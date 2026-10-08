@@ -302,7 +302,7 @@ fn layoutResult(
     const widths = try a.alloc(usize, ncols);
     const header = try a.alloc([]const u8, ncols);
     for (r.columns, 0..) |name, i| {
-        header[i] = try cellText(a, name);
+        header[i] = try render.singleLine(a, name); // names are never truncated
         widths[i] = render.displayWidth(header[i]);
     }
     const cells = try a.alloc(?[]const u8, ncols * shown_rows);

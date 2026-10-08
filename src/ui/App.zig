@@ -1209,9 +1209,9 @@ fn startDefinition(app: *App, name: []const u8) !void {
 fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
     const job = try app.newJob(.{ .browse_open = undefined });
     const a = job.arena.allocator();
-    const b: TableView.Browse = .{ .table = try a.dupe(u8, table), .filter = try a.dupe(u8, filter) };
-    job.kind = .{ .browse_open = b };
     const kind = app.conn.?.kind;
+    const b: TableView.Browse = .{ .table = try a.dupe(u8, table), .filter = try a.dupe(u8, filter), .kind = kind };
+    job.kind = .{ .browse_open = b };
     job.sqls = try a.dupe([]const u8, &.{
         try schema.browseSql(a, kind, b.table, b.filter, null, b.page_size, 0),
         try schema.countSql(a, kind, b.table, b.filter),

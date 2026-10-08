@@ -61,7 +61,7 @@ pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableO
     const widths = try a.alloc(usize, ncols);
     const cells = try a.alloc([]const u8, ncols * (r.rows.len + 1));
     for (r.columns, 0..) |name, i| {
-        cells[i] = try cellText(a, name, opts.max_cell_width);
+        cells[i] = try singleLine(a, name); // names are never truncated
         widths[i] = displayWidth(cells[i]);
     }
     for (r.rows, 1..) |row, ri| {

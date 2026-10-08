@@ -98,7 +98,8 @@ Anything else you type is run as SQL.
 | `↑` `↓` | history | `s` | sort by column |
 | `ctrl+o` | open last result as a table | `n` / `p` | next / previous page |
 | `ctrl+c` | cancel query · clear · exit (twice) | `y` / `Y` | copy cell / row |
-| `ctrl+l` | clear screen | `q` | back |
+| `ctrl+l` | clear screen | `c` / `x` | choose columns / hide current column |
+| | | `q` | back |
 
 ---
 
@@ -173,4 +174,5 @@ zpeek prod -e "select count(*) from users"  # выполнить запрос и
 | `↑` `↓` | история | `s` | сортировка по колонке |
 | `ctrl+o` | открыть последний результат таблицей | `n` / `p` | следующая / предыдущая страница |
 | `ctrl+c` | отменить запрос · очистить · выйти (дважды) | `y` / `Y` | копировать ячейку / строку |
-| `ctrl+l` | очистить экран | `q` | назад |
+| `ctrl+l` | очистить экран | `c` / `x` | выбрать колонки / скрыть текущую |
+| | | `q` | назад |

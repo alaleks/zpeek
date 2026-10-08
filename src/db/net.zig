@@ -8,7 +8,39 @@ const tls = std.crypto.tls;
 const TlsClient = @import("tls/Client.zig");
 const conninfo = @import("../conninfo.zig");
 
-const connect_timeout: Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } };
+const connect_timeout: Io.Duration = .fromSeconds(10);
+
+/// std.Io.Threaded (Zig 0.17) panics on `ConnectOptions.timeout`, so the
+/// timeout is implemented by racing the connect against a sleep.
+fn connectWithTimeout(io: Io, name: Io.net.HostName, port: u16) !Io.net.Stream {
+    const Race = union(enum) {
+        conn: Io.net.HostName.ConnectError!Io.net.Stream,
+        timer: Io.Cancelable!void,
+    };
+    var buf: [2]Race = undefined;
+    var race: Io.Select(Race) = .init(io, &buf);
+    race.concurrent(.conn, Io.net.HostName.connect, .{ name, io, port, .{ .mode = .stream } }) catch
+        return name.connect(io, port, .{ .mode = .stream });
+    race.concurrent(.timer, Io.sleep, .{ io, connect_timeout, .awake }) catch {
+        // No spare concurrency for the timer: wait for the connect alone.
+        const first = try race.await();
+        return first.conn;
+    };
+    const first = try race.await();
+    // Stops the other task; returns its result if it finished meanwhile.
+    const late = race.cancel();
+    switch (first) {
+        .conn => |result| return result,
+        .timer => {
+            // The connect may have succeeded right before it was canceled.
+            if (late) |l| switch (l) {
+                .conn => |result| if (result) |stream| return stream else |_| {},
+                .timer => {},
+            };
+            return error.Timeout;
+        },
+    }
+}
 
 pub const Transport = struct {
     gpa: Allocator,
@@ -54,8 +86,11 @@ pub const Transport = struct {
                 diag.* = "invalid host name";
                 return error.ConnectFailed;
             };
-            break :blk name.connect(io, port, .{ .mode = .stream, .timeout = connect_timeout }) catch |err| {
-                diag.* = @errorName(err);
+            break :blk connectWithTimeout(io, name, port) catch |err| {
+                diag.* = switch (err) {
+                    error.Timeout => "timed out after 10 s (host unreachable or port filtered)",
+                    else => @errorName(err),
+                };
                 return error.ConnectFailed;
             };
         };

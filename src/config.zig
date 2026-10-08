@@ -135,7 +135,6 @@ const EntryError = error{
     MissingDriver,
     UnknownDriver,
     InvalidField,
-    MissingPasswordEnv,
 } || conninfo.ParseError;
 
 fn errorText(err: EntryError) []const u8 {
@@ -143,7 +142,6 @@ fn errorText(err: EntryError) []const u8 {
         error.MissingDriver => "set 'url', 'path' or 'driver'",
         error.UnknownDriver => "unknown driver (expected postgres, mysql, mariadb or sqlite)",
         error.InvalidField => "field has the wrong type",
-        error.MissingPasswordEnv => "environment variable from 'password_env' is not set",
         error.InvalidConnectionString => "invalid 'url'",
         error.UnknownScheme => "unknown scheme in 'url'",
         error.InvalidPort => "invalid port",
@@ -169,7 +167,9 @@ fn entryParams(arena: Allocator, env: *const std.process.Environ.Map, t: *const 
     if (try getString(t, "user")) |v| params.user = v;
     if (try getString(t, "password")) |v| params.password = v;
     if (try getString(t, "password_env")) |name| {
-        params.password = env.get(name) orelse return error.MissingPasswordEnv;
+        // A missing variable must not break the whole config: the password
+        // stays empty and only this connection fails to authenticate.
+        if (env.get(name)) |pw| params.password = pw;
     }
     if (try getString(t, "database")) |v| params.database = v;
     if (try getString(t, "sslmode")) |v| {

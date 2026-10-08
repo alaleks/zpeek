@@ -31,7 +31,8 @@ pub const info: Style = .{ .fg = info_color };
 pub const border: Style = .{ .fg = muted_color };
 pub const border_focus: Style = .{ .fg = accent };
 pub const null_value: Style = .{ .fg = muted_color, .italic = true };
-pub const header: Style = .{ .bold = true, .fg = info_color };
+/// Column names: regular weight, color only.
+pub const header: Style = .{ .fg = info_color };
 pub const selected: Style = .{ .reverse = true };
 pub const selected_cell: Style = .{ .bg = selection_bg, .fg = .{ .index = 15 }, .bold = true };
 pub const row_highlight: Style = .{ .bg = .{ .index = 0 } };
