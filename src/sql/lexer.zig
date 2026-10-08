@@ -1,0 +1,349 @@
+//! A forgiving SQL tokenizer for highlighting and completion. It never fails:
+//! unterminated strings and comments simply run to the end of input.
+
+const std = @import("std");
+
+pub const Dialect = enum { postgres, mysql, sqlite };
+
+pub const Tag = enum {
+    whitespace,
+    keyword,
+    /// Built-in function or type name (count, now, varchar, ...).
+    builtin,
+    identifier,
+    quoted_identifier,
+    string,
+    number,
+    comment,
+    operator,
+    punctuation,
+    /// $1, ?, :name
+    parameter,
+};
+
+pub const Token = struct {
+    tag: Tag,
+    start: usize,
+    end: usize,
+
+    pub fn text(t: Token, src: []const u8) []const u8 {
+        return src[t.start..t.end];
+    }
+};
+
+pub const Iterator = struct {
+    src: []const u8,
+    dialect: Dialect = .postgres,
+    pos: usize = 0,
+
+    pub fn init(src: []const u8) Iterator {
+        return .{ .src = src };
+    }
+
+    pub fn initDialect(src: []const u8, dialect: Dialect) Iterator {
+        return .{ .src = src, .dialect = dialect };
+    }
+
+    pub fn next(it: *Iterator) ?Token {
+        const s = it.src;
+        if (it.pos >= s.len) return null;
+        const start = it.pos;
+        const c = s[start];
+        var tag: Tag = .punctuation;
+        var i = start + 1;
+
+        switch (c) {
+            ' ', '\t', '\r', '\n' => {
+                tag = .whitespace;
+                while (i < s.len and std.ascii.isWhitespace(s[i])) i += 1;
+            },
+            '-' => if (i < s.len and s[i] == '-') {
+                tag = .comment;
+                while (i < s.len and s[i] != '\n') i += 1;
+            } else {
+                tag = .operator;
+            },
+            '#' => {
+                // MySQL line comment; harmless elsewhere since '#' is rare in SQL.
+                tag = .comment;
+                while (i < s.len and s[i] != '\n') i += 1;
+            },
+            '/' => if (i < s.len and s[i] == '*') {
+                tag = .comment;
+                i += 1;
+                while (i < s.len and !(s[i] == '/' and s[i - 1] == '*' and i - 1 > start + 1)) i += 1;
+                if (i < s.len) i += 1;
+            } else {
+                tag = .operator;
+            },
+            '\'' => {
+                tag = .string;
+                i = scanQuoted(s, i, '\'', it.dialect == .mysql);
+            },
+            '"' => {
+                tag = .quoted_identifier;
+                i = scanQuoted(s, i, '"', it.dialect == .mysql);
+            },
+            '`' => {
+                tag = .quoted_identifier;
+                i = scanQuoted(s, i, '`', it.dialect == .mysql);
+            },
+            '[' => {
+                tag = .punctuation;
+            },
+            '$' => {
+                if (i < s.len and std.ascii.isDigit(s[i])) {
+                    tag = .parameter;
+                    while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+                } else if (dollarTag(s, start)) |tag_end| {
+                    // PostgreSQL dollar quoting: $tag$ ... $tag$
+                    tag = .string;
+                    const delim = s[start..tag_end];
+                    i = if (std.mem.indexOfPos(u8, s, tag_end, delim)) |close| close + delim.len else s.len;
+                } else {
+                    tag = .operator;
+                }
+            },
+            '?' => tag = .parameter,
+            ':' => if (i < s.len and s[i] == ':') {
+                tag = .operator;
+                i += 1;
+            } else if (i < s.len and isIdentStart(s[i])) {
+                tag = .parameter;
+                while (i < s.len and isIdentChar(s[i])) i += 1;
+            } else {
+                tag = .operator;
+            },
+            '0'...'9' => {
+                tag = .number;
+                while (i < s.len and (std.ascii.isAlphanumeric(s[i]) or s[i] == '.' or s[i] == '_')) i += 1;
+            },
+            '.' => if (i < s.len and std.ascii.isDigit(s[i])) {
+                tag = .number;
+                while (i < s.len and (std.ascii.isDigit(s[i]) or s[i] == 'e' or s[i] == 'E')) i += 1;
+            } else {
+                tag = .punctuation;
+            },
+            '(', ')', ',', ';', ']', '{', '}' => tag = .punctuation,
+            '+', '*', '%', '=', '<', '>', '!', '|', '&', '^', '~', '@' => {
+                tag = .operator;
+                while (i < s.len and std.mem.indexOfScalar(u8, "=<>!|&~", s[i]) != null) i += 1;
+            },
+            else => {
+                if (isIdentStart(c)) {
+                    // E'...' / X'...' / B'...' / N'...' string prefixes
+                    if (i < s.len and s[i] == '\'' and std.mem.indexOfScalar(u8, "eExXbBnN", c) != null) {
+                        tag = .string;
+                        i = scanQuoted(s, i + 1, '\'', it.dialect == .mysql or c == 'e' or c == 'E');
+                    } else {
+                        while (i < s.len and isIdentChar(s[i])) i += 1;
+                        const word = s[start..i];
+                        tag = if (isKeyword(word)) .keyword else if (isBuiltin(word)) .builtin else .identifier;
+                    }
+                } else {
+                    // Unknown byte (e.g. stray UTF-8 continuation): treat the
+                    // whole UTF-8 sequence as an identifier character run.
+                    tag = .identifier;
+                    while (i < s.len and isIdentChar(s[i])) i += 1;
+                }
+            },
+        }
+        it.pos = i;
+        return .{ .tag = tag, .start = start, .end = i };
+    }
+};
+
+fn scanQuoted(s: []const u8, from: usize, q: u8, backslash_escapes: bool) usize {
+    var i = from;
+    while (i < s.len) : (i += 1) {
+        if (backslash_escapes and s[i] == '\\' and i + 1 < s.len) {
+            i += 1;
+            continue;
+        }
+        if (s[i] == q) {
+            if (i + 1 < s.len and s[i + 1] == q) {
+                i += 1; // doubled quote
+                continue;
+            }
+            return i + 1;
+        }
+    }
+    return s.len;
+}
+
+fn dollarTag(s: []const u8, start: usize) ?usize {
+    var i = start + 1;
+    while (i < s.len and (std.ascii.isAlphanumeric(s[i]) or s[i] == '_')) i += 1;
+    if (i < s.len and s[i] == '$') return i + 1;
+    return null;
+}
+
+pub fn isIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_' or c >= 0x80;
+}
+
+pub fn isIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '$' or c >= 0x80;
+}
+
+pub const keywords = [_][]const u8{
+    "add",            "all",           "alter",       "analyze",      "and",      "any",       "as",        "asc",
+    "begin",          "between",       "by",          "cascade",      "case",     "cast",      "check",     "column",
+    "commit",         "constraint",    "create",      "cross",        "database", "default",   "delete",    "desc",
+    "describe",       "distinct",      "drop",        "else",         "end",      "except",    "exists",    "explain",
+    "false",          "fetch",         "first",       "for",          "foreign",  "from",      "full",      "function",
+    "grant",          "group",         "having",      "if",           "ilike",    "in",        "index",     "inner",
+    "insert",         "intersect",     "into",        "is",           "join",     "key",       "last",      "lateral",
+    "left",           "like",          "limit",       "materialized", "natural",  "not",       "null",      "nulls",
+    "offset",         "on",            "or",          "order",        "outer",    "over",      "partition", "primary",
+    "procedure",      "recursive",     "references",  "rename",       "replace",  "returning", "revoke",    "right",
+    "rollback",       "rows",          "schema",      "select",       "set",      "show",      "table",     "temporary",
+    "then",           "to",            "transaction", "trigger",      "true",     "truncate",  "union",     "unique",
+    "update",         "use",           "using",       "vacuum",       "values",   "view",      "when",      "where",
+    "window",         "with",          "without",     "conflict",     "do",       "nothing",   "pragma",    "after",
+    "before",         "each",          "row",         "instead",      "of",       "language",  "returns",   "declare",
+    "auto_increment", "autoincrement", "engine",      "temp",         "unlogged", "only",      "similar",   "escape",
+    "tablespace",     "sequence",      "type",        "enum",         "domain",   "extension", "owner",     "comment",
+    "execute",        "call",          "immutable",   "stable",       "volatile", "security",  "definer",   "invoker",
+};
+
+pub const builtins = [_][]const u8{
+    // functions
+    "count",       "sum",        "avg",          "min",               "max",          "coalesce",  "nullif",     "now",
+    "lower",       "upper",      "length",       "substr",            "substring",    "trim",      "round",      "abs",
+    "concat",      "date",       "extract",      "json_agg",          "jsonb_agg",    "array_agg", "string_agg", "group_concat",
+    "row_number",  "rank",       "dense_rank",   "lag",               "lead",         "ifnull",    "isnull",     "greatest",
+    "least",       "date_trunc", "current_date", "current_timestamp", "current_user", "random",
+    // types
+       "int",        "integer",
+    "bigint",      "smallint",   "tinyint",      "serial",            "bigserial",    "text",      "varchar",    "char",
+    "boolean",     "bool",       "real",         "float",             "double",       "numeric",   "decimal",    "timestamp",
+    "timestamptz", "time",       "interval",     "uuid",              "json",         "jsonb",     "blob",       "bytea",
+    "datetime",    "precision",  "varying",      "character",         "mediumtext",   "longtext",
+};
+
+fn inList(comptime list: []const []const u8, word: []const u8) bool {
+    if (word.len > 32) return false;
+    var buf: [32]u8 = undefined;
+    const lower = std.ascii.lowerString(&buf, word);
+    const map = comptime blk: {
+        var kvs: [list.len]struct { []const u8 } = undefined;
+        for (list, 0..) |w, idx| kvs[idx] = .{w};
+        break :blk std.StaticStringMap(void).initComptime(kvs);
+    };
+    return map.has(lower);
+}
+
+pub fn isKeyword(word: []const u8) bool {
+    return inList(&keywords, word);
+}
+
+pub fn isBuiltin(word: []const u8) bool {
+    return inList(&builtins, word);
+}
+
+/// Splits a script into statements at top-level semicolons (ignoring those in
+/// strings, comments and dollar quotes). Empty statements are skipped.
+pub fn splitStatements(src: []const u8, dialect: Dialect, out: *std.ArrayList([]const u8), gpa: std.mem.Allocator) !void {
+    // In MySQL, \' is ambiguous because NO_BACKSLASH_ESCAPES is session state.
+    // Let the server parse the complete script instead of guessing that state.
+    if ((dialect == .mysql and std.mem.indexOf(u8, src, "\\'") != null) or containsCompoundDefinition(src, dialect)) {
+        const stmt = std.mem.trim(u8, src, " \t\r\n;");
+        if (stmt.len > 0) try out.append(gpa, stmt);
+        return;
+    }
+    var it: Iterator = .initDialect(src, dialect);
+    var start: usize = 0;
+    while (it.next()) |t| {
+        if (t.tag == .punctuation and src[t.start] == ';') {
+            const stmt = std.mem.trim(u8, src[start..t.start], " \t\r\n");
+            if (stmt.len > 0 and !isOnlyComments(stmt, dialect)) try out.append(gpa, stmt);
+            start = t.end;
+        }
+    }
+    const stmt = std.mem.trim(u8, src[start..], " \t\r\n");
+    if (stmt.len > 0 and !isOnlyComments(stmt, dialect)) try out.append(gpa, stmt);
+}
+
+/// Compound trigger and routine bodies contain semicolons that only the
+/// database parser can classify correctly. Keep such input as one query.
+fn containsCompoundDefinition(src: []const u8, dialect: Dialect) bool {
+    var it: Iterator = .initDialect(src, dialect);
+    var saw_create = false;
+    var saw_compound_kind = false;
+    while (it.next()) |t| {
+        if (t.tag == .whitespace or t.tag == .comment) continue;
+        if (t.tag == .punctuation and src[t.start] == ';') return false;
+        const word = t.text(src);
+        if (!saw_create) {
+            if (t.tag == .keyword and std.ascii.eqlIgnoreCase(word, "create")) saw_create = true;
+            continue;
+        }
+        if (t.tag == .keyword) {
+            for ([_][]const u8{ "trigger", "function", "procedure" }) |kind| {
+                if (std.ascii.eqlIgnoreCase(word, kind)) saw_compound_kind = true;
+            }
+            if (saw_compound_kind and std.ascii.eqlIgnoreCase(word, "begin")) return true;
+        }
+    }
+    return false;
+}
+
+fn isOnlyComments(s: []const u8, dialect: Dialect) bool {
+    var it: Iterator = .initDialect(s, dialect);
+    while (it.next()) |t| switch (t.tag) {
+        .whitespace, .comment => {},
+        else => return false,
+    };
+    return true;
+}
+
+const testing = std.testing;
+
+test "tokens" {
+    const src = "SELECT u.name, 'it''s' AS x -- hi\nFROM \"Users\" u WHERE id = $1 AND n > 3.5";
+    var it: Iterator = .init(src);
+    var tags: std.ArrayList(Tag) = .empty;
+    defer tags.deinit(testing.allocator);
+    while (it.next()) |t| if (t.tag != .whitespace) try tags.append(testing.allocator, t.tag);
+    try testing.expectEqualSlices(Tag, &.{
+        .keyword,  .identifier,        .punctuation, .identifier, .punctuation, .string,   .keyword,   .identifier, .comment,
+        .keyword,  .quoted_identifier, .identifier,  .keyword,    .identifier,  .operator, .parameter, .keyword,    .identifier,
+        .operator, .number,
+    }, tags.items);
+}
+
+test "dollar quotes and split" {
+    const src = "create function f() returns int as $body$ select 1; $body$ language sql; select 2; -- end";
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(testing.allocator);
+    try splitStatements(src, .postgres, &parts, testing.allocator);
+    try testing.expectEqual(@as(usize, 2), parts.items.len);
+    try testing.expectEqualStrings("select 2", parts.items[1]);
+}
+
+test "compound trigger body is not split" {
+    const src = "create trigger tr after insert on t begin insert into log values (new.id); update stats set n = n + 1; end;";
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(testing.allocator);
+    try splitStatements(src, .sqlite, &parts, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), parts.items.len);
+    try testing.expectEqualStrings(std.mem.trimEnd(u8, src, ";"), parts.items[0]);
+}
+
+test "statement splitting follows string rules of each dialect" {
+    const src = "select 'a\\'; select 2;";
+
+    for ([_]Dialect{ .postgres, .sqlite }) |dialect| {
+        var parts: std.ArrayList([]const u8) = .empty;
+        defer parts.deinit(testing.allocator);
+        try splitStatements(src, dialect, &parts, testing.allocator);
+        try testing.expectEqual(@as(usize, 2), parts.items.len);
+        try testing.expectEqualStrings("select 2", parts.items[1]);
+    }
+
+    var mysql_parts: std.ArrayList([]const u8) = .empty;
+    defer mysql_parts.deinit(testing.allocator);
+    try splitStatements(src, .mysql, &mysql_parts, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), mysql_parts.items.len);
+}

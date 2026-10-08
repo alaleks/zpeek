@@ -1,0 +1,590 @@
+//! Full-screen grid for a result set with cursor navigation, a cell detail
+//! view, filtering and sorting. In browse mode filter/sort/paging are done by
+//! the database (the App re-runs the query); otherwise they are applied locally.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const vaxis = @import("vaxis");
+const Segment = vaxis.Segment;
+const db = @import("../db/db.zig");
+const schema = @import("../db/schema.zig");
+const render = @import("../render.zig");
+const theme = @import("theme.zig");
+const Editor = @import("Editor.zig");
+const Transcript = @import("Transcript.zig");
+
+const TableView = @This();
+
+pub const Browse = struct {
+    table: []const u8,
+    filter: []const u8 = "",
+    order: ?schema.Order = null,
+    offset: usize = 0,
+    page_size: usize = 500,
+    /// Total rows matching the filter, when known.
+    total: ?u64 = null,
+};
+
+pub const Action = union(enum) {
+    none,
+    close,
+    /// Browse parameters changed; the App should fetch a new page.
+    reload,
+    copy: []const u8,
+    /// Show a short message in the status bar.
+    notice: []const u8,
+};
+
+gpa: Allocator,
+/// Owned when `owns_result` is true (browse mode), otherwise borrowed from the transcript.
+result: *db.Result,
+owns_result: bool,
+title: []const u8,
+browse: ?Browse,
+
+/// Row indices into `result.rows` after local filter/sort.
+view: std.ArrayList(usize) = .empty,
+widths: std.ArrayList(u16) = .empty,
+
+row: usize = 0,
+col: usize = 0,
+top: usize = 0,
+left: usize = 0,
+
+local_filter: std.ArrayList(u8) = .empty,
+local_sort: ?struct { col: usize, desc: bool } = null,
+
+filter_editor: Editor,
+editing_filter: bool = false,
+detail: bool = false,
+detail_scroll: usize = 0,
+notice: ?[]const u8 = null,
+
+/// Visible rows from the last draw (for paging).
+page_rows: usize = 20,
+
+frame_arena: std.heap.ArenaAllocator,
+
+pub fn init(gpa: Allocator, result: *db.Result, owns_result: bool, title: []const u8, browse: ?Browse) Allocator.Error!*TableView {
+    const tv = try gpa.create(TableView);
+    tv.* = .{
+        .gpa = gpa,
+        .result = result,
+        .owns_result = owns_result,
+        .title = try gpa.dupe(u8, title),
+        .browse = browse,
+        .filter_editor = .init(gpa),
+        .frame_arena = .init(gpa),
+    };
+    if (tv.browse) |*b| {
+        b.table = try gpa.dupe(u8, b.table);
+        b.filter = try gpa.dupe(u8, b.filter);
+        if (b.order) |*o| o.column = try gpa.dupe(u8, o.column);
+    }
+    try tv.rebuild();
+    return tv;
+}
+
+pub fn deinit(tv: *TableView) void {
+    if (tv.owns_result) {
+        tv.result.deinit();
+        tv.gpa.destroy(tv.result);
+    }
+    if (tv.browse) |b| {
+        tv.gpa.free(b.table);
+        tv.gpa.free(b.filter);
+        if (b.order) |o| tv.gpa.free(o.column);
+    }
+    tv.gpa.free(tv.title);
+    tv.view.deinit(tv.gpa);
+    tv.widths.deinit(tv.gpa);
+    tv.local_filter.deinit(tv.gpa);
+    tv.filter_editor.deinit();
+    tv.frame_arena.deinit();
+    tv.gpa.destroy(tv);
+}
+
+/// Replaces the result after a browse reload.
+pub fn setResult(tv: *TableView, result: *db.Result) Allocator.Error!void {
+    if (tv.owns_result) {
+        tv.result.deinit();
+        tv.gpa.destroy(tv.result);
+    }
+    tv.result = result;
+    tv.owns_result = true;
+    tv.row = 0;
+    tv.top = 0;
+    tv.col = @min(tv.col, result.columns.len -| 1);
+    if (tv.left > tv.col) tv.left = tv.col;
+    try tv.rebuild();
+}
+
+fn rebuild(tv: *TableView) Allocator.Error!void {
+    const r = tv.result;
+    tv.view.clearRetainingCapacity();
+    const needle = tv.local_filter.items;
+    const filter = parseLocalFilter(r.columns, needle);
+    for (r.rows, 0..) |row, i| {
+        if (needle.len == 0 or filter.matches(row)) try tv.view.append(tv.gpa, i);
+    }
+    if (tv.local_sort) |s| {
+        const Ctx = struct {
+            rows: []const []const ?[]const u8,
+            col: usize,
+            desc: bool,
+            fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                const ord = compareValues(ctx.rows[a][ctx.col], ctx.rows[b][ctx.col]);
+                return if (ctx.desc) ord == .gt else ord == .lt;
+            }
+        };
+        std.sort.block(usize, tv.view.items, Ctx{ .rows = r.rows, .col = s.col, .desc = s.desc }, Ctx.lessThan);
+    }
+
+    tv.widths.clearRetainingCapacity();
+    for (r.columns, 0..) |name, ci| {
+        var w: usize = render.displayWidth(name) + 2; // room for sort marker
+        for (r.rows) |row| {
+            const v = row[ci] orelse render.null_text;
+            const vw = cellWidth(v);
+            if (vw > w) w = vw;
+            if (w >= 50) break;
+        }
+        try tv.widths.append(tv.gpa, @intCast(@min(@max(w, 4), 50)));
+    }
+    tv.row = @min(tv.row, tv.view.items.len -| 1);
+}
+
+fn cellWidth(v: []const u8) usize {
+    // Fast path: avoid full grapheme scanning for long values.
+    const head = v[0..@min(v.len, 200)];
+    return render.displayWidth(head);
+}
+
+const LocalFilter = struct {
+    column: ?usize,
+    text: []const u8,
+    exact: bool,
+
+    fn matches(f: LocalFilter, row: []const ?[]const u8) bool {
+        if (f.column) |c| return f.cellMatches(row[c]);
+        for (row) |v| if (f.cellMatches(v)) return true;
+        return false;
+    }
+
+    fn cellMatches(f: LocalFilter, v: ?[]const u8) bool {
+        const s = v orelse return std.ascii.eqlIgnoreCase(f.text, "null");
+        if (f.exact) return std.mem.eql(u8, s, f.text);
+        return std.ascii.findIgnoreCase(s, f.text) != null;
+    }
+};
+
+/// `text` searches all columns; `col:text` one column; `col=value` exact match.
+fn parseLocalFilter(columns: []const []const u8, s: []const u8) LocalFilter {
+    for ([_]u8{ '=', ':' }) |sep| {
+        if (std.mem.indexOfScalar(u8, s, sep)) |i| {
+            const name = std.mem.trim(u8, s[0..i], " ");
+            for (columns, 0..) |c, ci| {
+                if (std.ascii.eqlIgnoreCase(c, name)) {
+                    return .{ .column = ci, .text = std.mem.trim(u8, s[i + 1 ..], " "), .exact = sep == '=' };
+                }
+            }
+        }
+    }
+    return .{ .column = null, .text = s, .exact = false };
+}
+
+fn compareValues(a: ?[]const u8, b: ?[]const u8) std.math.Order {
+    const x = a orelse return if (b == null) .eq else .gt; // NULLs last
+    const y = b orelse return .lt;
+    const fx = std.fmt.parseFloat(f64, x) catch null;
+    const fy = std.fmt.parseFloat(f64, y) catch null;
+    if (fx != null and fy != null) return std.math.order(fx.?, fy.?);
+    return std.mem.order(u8, x, y);
+}
+
+fn currentValue(tv: *const TableView) ?[]const u8 {
+    if (tv.view.items.len == 0 or tv.result.columns.len == 0) return null;
+    return tv.result.rows[tv.view.items[tv.row]][tv.col];
+}
+
+pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
+    tv.notice = null;
+    if (tv.editing_filter) return tv.handleFilterKey(key);
+    if (tv.detail) {
+        if (key.matchesAny(&.{ vaxis.Key.escape, vaxis.Key.enter, 'q' }, .{})) {
+            tv.detail = false;
+        } else if (key.matchesAny(&.{ vaxis.Key.down, 'j' }, .{})) {
+            tv.detail_scroll += 1;
+        } else if (key.matchesAny(&.{ vaxis.Key.up, 'k' }, .{})) {
+            tv.detail_scroll -|= 1;
+        } else if (key.matches('y', .{})) {
+            return .{ .copy = tv.currentValue() orelse "" };
+        }
+        return .none;
+    }
+
+    const nrows = tv.view.items.len;
+    const ncols = tv.result.columns.len;
+    if (key.matchesAny(&.{ vaxis.Key.escape, 'q' }, .{}) or key.matches('c', .{ .ctrl = true })) return .close;
+    if (key.matchesAny(&.{ vaxis.Key.down, 'j' }, .{})) {
+        if (tv.row + 1 < nrows) tv.row += 1 else return tv.nextPage();
+    } else if (key.matchesAny(&.{ vaxis.Key.up, 'k' }, .{})) {
+        if (tv.row > 0) tv.row -= 1;
+    } else if (key.matchesAny(&.{ vaxis.Key.right, 'l', vaxis.Key.tab }, .{})) {
+        if (tv.col + 1 < ncols) tv.col += 1;
+    } else if (key.matchesAny(&.{ vaxis.Key.left, 'h' }, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
+        if (tv.col > 0) tv.col -= 1;
+    } else if (key.matches(vaxis.Key.page_down, .{}) or key.matches('f', .{ .ctrl = true }) or key.matches(' ', .{})) {
+        if (tv.row + 1 >= nrows) return tv.nextPage();
+        tv.row = @min(tv.row + tv.page_rows, nrows -| 1);
+    } else if (key.matches(vaxis.Key.page_up, .{}) or key.matches('b', .{ .ctrl = true })) {
+        tv.row -|= tv.page_rows;
+    } else if (key.matches('d', .{ .ctrl = true })) {
+        tv.row = @min(tv.row + tv.page_rows / 2, nrows -| 1);
+    } else if (key.matches('u', .{ .ctrl = true })) {
+        tv.row -|= tv.page_rows / 2;
+    } else if (key.matchesAny(&.{ vaxis.Key.home, 'g' }, .{})) {
+        tv.row = 0;
+    } else if (key.matchesAny(&.{ vaxis.Key.end, 'G' }, .{}) or key.matches('g', .{ .shift = true })) {
+        tv.row = nrows -| 1;
+    } else if (key.matches('0', .{}) or key.matches('^', .{})) {
+        tv.col = 0;
+    } else if (key.matches('$', .{})) {
+        tv.col = ncols -| 1;
+    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('v', .{})) {
+        if (nrows > 0) {
+            tv.detail = true;
+            tv.detail_scroll = 0;
+        }
+    } else if (key.matches('/', .{}) or key.matches('f', .{})) {
+        tv.editing_filter = true;
+        const current = if (tv.browse) |b| b.filter else tv.local_filter.items;
+        try tv.filter_editor.setText(current);
+    } else if (key.matches('s', .{})) {
+        return tv.toggleSort();
+    } else if (key.matches('n', .{}) or key.matches(']', .{})) {
+        return tv.nextPage();
+    } else if (key.matches('p', .{}) or key.matches('[', .{})) {
+        return tv.prevPage();
+    } else if (key.matches('r', .{})) {
+        if (tv.browse != null) return .reload;
+    } else if (key.matches('y', .{})) {
+        return .{ .copy = tv.currentValue() orelse "" };
+    } else if (key.matches('Y', .{}) or key.matches('y', .{ .shift = true })) {
+        return .{ .copy = try tv.rowAsTsv() };
+    }
+    return .none;
+}
+
+fn handleFilterKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
+    const e = &tv.filter_editor;
+    if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
+        tv.editing_filter = false;
+    } else if (key.matches(vaxis.Key.enter, .{})) {
+        tv.editing_filter = false;
+        const text = std.mem.trim(u8, e.text(), " \t");
+        if (tv.browse) |*b| {
+            tv.gpa.free(b.filter);
+            b.filter = try tv.gpa.dupe(u8, text);
+            b.offset = 0;
+            b.total = null;
+            return .reload;
+        }
+        tv.local_filter.clearRetainingCapacity();
+        try tv.local_filter.appendSlice(tv.gpa, text);
+        tv.row = 0;
+        tv.top = 0;
+        try tv.rebuild();
+    } else if (key.matches(vaxis.Key.backspace, .{})) {
+        e.backspace();
+    } else if (key.matches(vaxis.Key.delete, .{})) {
+        e.deleteForward();
+    } else if (key.matches(vaxis.Key.left, .{})) {
+        e.left();
+    } else if (key.matches(vaxis.Key.right, .{})) {
+        e.right();
+    } else if (key.matches(vaxis.Key.home, .{}) or key.matches('a', .{ .ctrl = true })) {
+        e.home();
+    } else if (key.matches(vaxis.Key.end, .{}) or key.matches('e', .{ .ctrl = true })) {
+        e.end();
+    } else if (key.matches('u', .{ .ctrl = true })) {
+        e.killToLineStart();
+    } else if (key.matches('w', .{ .ctrl = true })) {
+        e.deleteWordLeft();
+    } else if (key.text) |t| {
+        if (!key.mods.ctrl and !key.mods.alt) try e.insert(t);
+    }
+    return .none;
+}
+
+fn toggleSort(tv: *TableView) Allocator.Error!Action {
+    if (tv.result.columns.len == 0) return .none;
+    const name = tv.result.columns[tv.col];
+    if (tv.browse) |*b| {
+        // asc -> desc -> none
+        if (b.order) |o| {
+            const same = std.mem.eql(u8, o.column, name);
+            tv.gpa.free(o.column);
+            b.order = if (same and !o.descending) .{ .column = try tv.gpa.dupe(u8, name), .descending = true } else if (same) null else .{ .column = try tv.gpa.dupe(u8, name) };
+        } else {
+            b.order = .{ .column = try tv.gpa.dupe(u8, name) };
+        }
+        b.offset = 0;
+        return .reload;
+    }
+    if (tv.local_sort) |s| {
+        tv.local_sort = if (s.col == tv.col and !s.desc) .{ .col = tv.col, .desc = true } else if (s.col == tv.col) null else .{ .col = tv.col, .desc = false };
+    } else {
+        tv.local_sort = .{ .col = tv.col, .desc = false };
+    }
+    try tv.rebuild();
+    return .none;
+}
+
+fn nextPage(tv: *TableView) Action {
+    const b = &(tv.browse orelse return .none);
+    if (tv.result.rows.len < b.page_size) return .{ .notice = "last page" };
+    b.offset += b.page_size;
+    return .reload;
+}
+
+fn prevPage(tv: *TableView) Action {
+    const b = &(tv.browse orelse return .none);
+    if (b.offset == 0) return .{ .notice = "first page" };
+    b.offset -|= b.page_size;
+    return .reload;
+}
+
+fn rowAsTsv(tv: *TableView) Allocator.Error![]const u8 {
+    const a = tv.frame_arena.allocator();
+    if (tv.view.items.len == 0) return "";
+    const row = tv.result.rows[tv.view.items[tv.row]];
+    var out: std.ArrayList(u8) = .empty;
+    for (row, 0..) |v, i| {
+        if (i > 0) try out.append(a, '\t');
+        try out.appendSlice(a, v orelse "NULL");
+    }
+    return out.items;
+}
+
+pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
+    _ = tv.frame_arena.reset(.retain_capacity);
+    const a = tv.frame_arena.allocator();
+    win.clear();
+    if (win.height < 4 or win.width < 10) return;
+
+    const r = tv.result;
+    const footer_h: u16 = 2;
+    const grid_h = win.height - footer_h;
+    // title line + header + rule
+    const body_h: usize = grid_h -| 3;
+    tv.page_rows = @max(body_h, 1);
+
+    // Title
+    {
+        var title: std.ArrayList(Segment) = .empty;
+        try title.append(a, .{ .text = " ", .style = .{} });
+        try title.append(a, .{ .text = tv.title, .style = theme.accent_bold });
+        if (tv.browse) |b| {
+            if (b.filter.len > 0) {
+                try title.append(a, .{ .text = "  where ", .style = theme.dim });
+                try title.appendSlice(a, try theme.highlight(a, b.filter, .{}));
+            }
+            if (b.order) |o| {
+                try title.append(a, .{ .text = try std.fmt.allocPrint(a, "  order by {s}{s}", .{ o.column, if (o.descending) " desc" else "" }), .style = theme.dim });
+            }
+        } else if (tv.local_filter.items.len > 0) {
+            try title.append(a, .{ .text = "  filter: ", .style = theme.dim });
+            try title.append(a, .{ .text = tv.local_filter.items, .style = theme.warn });
+        }
+        _ = win.print(title.items, .{ .row_offset = 0, .wrap = .none });
+    }
+
+    if (r.columns.len == 0) {
+        _ = win.printSegment(.{ .text = " no columns", .style = theme.dim }, .{ .row_offset = 2 });
+        return;
+    }
+
+    // Keep the cursor visible.
+    if (tv.row < tv.top) tv.top = tv.row;
+    if (tv.row >= tv.top + body_h) tv.top = tv.row + 1 - body_h;
+    if (tv.col < tv.left) tv.left = tv.col;
+    // Make sure the cursor column fits; shift `left` until it does.
+    while (tv.left < tv.col) {
+        var used: usize = 1;
+        for (tv.widths.items[tv.left .. tv.col + 1]) |w| used += w + 3;
+        if (used <= win.width) break;
+        tv.left += 1;
+    }
+
+    // Columns to draw.
+    var x: u16 = 1;
+    var last_col = tv.left;
+    while (last_col < r.columns.len) : (last_col += 1) {
+        const w = tv.widths.items[last_col];
+        if (x + w + 3 > win.width and last_col > tv.left) break;
+        x += w + 3;
+    }
+
+    const grid = win.child(.{ .y_off = 1, .height = grid_h - 1 });
+
+    // Header
+    {
+        var col_x: u16 = 0;
+        for (tv.left..last_col) |ci| {
+            const w = tv.widths.items[ci];
+            var name: []const u8 = r.columns[ci];
+            const marker: []const u8 = blk: {
+                if (tv.browse) |b| if (b.order) |o| if (std.mem.eql(u8, o.column, name)) break :blk if (o.descending) " ↓" else " ↑";
+                if (tv.local_sort) |s| if (s.col == ci) break :blk if (s.desc) " ↓" else " ↑";
+                break :blk "";
+            };
+            if (marker.len > 0) name = try std.mem.concat(a, u8, &.{ name, marker });
+            const style: vaxis.Style = if (ci == tv.col) .{ .bold = true, .fg = theme.accent, .ul_style = .single } else theme.header;
+            drawCell(grid, col_x, 0, w, name, style);
+            if (ci + 1 < last_col) grid.writeCell(col_x + w + 2, 0, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = theme.border });
+            col_x += w + 3;
+        }
+        // rule
+        var rule: std.ArrayList(u8) = .empty;
+        var cx: usize = 0;
+        for (tv.left..last_col) |ci| {
+            const w = tv.widths.items[ci];
+            for (0..w + 2) |_| try rule.appendSlice(a, "─");
+            if (ci + 1 < last_col) try rule.appendSlice(a, "┼");
+            cx += w + 3;
+        }
+        _ = grid.print(&.{.{ .text = rule.items, .style = theme.border }}, .{ .row_offset = 1, .wrap = .none });
+    }
+
+    // Body
+    const end_row = @min(tv.top + body_h, tv.view.items.len);
+    for (tv.top..end_row, 0..) |vi, screen_row| {
+        const row = r.rows[tv.view.items[vi]];
+        const y: u16 = @intCast(screen_row + 2);
+        const is_cur_row = vi == tv.row;
+        var col_x: u16 = 0;
+        for (tv.left..last_col) |ci| {
+            const w = tv.widths.items[ci];
+            const v = row[ci];
+            const text = try render.singleLine(a, v orelse render.null_text);
+            var style: vaxis.Style = if (v == null) theme.null_value else .{};
+            if (is_cur_row) style.bg = .{ .index = 8 };
+            if (is_cur_row and ci == tv.col) style = theme.selected_cell;
+            // fill the padding around the cell for the current row
+            if (is_cur_row) fillRow(grid, col_x, y, w + 2, style);
+            drawCell(grid, col_x, y, w, text, style);
+            const sep_style: vaxis.Style = if (is_cur_row) .{ .fg = theme.muted_color, .bg = .{ .index = 8 } } else theme.border;
+            if (ci + 1 < last_col) grid.writeCell(col_x + w + 2, y, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = sep_style });
+            col_x += w + 3;
+        }
+    }
+    if (tv.view.items.len == 0) {
+        _ = grid.printSegment(.{ .text = "  (no rows)", .style = theme.dim }, .{ .row_offset = 2 });
+    }
+
+    try tv.drawFooter(a, win.child(.{ .y_off = @intCast(win.height - footer_h), .height = footer_h }), last_col);
+
+    if (tv.detail) try tv.drawDetail(a, win);
+}
+
+fn drawCell(win: vaxis.Window, x: u16, y: u16, width: u16, text: []const u8, style: vaxis.Style) void {
+    const fit = render.fitWidth(text, width);
+    var segs = [_]Segment{.{ .text = fit.text, .style = style }};
+    _ = win.print(&segs, .{ .row_offset = y, .col_offset = x + 1, .wrap = .none });
+    if (fit.text.len < text.len and width > 0) {
+        // mark truncation in the last column of the cell
+        win.writeCell(x + width, y, .{ .char = .{ .grapheme = "…", .width = 1 }, .style = .{ .fg = theme.muted_color, .bg = style.bg } });
+    }
+}
+
+fn fillRow(win: vaxis.Window, x: u16, y: u16, width: u16, style: vaxis.Style) void {
+    var i: u16 = 0;
+    while (i < width) : (i += 1) {
+        win.writeCell(x + i, y, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = style.bg } });
+    }
+}
+
+fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) Allocator.Error!void {
+    const r = tv.result;
+    // Line 1: position / filter editor
+    if (tv.editing_filter) {
+        const label: []const u8 = if (tv.browse != null) " WHERE " else " filter ";
+        var segs: std.ArrayList(Segment) = .empty;
+        try segs.append(a, .{ .text = label, .style = theme.accent_bold });
+        const text = tv.filter_editor.text();
+        if (tv.browse != null) {
+            try segs.appendSlice(a, try theme.highlight(a, text, .{}));
+        } else {
+            try segs.append(a, .{ .text = text });
+        }
+        _ = win.print(segs.items, .{ .row_offset = 0, .wrap = .none });
+        const cursor_col = render.displayWidth(label) + render.displayWidth(text[0..tv.filter_editor.cursor]);
+        win.showCursor(@intCast(@min(cursor_col, win.width -| 1)), 0);
+    } else {
+        var info: std.ArrayList(u8) = .empty;
+        const col_name = if (r.columns.len > 0) r.columns[tv.col] else "";
+        if (tv.browse) |b| {
+            const first = b.offset + 1;
+            const last = b.offset + r.rows.len;
+            if (r.rows.len == 0) {
+                try info.print(a, " no rows", .{});
+            } else {
+                try info.print(a, " rows {d}–{d}", .{ first, last });
+            }
+            if (b.total) |t| try info.print(a, " of {d}", .{t});
+            try info.print(a, " · row {d}", .{b.offset + tv.row + 1});
+        } else {
+            try info.print(a, " row {d}/{d}", .{ if (tv.view.items.len == 0) 0 else tv.row + 1, tv.view.items.len });
+            if (tv.view.items.len != r.rows.len) try info.print(a, " (of {d})", .{r.rows.len});
+        }
+        try info.print(a, " · col {d}/{d} {s}", .{ tv.col + 1, r.columns.len, col_name });
+        if (last_col < r.columns.len) try info.print(a, " · {d} more →", .{r.columns.len - last_col});
+        var segs: std.ArrayList(Segment) = .empty;
+        try segs.append(a, .{ .text = info.items, .style = theme.bold });
+        if (tv.notice) |n| try segs.append(a, .{ .text = try std.fmt.allocPrint(a, "  {s}", .{n}), .style = theme.warn });
+        _ = win.print(segs.items, .{ .row_offset = 0, .wrap = .none });
+        win.hideCursor();
+    }
+
+    const hint: []const u8 = if (tv.editing_filter)
+        (if (tv.browse != null) " enter apply · esc cancel · empty clears the filter" else " text · col:text · col=value · enter apply · esc cancel")
+    else if (tv.browse != null)
+        " ↑↓←→ move · enter view cell · / where · s sort · n/p page · y copy · r reload · q back"
+    else
+        " ↑↓←→ move · enter view cell · / filter · s sort · y copy cell · Y copy row · q back";
+    _ = win.print(&.{.{ .text = hint, .style = theme.dim }}, .{ .row_offset = 1, .wrap = .none });
+}
+
+fn drawDetail(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!void {
+    const value = tv.currentValue();
+    const w: u16 = @min(win.width -| 4, 100);
+    var lines: std.ArrayList(Transcript.Line) = .empty;
+    const segs: []const Segment = if (value) |v|
+        &.{.{ .text = v }}
+    else
+        &.{.{ .text = "NULL", .style = theme.null_value }};
+    try Transcript.wrapWithPrefix(a, &lines, segs, w -| 2, .{ .text = "" }, "");
+    // title + blank line + content + borders
+    const h: u16 = @intCast(@min(@as(usize, win.height -| 4), lines.items.len + 4));
+    const box = win.child(.{
+        .x_off = @intCast((win.width - w) / 2),
+        .y_off = @intCast((win.height - h) / 2),
+        .width = w,
+        .height = h,
+        .border = .{ .where = .all, .style = theme.border_focus },
+    });
+    box.clear();
+    const col_name = tv.result.columns[tv.col];
+    _ = box.print(&.{
+        .{ .text = col_name, .style = theme.accent_bold },
+        .{ .text = "  esc close · y copy · ↑↓ scroll", .style = theme.dim },
+    }, .{ .row_offset = 0, .wrap = .none });
+
+    const body_h = box.height -| 2;
+    tv.detail_scroll = @min(tv.detail_scroll, lines.items.len -| body_h);
+    for (lines.items[tv.detail_scroll..], 0..) |line, i| {
+        if (i >= body_h) break;
+        _ = box.print(line, .{ .row_offset = @intCast(i + 2), .wrap = .none });
+    }
+}
