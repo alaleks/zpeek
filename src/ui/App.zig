@@ -427,8 +427,16 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     } else if (key.text) |t| {
         if (!key.mods.ctrl and !(key.mods.alt and t.len == 1)) {
             try e.insert(t);
-            // Slash commands get a live popup; SQL completes on Tab.
-            if (std.mem.startsWith(u8, e.text(), "/")) try app.openCompletion(false);
+            if (std.mem.startsWith(u8, e.text(), "/")) {
+                try app.openCompletion(false);
+            } else if (app.conn != null) {
+                // Operators appear live after a column; other SQL completion
+                // remains explicit on Tab to avoid a noisy popup.
+                try app.openCompletion(false);
+                if (app.popup) |p| {
+                    if (p.completion.candidates[0].kind != .operator) app.closePopup();
+                }
+            }
         }
     }
 }
@@ -483,13 +491,19 @@ fn handlePopupKey(app: *App, key: vaxis.Key) !bool {
 
 fn acceptCandidate(app: *App, cand: complete.Candidate, replace_len: usize) Allocator.Error!void {
     var text = cand.text;
+    var cursor_back: usize = 0;
     const a = app.popup_arena.allocator();
     if (cand.kind == .table or cand.kind == .column) text = try app.maybeQuote(a, text);
     if (cand.kind == .command) {
         const cmd = findCommand(text);
         if (cmd != null and cmd.?.args.len > 0) text = try std.mem.concat(a, u8, &.{ text, " " });
     }
-    try app.editor.replaceBeforeCursor(replace_len, text);
+    if (cand.kind == .operator) {
+        const snippet = complete.operatorSnippet(text);
+        text = try std.mem.concat(a, u8, &.{ text, snippet.suffix });
+        cursor_back = snippet.cursor_back;
+    }
+    try app.editor.replaceBeforeCursorAndMove(replace_len, text, cursor_back);
     app.closePopup();
     if (cand.kind == .command and std.mem.endsWith(u8, text, " ")) try app.openCompletion(false);
 }
@@ -521,6 +535,7 @@ fn openCompletion(app: *App, explicit: bool) Allocator.Error!void {
         .cache = if (app.cache) |*c| c else null,
         .connections = names.items,
         .commands = &commands,
+        .kind = if (app.conn) |conn| conn.kind else null,
     });
     if (result.candidates.len == 0) {
         app.popup = null;
@@ -767,7 +782,7 @@ fn showHelp(app: *App) !void {
     const keys = [_][2][]const u8{
         .{ "enter", "run SQL / command (several statements separated by ;)" },
         .{ "shift+enter, alt+enter, ctrl+j, \\", "new line" },
-        .{ "tab", "complete commands, tables, columns, keywords" },
+        .{ "tab", "complete commands, tables, columns, operators, keywords" },
         .{ "↑ ↓", "history (or move between lines)" },
         .{ "ctrl+o", "open the last result in the table viewer" },
         .{ "pgup pgdn, mouse wheel", "scroll" },
@@ -1496,6 +1511,7 @@ fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16
             .command => "›",
             .table => "▦",
             .column => "◦",
+            .operator => "=",
             .keyword => "k",
             .function => "ƒ",
             .connection => "●",

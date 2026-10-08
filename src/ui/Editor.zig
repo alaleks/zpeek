@@ -228,9 +228,16 @@ pub fn wordBeforeCursor(e: *const Editor) []const u8 {
 
 /// Replaces the last `len` bytes before the cursor with `replacement`.
 pub fn replaceBeforeCursor(e: *Editor, len: usize, replacement: []const u8) Allocator.Error!void {
+    return e.replaceBeforeCursorAndMove(len, replacement, 0);
+}
+
+/// Replaces text before the cursor, then moves the cursor left within the
+/// inserted ASCII suffix. Used by completion snippets with paired delimiters.
+pub fn replaceBeforeCursorAndMove(e: *Editor, len: usize, replacement: []const u8, cursor_back: usize) Allocator.Error!void {
+    std.debug.assert(cursor_back <= replacement.len);
     const start = e.cursor - len;
     try e.buf.replaceRange(e.gpa, start, len, replacement);
-    e.cursor = start + replacement.len;
+    e.cursor = start + replacement.len - cursor_back;
     e.goal_col = null;
 }
 
@@ -318,4 +325,13 @@ test "history" {
     try e.historyNext();
     try e.historyNext();
     try testing.expectEqualStrings("draft", e.text());
+}
+
+test "completion snippet positions cursor inside delimiters" {
+    var e: Editor = .init(testing.allocator);
+    defer e.deinit();
+    try e.insert("where id I");
+    try e.replaceBeforeCursorAndMove(1, "IN ()", 1);
+    try testing.expectEqualStrings("where id IN ()", e.text());
+    try testing.expectEqualStrings(")", e.text()[e.cursor..]);
 }

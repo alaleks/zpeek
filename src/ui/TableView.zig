@@ -12,6 +12,7 @@ const render = @import("../render.zig");
 const theme = @import("theme.zig");
 const Editor = @import("Editor.zig");
 const Transcript = @import("Transcript.zig");
+const complete = @import("complete.zig");
 const lexer = @import("../sql/lexer.zig");
 const Kind = @import("../conninfo.zig").Kind;
 
@@ -69,10 +70,10 @@ local_sort: ?struct { col: usize, desc: bool } = null,
 
 filter_editor: Editor,
 editing_filter: bool = false,
-/// Column-name completion while editing the filter.
-completion: std.ArrayList(usize) = .empty,
+/// Column and SQL-operator completion while editing the filter.
+completion: std.ArrayList(complete.Candidate) = .empty,
 completion_sel: usize = 0,
-/// Bytes before the cursor replaced by the chosen column.
+/// Bytes before the cursor replaced by the chosen candidate.
 completion_len: usize = 0,
 detail: bool = false,
 detail_scroll: usize = 0,
@@ -471,11 +472,23 @@ fn completionWord(tv: *const TableView) ?[]const u8 {
     };
 }
 
-/// Recomputes column suggestions for the word before the cursor.
+/// Recomputes column or SQL-operator suggestions before the cursor.
 fn updateCompletion(tv: *TableView) Allocator.Error!void {
     tv.completion.clearRetainingCapacity();
     tv.completion_sel = 0;
     if (!tv.editing_filter) return;
+    if (tv.browse) |b| {
+        if (complete.operatorPrefix(tv.filter_editor.text(), tv.filter_editor.cursor, true)) |prefix| {
+            tv.completion_len = prefix.len;
+            for (complete.operators(b.kind)) |candidate| {
+                if (tv.completion.items.len >= max_completions) return;
+                if (!std.ascii.startsWithIgnoreCase(candidate.text, prefix)) continue;
+                if (std.ascii.eqlIgnoreCase(candidate.text, prefix)) continue;
+                try tv.completion.append(tv.gpa, candidate);
+            }
+            return;
+        }
+    }
     const word = tv.completionWord() orelse return;
     tv.completion_len = word.len;
     const needle = std.mem.trimStart(u8, word, "\"`");
@@ -490,17 +503,23 @@ fn updateCompletion(tv: *TableView) Allocator.Error!void {
             if (is_prefix != prefix_pass) continue;
             if (!is_prefix and std.ascii.findIgnoreCase(name, needle) == null) continue;
             if (std.mem.eql(u8, name, needle)) continue; // already complete
-            try tv.completion.append(tv.gpa, ci);
+            try tv.completion.append(tv.gpa, .{ .text = name, .kind = .column });
         }
     }
 }
 
 fn acceptCompletion(tv: *TableView) Allocator.Error!void {
-    const ci = tv.completion.items[tv.completion_sel];
-    const name = tv.result.columns[ci];
+    const candidate = tv.completion.items[tv.completion_sel];
     const a = tv.frame_arena.allocator();
-    const text = if (tv.browse) |b| try quoteIfNeeded(a, b.kind, name) else name;
-    try tv.filter_editor.replaceBeforeCursor(tv.completion_len, text);
+    var text = candidate.text;
+    var cursor_back: usize = 0;
+    if (candidate.kind == .column) text = if (tv.browse) |b| try quoteIfNeeded(a, b.kind, text) else text;
+    if (candidate.kind == .operator) {
+        const snippet = complete.operatorSnippet(text);
+        text = try std.mem.concat(a, u8, &.{ text, snippet.suffix });
+        cursor_back = snippet.cursor_back;
+    }
+    try tv.filter_editor.replaceBeforeCursorAndMove(tv.completion_len, text, cursor_back);
     tv.completion.clearRetainingCapacity();
 }
 
@@ -521,7 +540,7 @@ fn drawCompletion(tv: *TableView, a: Allocator, win: vaxis.Window, input_row: u1
     const word_start = e.cursor - tv.completion_len;
     const x_raw = render.displayWidth(tv.filterLabel()) + render.displayWidth(e.text()[0..word_start]);
     var name_w: usize = 0;
-    for (items) |ci| name_w = @max(name_w, render.displayWidth(tv.result.columns[ci]));
+    for (items) |candidate| name_w = @max(name_w, render.displayWidth(candidate.text));
     const w: u16 = @intCast(@min(name_w + 4, @as(usize, win.width)));
     const x: u16 = @intCast(@min(x_raw, @as(usize, win.width -| w)));
     const pop = win.child(.{
@@ -531,17 +550,19 @@ fn drawCompletion(tv: *TableView, a: Allocator, win: vaxis.Window, input_row: u1
         .height = @intCast(items.len),
     });
     pop.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .index = 0 } } });
-    for (items, 0..) |ci, i| {
+    for (items, 0..) |candidate, i| {
         const sel = i == tv.completion_sel;
         const bg: vaxis.Color = if (sel) theme.selection_bg else .{ .index = 0 };
         if (sel) {
             var cx: u16 = 0;
             while (cx < pop.width) : (cx += 1) pop.writeCell(cx, @intCast(i), .{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = bg } });
         }
-        const name = tv.result.columns[ci];
+        const icon: []const u8 = if (candidate.kind == .operator) "=" else "◦";
         _ = pop.print(&.{
-            .{ .text = " ◦ ", .style = .{ .fg = if (sel) .{ .index = 15 } else theme.muted_color, .bg = bg } },
-            .{ .text = try a.dupe(u8, render.fitWidth(name, w -| 4).text), .style = .{ .fg = if (sel) .{ .index = 15 } else .default, .bg = bg, .bold = sel } },
+            .{ .text = " ", .style = .{ .bg = bg } },
+            .{ .text = icon, .style = .{ .fg = if (sel) .{ .index = 15 } else theme.muted_color, .bg = bg } },
+            .{ .text = " ", .style = .{ .bg = bg } },
+            .{ .text = try a.dupe(u8, render.fitWidth(candidate.text, w -| 4).text), .style = .{ .fg = if (sel) .{ .index = 15 } else .default, .bg = bg, .bold = sel } },
         }, .{ .row_offset = @intCast(i), .wrap = .none });
     }
 }
@@ -786,7 +807,7 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
         (if (tv.completion.items.len > 0)
             " ↑↓ choose column · tab/enter insert · esc hide suggestions"
         else if (tv.browse != null)
-            " enter apply · esc cancel · empty clears the filter · column names complete as you type"
+            " enter apply · esc cancel · empty clears · columns and operators autocomplete"
         else
             " text · col:text · col=value · enter apply · esc cancel")
     else if (tv.browse != null)

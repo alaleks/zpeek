@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const lexer = @import("../sql/lexer.zig");
 const db = @import("../db/db.zig");
 
-pub const Kind = enum { command, table, column, keyword, function, connection };
+pub const Kind = enum { command, table, column, operator, keyword, function, connection };
 
 pub const Candidate = struct {
     text: []const u8,
@@ -90,7 +90,95 @@ pub const Context = struct {
     cache: ?*const SchemaCache,
     connections: []const []const u8,
     commands: []const Command,
+    /// Connected SQL dialect. Enables context-sensitive operator completion.
+    kind: ?db.Kind = null,
 };
+
+const postgres_operators = [_]Candidate{
+    .{ .text = "IN", .kind = .operator, .detail = "membership" },
+    .{ .text = "NOT IN", .kind = .operator, .detail = "not a member" },
+    .{ .text = "ILIKE", .kind = .operator, .detail = "case-insensitive match" },
+    .{ .text = "NOT ILIKE", .kind = .operator, .detail = "case-insensitive mismatch" },
+    .{ .text = "LIKE", .kind = .operator, .detail = "pattern match" },
+    .{ .text = "NOT LIKE", .kind = .operator, .detail = "pattern mismatch" },
+    .{ .text = "IS NULL", .kind = .operator, .detail = "null check" },
+    .{ .text = "IS NOT NULL", .kind = .operator, .detail = "null check" },
+    .{ .text = "BETWEEN", .kind = .operator, .detail = "range" },
+    .{ .text = "=", .kind = .operator, .detail = "equal" },
+    .{ .text = "<>", .kind = .operator, .detail = "not equal" },
+    .{ .text = "<", .kind = .operator, .detail = "less than" },
+    .{ .text = "<=", .kind = .operator, .detail = "at most" },
+    .{ .text = ">", .kind = .operator, .detail = "greater than" },
+    .{ .text = ">=", .kind = .operator, .detail = "at least" },
+    .{ .text = "~", .kind = .operator, .detail = "regular expression" },
+    .{ .text = "~*", .kind = .operator, .detail = "case-insensitive regex" },
+};
+
+const mysql_operators = [_]Candidate{
+    .{ .text = "IN", .kind = .operator, .detail = "membership" },
+    .{ .text = "NOT IN", .kind = .operator, .detail = "not a member" },
+    .{ .text = "LIKE", .kind = .operator, .detail = "pattern match" },
+    .{ .text = "NOT LIKE", .kind = .operator, .detail = "pattern mismatch" },
+    .{ .text = "IS NULL", .kind = .operator, .detail = "null check" },
+    .{ .text = "IS NOT NULL", .kind = .operator, .detail = "null check" },
+    .{ .text = "BETWEEN", .kind = .operator, .detail = "range" },
+    .{ .text = "REGEXP", .kind = .operator, .detail = "regular expression" },
+    .{ .text = "NOT REGEXP", .kind = .operator, .detail = "regex mismatch" },
+    .{ .text = "=", .kind = .operator, .detail = "equal" },
+    .{ .text = "!=", .kind = .operator, .detail = "not equal" },
+    .{ .text = "<>", .kind = .operator, .detail = "not equal" },
+    .{ .text = "<", .kind = .operator, .detail = "less than" },
+    .{ .text = "<=", .kind = .operator, .detail = "at most" },
+    .{ .text = ">", .kind = .operator, .detail = "greater than" },
+    .{ .text = ">=", .kind = .operator, .detail = "at least" },
+};
+
+const sqlite_operators = [_]Candidate{
+    .{ .text = "IN", .kind = .operator, .detail = "membership" },
+    .{ .text = "NOT IN", .kind = .operator, .detail = "not a member" },
+    .{ .text = "LIKE", .kind = .operator, .detail = "case-insensitive ASCII match" },
+    .{ .text = "NOT LIKE", .kind = .operator, .detail = "pattern mismatch" },
+    .{ .text = "GLOB", .kind = .operator, .detail = "case-sensitive pattern" },
+    .{ .text = "NOT GLOB", .kind = .operator, .detail = "case-sensitive mismatch" },
+    .{ .text = "IS NULL", .kind = .operator, .detail = "null check" },
+    .{ .text = "IS NOT NULL", .kind = .operator, .detail = "null check" },
+    .{ .text = "BETWEEN", .kind = .operator, .detail = "range" },
+    .{ .text = "=", .kind = .operator, .detail = "equal" },
+    .{ .text = "!=", .kind = .operator, .detail = "not equal" },
+    .{ .text = "<>", .kind = .operator, .detail = "not equal" },
+    .{ .text = "<", .kind = .operator, .detail = "less than" },
+    .{ .text = "<=", .kind = .operator, .detail = "at most" },
+    .{ .text = ">", .kind = .operator, .detail = "greater than" },
+    .{ .text = ">=", .kind = .operator, .detail = "at least" },
+};
+
+pub fn operators(kind: db.Kind) []const Candidate {
+    return switch (kind) {
+        .postgres => &postgres_operators,
+        .mysql => &mysql_operators,
+        .sqlite => &sqlite_operators,
+    };
+}
+
+pub const OperatorSnippet = struct {
+    suffix: []const u8,
+    /// ASCII bytes to move left after inserting the completed text.
+    cursor_back: usize = 0,
+};
+
+/// Adds useful paired syntax and places the cursor at the first value slot.
+pub fn operatorSnippet(operator: []const u8) OperatorSnippet {
+    if (std.ascii.eqlIgnoreCase(operator, "IN") or std.ascii.eqlIgnoreCase(operator, "NOT IN")) {
+        return .{ .suffix = " ()", .cursor_back = 1 };
+    }
+    if (std.ascii.eqlIgnoreCase(operator, "BETWEEN")) {
+        return .{ .suffix = "  AND ", .cursor_back = 5 };
+    }
+    for ([_][]const u8{ "LIKE", "NOT LIKE", "ILIKE", "NOT ILIKE", "GLOB", "NOT GLOB", "REGEXP", "NOT REGEXP", "~", "~*" }) |pattern_operator| {
+        if (std.ascii.eqlIgnoreCase(operator, pattern_operator)) return .{ .suffix = " ''", .cursor_back = 1 };
+    }
+    return .{ .suffix = " " };
+}
 
 const max_candidates = 200;
 
@@ -124,6 +212,17 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
     const word = sqlWord(before);
     const stmt = currentStatement(ctx.text, ctx.cursor);
     const cache = ctx.cache;
+
+    if (ctx.kind) |kind| {
+        const relative_cursor = ctx.cursor - stmt.start;
+        if (operatorPrefix(stmt.text, relative_cursor, false)) |prefix| {
+            const upper = prefix.len == 0 or std.ascii.isUpper(prefix[0]);
+            for (operators(kind)) |op| {
+                try list.addIfMatch(try caseLike(a, op.text, upper), prefix, .operator, op.detail);
+            }
+            return .{ .replace_len = prefix.len, .candidates = list.items.items };
+        }
+    }
 
     // qualifier.partial -> columns of the qualifier's table
     if (std.mem.lastIndexOfScalar(u8, word, '.')) |dot| {
@@ -207,6 +306,38 @@ fn sqlWord(before: []const u8) []const u8 {
     var i = before.len;
     while (i > 0 and (lexer.isIdentChar(before[i - 1]) or before[i - 1] == '.' or before[i - 1] == '"' or before[i - 1] == '`')) i -= 1;
     return before[i..];
+}
+
+/// Returns the partial operator at the cursor when it follows a column in a
+/// condition. Browse filters set `condition_only`; console SQL must contain a
+/// WHERE, HAVING or JOIN ON clause.
+pub fn operatorPrefix(text: []const u8, cursor: usize, condition_only: bool) ?[]const u8 {
+    const before = text[0..cursor];
+    const word = sqlWord(before);
+    const base = before[0 .. before.len - word.len];
+    var it: lexer.Iterator = .init(base);
+    var last: ?lexer.Token = null;
+    var in_condition = condition_only;
+    while (it.next()) |t| {
+        if (t.tag == .whitespace or t.tag == .comment) continue;
+        last = t;
+        if (t.tag != .keyword) continue;
+        const keyword = t.text(base);
+        if (std.ascii.eqlIgnoreCase(keyword, "where") or std.ascii.eqlIgnoreCase(keyword, "having") or std.ascii.eqlIgnoreCase(keyword, "on")) {
+            in_condition = true;
+        } else if (std.ascii.eqlIgnoreCase(keyword, "group") or std.ascii.eqlIgnoreCase(keyword, "order") or
+            std.ascii.eqlIgnoreCase(keyword, "limit") or std.ascii.eqlIgnoreCase(keyword, "returning") or
+            std.ascii.eqlIgnoreCase(keyword, "union"))
+        {
+            in_condition = false;
+        }
+    }
+    if (!in_condition) return null;
+    const previous = last orelse return null;
+    return switch (previous.tag) {
+        .identifier, .quoted_identifier, .builtin => word,
+        else => null,
+    };
 }
 
 fn unquote(s: []const u8) []const u8 {
@@ -366,4 +497,45 @@ test "keywords keep case and commands" {
     const cmds = [_]Command{ .{ .name = "/tables", .help = "" }, .{ .name = "/types", .help = "" } };
     const c2 = try complete(arena.allocator(), .{ .text = "/ta", .cursor = 3, .cache = null, .connections = &.{}, .commands = &cmds });
     try testing.expectEqual(@as(usize, 1), c2.candidates.len);
+}
+
+test "operators depend on SQL dialect" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const text = "select * from users where name I";
+    const pg = try complete(arena.allocator(), .{ .text = text, .cursor = text.len, .cache = null, .connections = &.{}, .commands = &.{}, .kind = .postgres });
+    try testing.expect(hasCandidate(pg.candidates, "IN"));
+    try testing.expect(hasCandidate(pg.candidates, "ILIKE"));
+
+    const mysql = try complete(arena.allocator(), .{ .text = text, .cursor = text.len, .cache = null, .connections = &.{}, .commands = &.{}, .kind = .mysql });
+    try testing.expect(hasCandidate(mysql.candidates, "IN"));
+    try testing.expect(!hasCandidate(mysql.candidates, "ILIKE"));
+
+    const sqlite_text = "select * from users where name G";
+    const sqlite = try complete(arena.allocator(), .{ .text = sqlite_text, .cursor = sqlite_text.len, .cache = null, .connections = &.{}, .commands = &.{}, .kind = .sqlite });
+    try testing.expect(hasCandidate(sqlite.candidates, "GLOB"));
+    try testing.expect(!hasCandidate(sqlite.candidates, "ILIKE"));
+}
+
+test "operator position requires a condition in console SQL" {
+    try testing.expect(operatorPrefix("name I", "name I".len, true) != null);
+    try testing.expect(operatorPrefix("select name I", "select name I".len, false) == null);
+    try testing.expect(operatorPrefix("select * from users where name I", "select * from users where name I".len, false) != null);
+}
+
+test "operator snippets place the cursor at the value" {
+    const in = operatorSnippet("IN");
+    try testing.expectEqualStrings(" ()", in.suffix);
+    try testing.expectEqual(@as(usize, 1), in.cursor_back);
+    const between = operatorSnippet("between");
+    try testing.expectEqualStrings("  AND ", between.suffix);
+    try testing.expectEqual(@as(usize, 5), between.cursor_back);
+    const like = operatorSnippet("ILIKE");
+    try testing.expectEqualStrings(" ''", like.suffix);
+    try testing.expectEqual(@as(usize, 1), like.cursor_back);
+}
+
+fn hasCandidate(candidates: []const Candidate, text: []const u8) bool {
+    for (candidates) |candidate| if (std.mem.eql(u8, candidate.text, text)) return true;
+    return false;
 }
