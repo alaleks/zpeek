@@ -242,6 +242,16 @@ fn executeOnce(gpa: Allocator, io: Io, entry: config.Entry, sql: []const u8, std
     };
     defer conn.close();
 
+    const dialect: @import("sql/lexer.zig").Dialect = switch (conn.kind) {
+        .postgres => .postgres,
+        .mysql => .mysql,
+        .sqlite => .sqlite,
+    };
+    if (@import("sql/lexer.zig").hasDeleteWithoutWhere(sql, dialect)) {
+        try stderr.print("zpeek: {s}\n", .{App.delete_without_where_message});
+        return 1;
+    }
+
     var result = conn.query(gpa, sql) catch |e| switch (e) {
         error.QueryFailed, error.ConnectionLost => {
             try stderr.print("{s}\n", .{conn.lastError()});
@@ -296,4 +306,5 @@ test {
     _ = @import("db/schema.zig");
     _ = @import("ui/Editor.zig");
     _ = @import("ui/complete.zig");
+    _ = @import("queries.zig");
 }

@@ -9,7 +9,7 @@ const render = @import("../render.zig");
 
 const Picker = @This();
 
-pub const Purpose = enum { connect, browse, describe };
+pub const Purpose = enum { connect, browse, describe, query };
 
 pub const Item = struct {
     label: []const u8,
@@ -123,7 +123,7 @@ pub fn draw(p: *Picker, win: vaxis.Window, a: Allocator) Allocator.Error!void {
     box.clear();
 
     _ = box.print(&.{.{ .text = p.title, .style = theme.accent_bold }}, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
-    const prompt = "❯ ";
+    const prompt = "> ";
     _ = box.print(&.{
         .{ .text = prompt, .style = theme.accent_bold },
         .{ .text = p.query.items },
@@ -157,7 +157,7 @@ pub fn draw(p: *Picker, win: vaxis.Window, a: Allocator) Allocator.Error!void {
         var detail_style = theme.dim;
         if (sel) detail_style = .{ .fg = .{ .index = 15 }, .bg = style.bg };
         _ = box.print(&.{
-            .{ .text = if (sel) " ❯ " else "   ", .style = style },
+            .{ .text = if (sel) " > " else "   ", .style = style },
             .{ .text = fit.text, .style = if (sel) .{ .bold = true, .bg = style.bg, .fg = style.fg } else theme.bold },
             .{ .text = try spaces(a, pad), .style = style },
             .{ .text = it.detail, .style = detail_style },

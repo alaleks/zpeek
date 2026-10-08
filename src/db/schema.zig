@@ -372,6 +372,49 @@ pub fn browseSql(
     return out.items;
 }
 
+/// Primary key column names of `table`, in key order.
+pub fn primaryKeySql(a: Allocator, kind: Kind, table: []const u8) Allocator.Error![]const u8 {
+    return switch (kind) {
+        .postgres => std.fmt.allocPrint(a,
+            \\select a.attname from pg_index i
+            \\  join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
+            \\where i.indrelid = {s}::regclass and i.indisprimary
+            \\order by array_position(i.indkey::int2[], a.attnum)
+        , .{try quoteLiteral(a, kind, try quoteName(a, kind, table))}),
+        .mysql => std.fmt.allocPrint(a,
+            \\select column_name from information_schema.key_column_usage
+            \\where table_schema = database() and table_name = {s} and constraint_name = 'PRIMARY'
+            \\order by ordinal_position
+        , .{try quoteLiteral(a, kind, splitName(table).name)}),
+        .sqlite => std.fmt.allocPrint(a,
+            \\select name from pragma_table_info({s}) where pk > 0 order by pk
+        , .{try quoteLiteral(a, kind, table)}),
+    };
+}
+
+/// `DELETE FROM table WHERE pk1 = v1 AND …` for one row. Values are passed as
+/// literals (the server casts them to the column types); NULL becomes IS NULL.
+pub fn deleteRowSql(
+    a: Allocator,
+    kind: Kind,
+    table: []const u8,
+    key_columns: []const []const u8,
+    key_values: []const ?[]const u8,
+) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(a, "DELETE FROM {s} WHERE ", .{try quoteName(a, kind, table)});
+    for (key_columns, key_values, 0..) |col, value, i| {
+        if (i > 0) try out.appendSlice(a, " AND ");
+        try out.appendSlice(a, try quoteIdent(a, kind, col));
+        if (value) |v| {
+            try out.print(a, " = {s}", .{try quoteLiteral(a, kind, v)});
+        } else {
+            try out.appendSlice(a, " IS NULL");
+        }
+    }
+    return out.items;
+}
+
 pub fn countSql(a: Allocator, kind: Kind, table: []const u8, filter: ?[]const u8) Allocator.Error![]const u8 {
     const where: []const u8 = if (filter) |f|
         (if (std.mem.trim(u8, f, " \t").len > 0) try std.fmt.allocPrint(a, " where {s}", .{f}) else "")
@@ -439,6 +482,20 @@ pub fn quoteLiteral(a: Allocator, kind: Kind, s: []const u8) Allocator.Error![]c
 }
 
 const testing = std.testing;
+
+test "delete row sql" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "DELETE FROM \"sales\".\"orders\" WHERE \"id\" = '42' AND \"part\" IS NULL",
+        try deleteRowSql(a, .postgres, "sales.orders", &.{ "id", "part" }, &.{ "42", null }),
+    );
+    try testing.expectEqualStrings(
+        "DELETE FROM `t` WHERE `name` = 'O''Brien\\\\'",
+        try deleteRowSql(a, .mysql, "t", &.{"name"}, &.{"O'Brien\\"}),
+    );
+}
 
 test "quoting" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

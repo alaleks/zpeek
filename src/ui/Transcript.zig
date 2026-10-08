@@ -190,7 +190,7 @@ fn ensureLayout(e: *Entry, width: u16) Allocator.Error!void {
     switch (e.content) {
         .input => |s| {
             const segs = try theme.highlight(a, s, .{});
-            try wrapWithPrefix(a, &lines, segs, width, .{ .text = "❯ ", .style = theme.accent_bold }, "  ");
+            try wrapWithPrefix(a, &lines, segs, width, .{ .text = "> ", .style = theme.accent_bold }, "  ");
         },
         .message => |m| {
             const style: Style = switch (m.kind) {
@@ -201,7 +201,7 @@ fn ensureLayout(e: *Entry, width: u16) Allocator.Error!void {
                 .warn => theme.warn,
             };
             const segs = try a.dupe(Segment, &.{.{ .text = m.text, .style = style }});
-            try wrapWithPrefix(a, &lines, segs, width, .{ .text = "  ⎿ ", .style = theme.dim }, "    ");
+            try wrapWithPrefix(a, &lines, segs, width, .{ .text = "  └ ", .style = theme.dim }, "    ");
         },
         .code => |s| {
             const segs = try theme.highlight(a, s, .{});
@@ -291,7 +291,7 @@ fn layoutResult(
     if (!r.hasRows()) {
         const status = try std.fmt.allocPrint(a, "{s} · {d} ms", .{ if (r.status.len > 0) r.status else "OK", elapsed_ms });
         try out.append(a, try a.dupe(Segment, &.{
-            .{ .text = "  ⎿ ", .style = theme.dim },
+            .{ .text = "  └ ", .style = theme.dim },
             .{ .text = status, .style = theme.ok },
         }));
         return;
@@ -361,7 +361,7 @@ fn layoutResult(
         try status.appendSlice(a, " — ctrl+o to open");
     }
     try out.append(a, try a.dupe(Segment, &.{
-        .{ .text = "  ⎿ ", .style = theme.dim },
+        .{ .text = "  └ ", .style = theme.dim },
         .{ .text = status.items, .style = theme.dim },
     }));
 }

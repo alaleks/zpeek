@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const vaxis = @import("vaxis");
 const Segment = vaxis.Segment;
 const db = @import("../db/db.zig");
+const config = @import("../config.zig");
 const schema = @import("../db/schema.zig");
 const render = @import("../render.zig");
 const theme = @import("theme.zig");
@@ -18,8 +19,12 @@ const Kind = @import("../conninfo.zig").Kind;
 
 const TableView = @This();
 
+pub const BadgeColor = config.Color;
+
 pub const Browse = struct {
     table: []const u8,
+    database: []const u8 = "",
+    database_color: ?BadgeColor = null,
     filter: []const u8 = "",
     order: ?schema.Order = null,
     offset: usize = 0,
@@ -38,6 +43,8 @@ pub const Action = union(enum) {
     copy: []const u8,
     /// Show a short message in the status bar.
     notice: []const u8,
+    /// Confirmed row deletion: run this statement, then reload the page.
+    delete_row: []const u8,
 };
 
 gpa: Allocator,
@@ -61,6 +68,11 @@ col: usize = 0,
 top: usize = 0,
 /// First drawn position within `visible`.
 left: usize = 0,
+
+/// Primary key columns of the browsed table (owned); empty when unknown.
+primary_key: std.ArrayList([]const u8) = .empty,
+/// DELETE statement awaiting confirmation (owned).
+confirm_delete: ?[]const u8 = null,
 
 /// Column chooser overlay state (`c` key).
 chooser: ?struct { sel: usize = 0, top: usize = 0 } = null,
@@ -97,6 +109,7 @@ pub fn init(gpa: Allocator, result: *db.Result, owns_result: bool, title: []cons
     };
     if (tv.browse) |*b| {
         b.table = try gpa.dupe(u8, b.table);
+        b.database = try gpa.dupe(u8, b.database);
         b.filter = try gpa.dupe(u8, b.filter);
         if (b.order) |*o| o.column = try gpa.dupe(u8, o.column);
     }
@@ -111,6 +124,7 @@ pub fn deinit(tv: *TableView) void {
     }
     if (tv.browse) |b| {
         tv.gpa.free(b.table);
+        tv.gpa.free(b.database);
         tv.gpa.free(b.filter);
         if (b.order) |o| tv.gpa.free(o.column);
     }
@@ -122,6 +136,8 @@ pub fn deinit(tv: *TableView) void {
     tv.local_filter.deinit(tv.gpa);
     tv.filter_editor.deinit();
     tv.completion.deinit(tv.gpa);
+    tv.clearPrimaryKey();
+    if (tv.confirm_delete) |sql| tv.gpa.free(sql);
     tv.frame_arena.deinit();
     tv.gpa.destroy(tv);
 }
@@ -279,6 +295,14 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
     tv.notice = null;
     if (tv.editing_filter) return tv.handleFilterKey(key);
     if (tv.chooser != null) return tv.handleChooserKey(key);
+    if (tv.confirm_delete) |sql| {
+        // Only an explicit "y" deletes; any other key cancels.
+        tv.confirm_delete = null;
+        if (key.matches('y', .{}) or key.matches('Y', .{})) return .{ .delete_row = sql };
+        tv.gpa.free(sql);
+        tv.notice = "delete canceled";
+        return .none;
+    }
     if (tv.detail) {
         if (key.matchesAny(&.{ vaxis.Key.escape, vaxis.Key.enter, 'q' }, .{})) {
             tv.detail = false;
@@ -330,6 +354,8 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
         const current = if (tv.browse) |b| b.filter else tv.local_filter.items;
         try tv.filter_editor.setText(current);
         tv.completion.clearRetainingCapacity();
+    } else if (key.matches('d', .{}) or key.matches(vaxis.Key.delete, .{})) {
+        return tv.requestDelete();
     } else if (key.matches('s', .{})) {
         return tv.toggleSort();
     } else if (key.matches('c', .{})) {
@@ -342,7 +368,7 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
         return tv.nextPage();
     } else if (key.matches('p', .{}) or key.matches('[', .{})) {
         return tv.prevPage();
-    } else if (key.matches('r', .{})) {
+    } else if (key.matches('r', .{}) or key.matches(vaxis.Key.f5, .{})) {
         if (tv.browse != null) return .reload;
     } else if (key.matches('y', .{})) {
         return .{ .copy = tv.currentValue() orelse "" };
@@ -557,7 +583,7 @@ fn drawCompletion(tv: *TableView, a: Allocator, win: vaxis.Window, input_row: u1
             var cx: u16 = 0;
             while (cx < pop.width) : (cx += 1) pop.writeCell(cx, @intCast(i), .{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = bg } });
         }
-        const icon: []const u8 = if (candidate.kind == .operator) "=" else "◦";
+        const icon: []const u8 = if (candidate.kind == .operator) "=" else "c";
         _ = pop.print(&.{
             .{ .text = " ", .style = .{ .bg = bg } },
             .{ .text = icon, .style = .{ .fg = if (sel) .{ .index = 15 } else theme.muted_color, .bg = bg } },
@@ -565,6 +591,67 @@ fn drawCompletion(tv: *TableView, a: Allocator, win: vaxis.Window, input_row: u1
             .{ .text = try a.dupe(u8, render.fitWidth(candidate.text, w -| 4).text), .style = .{ .fg = if (sel) .{ .index = 15 } else .default, .bg = bg, .bold = sel } },
         }, .{ .row_offset = @intCast(i), .wrap = .none });
     }
+}
+
+pub fn setPrimaryKey(tv: *TableView, columns: []const []const u8) Allocator.Error!void {
+    tv.clearPrimaryKey();
+    for (columns) |c| try tv.primary_key.append(tv.gpa, try tv.gpa.dupe(u8, c));
+}
+
+fn clearPrimaryKey(tv: *TableView) void {
+    for (tv.primary_key.items) |c| tv.gpa.free(c);
+    tv.primary_key.clearRetainingCapacity();
+    tv.primary_key.deinit(tv.gpa);
+    tv.primary_key = .empty;
+}
+
+/// Prepares `DELETE … WHERE <primary key> = <values>` for the current row and
+/// asks for confirmation. Without a primary key nothing is offered, because
+/// the row could not be identified unambiguously.
+fn requestDelete(tv: *TableView) Allocator.Error!Action {
+    const b = tv.browse orelse return .{ .notice = "row delete works in /browse" };
+    if (tv.view.items.len == 0) return .{ .notice = "no row to delete" };
+    if (tv.primary_key.items.len == 0) return .{ .notice = "table has no primary key — delete with an SQL statement" };
+    const row = tv.result.rows[tv.view.items[tv.row]];
+    const a = tv.frame_arena.allocator();
+    const values = try a.alloc(?[]const u8, tv.primary_key.items.len);
+    for (tv.primary_key.items, values) |pk, *v| {
+        const ci = for (tv.result.columns, 0..) |c, i| {
+            if (std.mem.eql(u8, c, pk)) break i;
+        } else return .{ .notice = "primary key column is not in the result — cannot delete" };
+        v.* = row[ci];
+    }
+    const sql = try schema.deleteRowSql(a, b.kind, b.table, tv.primary_key.items, values);
+    tv.confirm_delete = try tv.gpa.dupe(u8, sql);
+    return .none;
+}
+
+fn drawConfirmDelete(tv: *TableView, a: Allocator, win: vaxis.Window, sql: []const u8) Allocator.Error!void {
+    _ = tv;
+    const w: u16 = @min(win.width -| 4, 90);
+    var lines: std.ArrayList(Transcript.Line) = .empty;
+    try Transcript.wrapWithPrefix(a, &lines, try theme.highlight(a, sql, .{}), w -| 4, .{ .text = "" }, "");
+    // border(2) + title + blank + sql + blank + hint
+    const h: u16 = @intCast(@min(@as(usize, win.height -| 2), lines.items.len + 6));
+    const box = win.child(.{
+        .x_off = @intCast((win.width -| w) / 2),
+        .y_off = @intCast((win.height -| h) / 2),
+        .width = w,
+        .height = h,
+        .border = .{ .where = .all, .style = theme.err },
+    });
+    box.clear();
+    _ = box.print(&.{.{ .text = "Delete this row?", .style = theme.err_bold }}, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
+    for (lines.items, 0..) |line, i| {
+        if (i + 2 >= box.height -| 2) break;
+        _ = box.print(line, .{ .row_offset = @intCast(i + 2), .col_offset = 1, .wrap = .none });
+    }
+    _ = box.print(&.{
+        .{ .text = "y", .style = theme.err_bold },
+        .{ .text = " delete   ", .style = theme.dim },
+        .{ .text = "any other key", .style = theme.bold },
+        .{ .text = " cancel", .style = theme.dim },
+    }, .{ .row_offset = box.height -| 1, .col_offset = 1, .wrap = .none });
 }
 
 fn toggleSort(tv: *TableView) Allocator.Error!Action {
@@ -627,16 +714,23 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
     const r = tv.result;
     const footer_h: u16 = 2;
     const grid_h = win.height - footer_h;
-    // title line + header + rule
-    const body_h: usize = grid_h -| 3;
+    // title line + blank line + header + rule
+    const body_h: usize = grid_h -| 4;
     tv.page_rows = @max(body_h, 1);
 
     // Title
     {
         var title: std.ArrayList(Segment) = .empty;
         try title.append(a, .{ .text = " ", .style = .{} });
-        try title.append(a, .{ .text = tv.title, .style = theme.accent_bold });
         if (tv.browse) |b| {
+            if (b.database.len > 0) {
+                try title.append(a, .{
+                    .text = try std.fmt.allocPrint(a, " {s} ", .{b.database}),
+                    .style = databaseBadgeStyle(b.database_color),
+                });
+                try title.append(a, .{ .text = "  ", .style = .{} });
+            }
+            try title.append(a, .{ .text = tv.title, .style = theme.accent_bold });
             if (b.filter.len > 0) {
                 try title.append(a, .{ .text = "  where ", .style = theme.dim });
                 try title.appendSlice(a, try theme.highlight(a, b.filter, .{}));
@@ -644,9 +738,12 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
             if (b.order) |o| {
                 try title.append(a, .{ .text = try std.fmt.allocPrint(a, "  order by {s}{s}", .{ o.column, if (o.descending) " desc" else "" }), .style = theme.dim });
             }
-        } else if (tv.local_filter.items.len > 0) {
-            try title.append(a, .{ .text = "  filter: ", .style = theme.dim });
-            try title.append(a, .{ .text = tv.local_filter.items, .style = theme.warn });
+        } else {
+            try title.append(a, .{ .text = tv.title, .style = theme.accent_bold });
+            if (tv.local_filter.items.len > 0) {
+                try title.append(a, .{ .text = "  filter: ", .style = theme.dim });
+                try title.append(a, .{ .text = tv.local_filter.items, .style = theme.warn });
+            }
         }
         _ = win.print(title.items, .{ .row_offset = 0, .wrap = .none });
     }
@@ -679,7 +776,8 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
         x += w + 3;
     }
 
-    const grid = win.child(.{ .y_off = 1, .height = grid_h - 1 });
+    // A blank line separates the title (database, table) from the column names.
+    const grid = win.child(.{ .y_off = 2, .height = grid_h - 2 });
 
     // Header
     {
@@ -739,6 +837,26 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
 
     if (tv.detail) try tv.drawDetail(a, win);
     if (tv.chooser != null) try tv.drawChooser(a, win);
+    if (tv.confirm_delete) |sql| try tv.drawConfirmDelete(a, win, sql);
+}
+
+fn databaseBadgeStyle(color: ?BadgeColor) vaxis.Style {
+    const c = color orelse return .{ .fg = .{ .index = 15 }, .bg = .{ .index = 2 }, .bold = true };
+    const luminance = @as(u32, c.r) * 299 + @as(u32, c.g) * 587 + @as(u32, c.b) * 114;
+    const foreground: vaxis.Color = if (luminance >= 128_000) .{ .index = 0 } else .{ .index = 15 };
+    return .{ .fg = foreground, .bg = .{ .index = c.ansi256() }, .bold = true };
+}
+
+test "database badge chooses contrasting text" {
+    const dark = databaseBadgeStyle(.{ .r = 0x10, .g = 0x20, .b = 0x30 });
+    try std.testing.expectEqual(vaxis.Color{ .index = 15 }, dark.fg);
+    const light = databaseBadgeStyle(.{ .r = 0xf0, .g = 0xe0, .b = 0xd0 });
+    try std.testing.expectEqual(vaxis.Color{ .index = 0 }, light.fg);
+}
+
+test "database badge uses terminal palette background" {
+    const tomato = databaseBadgeStyle(.{ .r = 0xff, .g = 0x63, .b = 0x47 });
+    try std.testing.expectEqual(vaxis.Color{ .index = 209 }, tomato.bg);
 }
 
 fn drawCell(win: vaxis.Window, x: u16, y: u16, width: u16, text: []const u8, style: vaxis.Style) void {
@@ -811,7 +929,7 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
         else
             " text · col:text · col=value · enter apply · esc cancel")
     else if (tv.browse != null)
-        " ↑↓←→ move · enter cell · / where · s sort · c columns · x hide · n/p page · y copy · q back"
+        " ↑↓←→ move · enter cell · / where · s sort · c columns · x hide · d delete · n/p page · r/F5 refresh · q back"
     else
         " ↑↓←→ move · enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
     _ = win.print(&.{.{ .text = hint, .style = theme.dim }}, .{ .row_offset = 1, .wrap = .none });
@@ -890,7 +1008,7 @@ fn drawChooser(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!
         }
         _ = box.print(&.{
             .{ .text = " ", .style = .{ .bg = bg } },
-            .{ .text = if (shown) "[✓] " else "[ ] ", .style = .{ .fg = if (shown) theme.accent else theme.muted_color, .bg = bg, .bold = shown } },
+            .{ .text = if (shown) "[x] " else "[ ] ", .style = .{ .fg = if (shown) theme.accent else theme.muted_color, .bg = bg, .bold = shown } },
             .{ .text = render.fitWidth(name, box.width -| 6).text, .style = .{ .bg = bg, .fg = if (shown) .default else theme.muted_color, .bold = sel } },
         }, .{ .row_offset = row, .wrap = .none });
     }

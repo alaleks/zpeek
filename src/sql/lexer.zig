@@ -242,6 +242,56 @@ pub fn isBuiltin(word: []const u8) bool {
     return inList(&builtins, word);
 }
 
+/// True when the script contains a DELETE statement without a top-level
+/// WHERE clause (WHERE inside subqueries, strings or comments does not count).
+/// Such statements are refused so a table cannot be emptied by accident.
+pub fn hasDeleteWithoutWhere(src: []const u8, dialect: Dialect) bool {
+    var it: Iterator = .initDialect(src, dialect);
+    var depth: usize = 0;
+    var in_delete = false;
+    var has_where = false;
+    while (it.next()) |t| {
+        switch (t.tag) {
+            .punctuation => switch (src[t.start]) {
+                '(' => depth += 1,
+                ')' => depth -|= 1,
+                ';' => if (depth == 0) {
+                    if (in_delete and !has_where) return true;
+                    in_delete = false;
+                    has_where = false;
+                },
+                else => {},
+            },
+            .keyword => if (depth == 0) {
+                const w = t.text(src);
+                if (std.ascii.eqlIgnoreCase(w, "delete")) {
+                    in_delete = true;
+                    has_where = false;
+                } else if (in_delete and std.ascii.eqlIgnoreCase(w, "where")) {
+                    has_where = true;
+                }
+            },
+            else => {},
+        }
+    }
+    return in_delete and !has_where;
+}
+
+test "delete without where" {
+    try std.testing.expect(hasDeleteWithoutWhere("DELETE FROM users", .postgres));
+    try std.testing.expect(hasDeleteWithoutWhere("delete from users;", .mysql));
+    try std.testing.expect(hasDeleteWithoutWhere("select 1; delete from t", .sqlite));
+    try std.testing.expect(hasDeleteWithoutWhere("delete from t where id in (select id from x); delete from y", .postgres));
+    try std.testing.expect(hasDeleteWithoutWhere("delete from t -- where id = 1", .postgres));
+    try std.testing.expect(hasDeleteWithoutWhere("delete from t using x", .postgres));
+    try std.testing.expect(hasDeleteWithoutWhere("with a as (select 1) delete from t", .postgres));
+    try std.testing.expect(hasDeleteWithoutWhere("delete from t returning (select 1 where true)", .postgres));
+    try std.testing.expect(!hasDeleteWithoutWhere("DELETE FROM users WHERE id = 1", .postgres));
+    try std.testing.expect(!hasDeleteWithoutWhere("delete from t where true", .sqlite));
+    try std.testing.expect(!hasDeleteWithoutWhere("select 'delete from t'", .postgres));
+    try std.testing.expect(!hasDeleteWithoutWhere("create trigger x after insert on t begin delete from y where 1; end", .sqlite));
+}
+
 /// Splits a script into statements at top-level semicolons (ignoring those in
 /// strings, comments and dollar quotes). Empty statements are skipped.
 pub fn splitStatements(src: []const u8, dialect: Dialect, out: *std.ArrayList([]const u8), gpa: std.mem.Allocator) !void {

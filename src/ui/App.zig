@@ -20,6 +20,7 @@ const Transcript = @import("Transcript.zig");
 const TableView = @import("TableView.zig");
 const Picker = @import("Picker.zig");
 const complete = @import("complete.zig");
+const queries = @import("../queries.zig");
 
 const App = @This();
 
@@ -64,6 +65,9 @@ const commands = [_]complete.Command{
     .{ .name = "/def", .args = "<name>", .help = "source of a view, function, trigger or enum", .arg = .object },
     .{ .name = "/databases", .help = "list databases", .aliases = &.{"/dbs"} },
     .{ .name = "/refresh", .help = "reload table/column names for completion" },
+    .{ .name = "/save", .args = "<name>", .help = "save the last SQL you ran under a name" },
+    .{ .name = "/queries", .args = "[name]", .help = "saved queries: pick one to put it in the input", .arg = .query, .aliases = &.{"/sq"} },
+    .{ .name = "/unsave", .args = "<name>", .help = "delete a saved query", .arg = .query },
     .{ .name = "/clear", .help = "clear the screen" },
     .{ .name = "/quit", .help = "exit", .aliases = &.{ "/q", "/exit" } },
 };
@@ -78,6 +82,8 @@ const JobKind = union(enum) {
     definition: []const u8,
     browse_open: TableView.Browse,
     browse_reload,
+    /// A confirmed single-row DELETE from the table viewer.
+    browse_delete,
     cache,
 };
 
@@ -125,6 +131,7 @@ picker: ?*Picker = null,
 conn: ?db.Connection = null,
 conn_name: []const u8 = "",
 conn_params: ?conninfo.Params = null,
+conn_color: ?config.Color = null,
 conn_arena: std.heap.ArenaAllocator,
 cache: ?complete.SchemaCache = null,
 
@@ -138,6 +145,8 @@ popup_arena: std.heap.ArenaAllocator,
 pasting: bool = false,
 exit_armed: bool = false,
 notice: std.ArrayList(u8) = .empty,
+/// The last SQL text sent to the server, for /save.
+last_sql: std.ArrayList(u8) = .empty,
 frame_arena: std.heap.ArenaAllocator,
 history_path: ?[]const u8 = null,
 
@@ -145,6 +154,8 @@ const Popup = struct {
     completion: complete.Completion,
     selected: usize = 0,
     top: usize = 0,
+    /// The user moved the selection; Enter then inserts instead of running.
+    navigated: bool = false,
 };
 
 pub fn run(opts: Options) !void {
@@ -186,6 +197,10 @@ pub fn run(opts: Options) !void {
     try app.vx.setTitle(writer, "zpeek");
     try writer.flush();
     try app.vx.queryTerminal(writer, .fromSeconds(1));
+    // RGB colors as `38;2;r;g;b`: the colon form vaxis uses by default is not
+    // understood by several terminals (Zed, Terminal.app, …), which then print
+    // the parameters as text and shift the layout.
+    app.vx.sgr = .legacy;
 
     app.ticker = try app.io.concurrent(tickerTask, .{app});
     defer if (app.ticker) |*t| t.cancel(app.io);
@@ -225,6 +240,7 @@ fn deinit(app: *App) void {
     app.popup_arena.deinit();
     app.frame_arena.deinit();
     app.notice.deinit(app.gpa);
+    app.last_sql.deinit(app.gpa);
 }
 
 fn tickerTask(app: *App) void {
@@ -243,8 +259,9 @@ fn historyPath(app: *App) !?[]const u8 {
     if (app.env.get("XDG_STATE_HOME")) |x| {
         if (x.len > 0) return try std.fs.path.join(a, &.{ x, "zpeek", "history" });
     }
-    const home = app.env.get("HOME") orelse return null;
-    return try std.fs.path.join(a, &.{ home, ".local", "state", "zpeek", "history" });
+    if (app.env.get("HOME")) |home| return try std.fs.path.join(a, &.{ home, ".local", "state", "zpeek", "history" });
+    if (app.env.get("LOCALAPPDATA")) |local| return try std.fs.path.join(a, &.{ local, "zpeek", "history" });
+    return null;
 }
 
 fn loadHistory(app: *App) !void {
@@ -430,11 +447,11 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             if (std.mem.startsWith(u8, e.text(), "/")) {
                 try app.openCompletion(false);
             } else if (app.conn != null) {
-                // Operators appear live after a column; other SQL completion
-                // remains explicit on Tab to avoid a noisy popup.
+                // SQL suggestions follow typing (keywords for the dialect,
+                // tables after FROM, columns after WHERE, operators).
                 try app.openCompletion(false);
                 if (app.popup) |p| {
-                    if (p.completion.candidates[0].kind != .operator) app.closePopup();
+                    if (!p.completion.auto or p.completion.exact_match) app.closePopup();
                 }
             }
         }
@@ -447,10 +464,12 @@ fn handlePopupKey(app: *App, key: vaxis.Key) !bool {
     const n = p.completion.candidates.len;
     if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
         p.selected = (p.selected + 1) % n;
+        p.navigated = true;
         return true;
     }
     if (key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true })) {
         p.selected = (p.selected + n - 1) % n;
+        p.navigated = true;
         return true;
     }
     if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.enter, .{})) {
@@ -461,6 +480,9 @@ fn handlePopupKey(app: *App, key: vaxis.Key) !bool {
             app.closePopup();
             return false;
         }
+        // While the list is open, Enter inserts the selected suggestion (like
+        // Tab). The list closes on space or punctuation, and it does not open
+        // for an already complete word, so Enter then runs the query.
         try app.acceptCandidate(cand, p.completion.replace_len);
         return true;
     }
@@ -481,6 +503,10 @@ fn handlePopupKey(app: *App, key: vaxis.Key) !bool {
                 app.closePopup();
             } else {
                 try app.openCompletion(false);
+                if (app.popup) |np| {
+                    const is_command = std.mem.startsWith(u8, app.editor.text(), "/");
+                    if (!is_command and (np.completion.exact_match or !np.completion.auto)) app.closePopup();
+                }
             }
             return true;
         }
@@ -503,9 +529,16 @@ fn acceptCandidate(app: *App, cand: complete.Candidate, replace_len: usize) Allo
         text = try std.mem.concat(a, u8, &.{ text, snippet.suffix });
         cursor_back = snippet.cursor_back;
     }
+    if (cand.kind == .keyword) text = try std.mem.concat(a, u8, &.{ text, " " });
     try app.editor.replaceBeforeCursorAndMove(replace_len, text, cursor_back);
     app.closePopup();
-    if (cand.kind == .command and std.mem.endsWith(u8, text, " ")) try app.openCompletion(false);
+    // Show what can follow right away: tables after FROM, columns after WHERE…
+    if ((cand.kind == .command or cand.kind == .keyword) and std.mem.endsWith(u8, text, " ")) {
+        try app.openCompletion(false);
+        if (app.popup) |p| {
+            if (!p.completion.auto) app.closePopup();
+        }
+    }
 }
 
 /// Quotes identifiers that are not plain lowercase names.
@@ -534,6 +567,7 @@ fn openCompletion(app: *App, explicit: bool) Allocator.Error!void {
         .cursor = app.editor.cursor,
         .cache = if (app.cache) |*c| c else null,
         .connections = names.items,
+        .queries = try app.savedQueryNames(a),
         .commands = &commands,
         .kind = if (app.conn) |conn| conn.kind else null,
     });
@@ -594,6 +628,12 @@ fn handlePickerKey(app: *App, key: vaxis.Key) !void {
                     app.closePicker();
                     if (purpose == .browse) try app.startBrowse(name, "") else try app.startDescribe(name);
                 },
+                .query => {
+                    const name = try app.gpa.dupe(u8, label);
+                    defer app.gpa.free(name);
+                    app.closePicker();
+                    try app.loadSavedQuery(name);
+                },
             }
         },
         .raw => |text| {
@@ -632,6 +672,12 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
             tv.notice = "copied to clipboard";
         },
         .notice => |n| tv.notice = n,
+        .delete_row => |sql| {
+            defer app.gpa.free(sql);
+            const job = try app.newJob(.browse_delete);
+            job.sqls = try job.arena.allocator().dupe([]const u8, &.{try job.arena.allocator().dupe(u8, sql)});
+            try app.startJob(job);
+        },
     }
 }
 
@@ -659,6 +705,9 @@ fn submit(app: *App) !void {
         .mysql => .mysql,
         .sqlite => .sqlite,
     };
+    if (lexer.hasDeleteWithoutWhere(text, dialect)) {
+        return app.transcript.addMessage(.err, "{s}", .{delete_without_where_message});
+    }
     try lexer.splitStatements(text, dialect, &stmts, app.gpa);
     if (stmts.items.len == 0) return;
     const job = try app.newJob(.console);
@@ -667,8 +716,56 @@ fn submit(app: *App) !void {
     for (stmts.items, sqls) |s, *d| d.* = try a.dupe(u8, s);
     job.sqls = sqls;
     job.max_rows = console_row_limit;
+    app.last_sql.clearRetainingCapacity();
+    try app.last_sql.appendSlice(app.gpa, text);
     try app.startJob(job);
 }
+
+// ───────────────────────────── saved queries ─────────────────────────────
+
+fn queriesDir(app: *App) !?[]const u8 {
+    return queries.dirPath(app.frame_arena.allocator(), app.cfg.path);
+}
+
+fn savedQueryNames(app: *App, a: Allocator) ![]const []const u8 {
+    const dir = (try app.queriesDir()) orelse return &.{};
+    const entries = queries.list(a, app.io, dir) catch return &.{};
+    const names = try a.alloc([]const u8, entries.len);
+    for (entries, names) |e, *n| n.* = e.name;
+    return names;
+}
+
+fn saveQuery(app: *App, name: []const u8) !void {
+    if (!queries.validName(name)) return app.transcript.addMessage(.err, "usage: /save <name> — letters, digits, '_', '-', '.'", .{});
+    if (app.last_sql.items.len == 0) return app.transcript.addMessage(.err, "nothing to save yet — run an SQL query first", .{});
+    const dir = (try app.queriesDir()) orelse return app.transcript.addMessage(.err, "cannot determine the config directory", .{});
+    queries.save(app.gpa, app.io, dir, name, app.last_sql.items) catch |err| {
+        return app.transcript.addMessage(.err, "cannot save query: {t}", .{err});
+    };
+    try app.transcript.addMessage(.ok, "saved as '{s}' ({s}) — /queries to use it", .{ name, dir });
+}
+
+fn loadSavedQuery(app: *App, name: []const u8) !void {
+    const dir = (try app.queriesDir()) orelse return;
+    const sql = queries.load(app.frame_arena.allocator(), app.io, dir, name) catch {
+        return app.transcript.addMessage(.err, "no saved query named '{s}'", .{name});
+    };
+    // Put it in the input for review instead of running it right away.
+    try app.editor.setText(sql);
+}
+
+fn openQueriesPicker(app: *App) !void {
+    const dir = (try app.queriesDir()) orelse return app.transcript.addMessage(.err, "cannot determine the config directory", .{});
+    const a = app.frame_arena.allocator();
+    const entries = queries.list(a, app.io, dir) catch |err| return app.transcript.addMessage(.err, "cannot read {s}: {t}", .{ dir, err });
+    if (entries.len == 0) return app.transcript.addMessage(.dim, "no saved queries yet — run SQL, then /save <name>", .{});
+    var items: std.ArrayList(Picker.Item) = .empty;
+    for (entries) |e| try items.append(a, .{ .label = e.name, .detail = e.preview });
+    app.picker = try Picker.init(app.gpa, .query, "Saved queries", items.items, false);
+    app.mode = .picker;
+}
+
+pub const delete_without_where_message = "DELETE without WHERE is blocked: nothing was run. Add a WHERE clause (WHERE true deletes every row) or use TRUNCATE.";
 
 fn redactConnectionInput(text: []const u8) []const u8 {
     const name_end = std.mem.indexOfAny(u8, text, " \t\n") orelse return text;
@@ -701,7 +798,8 @@ fn runCommand(app: *App, text: []const u8) !void {
         return app.transcript.addMessage(.err, "unknown command {s} — /help lists commands", .{name});
 
     const needs_conn = !(std.mem.eql(u8, cmd.name, "/help") or std.mem.eql(u8, cmd.name, "/connect") or
-        std.mem.eql(u8, cmd.name, "/clear") or std.mem.eql(u8, cmd.name, "/quit"));
+        std.mem.eql(u8, cmd.name, "/clear") or std.mem.eql(u8, cmd.name, "/quit") or
+        std.mem.eql(u8, cmd.name, "/queries") or std.mem.eql(u8, cmd.name, "/save") or std.mem.eql(u8, cmd.name, "/unsave"));
     if (needs_conn and app.conn == null) return app.transcript.addMessage(.err, "not connected — use /connect", .{});
     const needs_idle = !(std.mem.eql(u8, cmd.name, "/help") or std.mem.eql(u8, cmd.name, "/clear") or std.mem.eql(u8, cmd.name, "/quit"));
     if (needs_idle and app.job != null) return app.transcript.addMessage(.warn, "busy — wait for the running query or press ctrl+c", .{});
@@ -750,6 +848,16 @@ fn runCommand(app: *App, text: []const u8) !void {
         return app.startJob(job);
     }
     if (eql(u8, cmd.name, "/refresh")) return app.startCacheLoad(true);
+    if (eql(u8, cmd.name, "/save")) return app.saveQuery(arg);
+    if (eql(u8, cmd.name, "/queries")) {
+        if (arg.len == 0) return app.openQueriesPicker();
+        return app.loadSavedQuery(arg);
+    }
+    if (eql(u8, cmd.name, "/unsave")) {
+        const dir = (try app.queriesDir()) orelse return;
+        queries.remove(app.io, dir, arg) catch return app.transcript.addMessage(.err, "no saved query named '{s}'", .{arg});
+        return app.transcript.addMessage(.dim, "deleted saved query '{s}'", .{arg});
+    }
 }
 
 /// `users where id > 3` -> table + filter. Also accepts a bare filter after the name.
@@ -808,8 +916,12 @@ fn welcome(app: *App) !void {
     const top = try std.mem.concat(a, u8, &.{ " ╭", try repeat(a, "─", inner), "╮" });
     const bottom = try std.mem.concat(a, u8, &.{ " ╰", try repeat(a, "─", inner), "╯" });
     try lines.append(a, try a.dupe(Segment, &.{.{ .text = top, .style = theme.border_focus }}));
+    // Text logo from block elements (▀ ▄ █): part of every terminal font,
+    // unlike inline images, which only some terminals support.
     const rows = [_][]const Segment{
-        &.{ .{ .text = " ✻ ", .style = theme.accent_bold }, .{ .text = "Welcome to zpeek", .style = theme.bold } },
+        &.{.{ .text = "   ▀▀█ █▀█ █▀▀ █▀▀ █ ▄", .style = theme.accent_bold }},
+        &.{.{ .text = "   ▄▀  █▀▀ █▀▀ █▀▀ █▀▄", .style = theme.accent_bold }},
+        &.{ .{ .text = "   ▀▀▀ ▀   ▀▀▀ ▀▀▀ ▀ ▀", .style = theme.accent_bold }, .{ .text = "   terminal database client", .style = theme.dim } },
         &.{},
         &.{.{ .text = "   PostgreSQL · MySQL/MariaDB · SQLite", .style = theme.dim }},
         &.{.{ .text = "   /help for commands · tab completes · ctrl+c twice exits", .style = theme.dim }},
@@ -904,6 +1016,7 @@ fn disconnect(app: *App) void {
     if (app.conn) |c| c.close();
     app.conn = null;
     app.conn_params = null;
+    app.conn_color = null;
     if (app.cache) |*c| c.deinit();
     app.cache = null;
     _ = app.conn_arena.reset(.retain_capacity);
@@ -1040,6 +1153,7 @@ fn processJob(app: *App, job: *Job) !void {
                 p.database = try a.dupe(u8, p.database);
                 p.password = "";
                 app.conn_params = p;
+                app.conn_color = if (app.cfg.find(c.name)) |entry| entry.color else null;
                 try app.transcript.addMessage(.ok, "connected to {s} · {s} {s}", .{ c.name, conn.kind.label(), conn.server_version });
                 try app.startCacheLoad(false);
             } else {
@@ -1095,11 +1209,41 @@ fn processJob(app: *App, job: *Job) !void {
                     };
                     if (app.table_view) |old| old.deinit();
                     app.table_view = tv;
+                    // Primary key (third query) enables row deletion.
+                    if (job.outcomes.items.len > 2) switch (job.outcomes.items[2]) {
+                        .result => |pk| {
+                            var names: std.ArrayList([]const u8) = .empty;
+                            defer names.deinit(app.gpa);
+                            for (pk.result.rows) |row| if (row.len > 0) if (row[0]) |n| try names.append(app.gpa, n);
+                            try tv.setPrimaryKey(names.items);
+                        },
+                        else => {},
+                    };
                     app.mode = .table;
                     try app.transcript.addMessage(.dim, "{s}: {d} rows loaded in {d} ms", .{ b.table, r.result.rows.len, r.ms });
                 },
                 .failed => |msg| try app.transcript.addMessage(.err, "{s}", .{msg}),
                 .canceled => try app.transcript.addMessage(.warn, "canceled", .{}),
+            }
+        },
+        .browse_delete => {
+            const tv = app.table_view orelse return;
+            if (job.outcomes.items.len == 0) return;
+            switch (job.outcomes.items[0]) {
+                .result => |r| {
+                    const n = r.result.affected_rows orelse 0;
+                    app.notice.clearRetainingCapacity();
+                    try app.notice.print(app.gpa, "{d} row{s} deleted", .{ n, if (n == 1) "" else "s" });
+                    tv.notice = app.notice.items;
+                    if (tv.browse) |*b| b.total = null;
+                    try app.startBrowseReload();
+                },
+                .failed => |msg| {
+                    app.notice.clearRetainingCapacity();
+                    try app.notice.appendSlice(app.gpa, msg);
+                    tv.notice = app.notice.items;
+                },
+                .canceled => tv.notice = "canceled",
             }
         },
         .browse_reload => {
@@ -1225,13 +1369,39 @@ fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
     const job = try app.newJob(.{ .browse_open = undefined });
     const a = job.arena.allocator();
     const kind = app.conn.?.kind;
-    const b: TableView.Browse = .{ .table = try a.dupe(u8, table), .filter = try a.dupe(u8, filter), .kind = kind };
+    const params = app.conn_params.?;
+    // Connections from the config are shown by their name ([connections.core_dev]
+    // -> "core_dev"); ad-hoc URLs/paths fall back to the database name.
+    const database = if (app.cfg.find(app.conn_name) != null) app.conn_name else databaseLabel(params, app.conn_name);
+    const b: TableView.Browse = .{
+        .table = try a.dupe(u8, table),
+        .database = try a.dupe(u8, database),
+        .database_color = app.conn_color,
+        .filter = try a.dupe(u8, filter),
+        .kind = kind,
+    };
     job.kind = .{ .browse_open = b };
     job.sqls = try a.dupe([]const u8, &.{
         try schema.browseSql(a, kind, b.table, b.filter, null, b.page_size, 0),
         try schema.countSql(a, kind, b.table, b.filter),
+        try schema.primaryKeySql(a, kind, b.table),
     });
     try app.startJob(job);
+}
+
+fn databaseLabel(params: conninfo.Params, connection_name: []const u8) []const u8 {
+    if (params.kind == .sqlite) return std.fs.path.basename(params.database);
+    if (params.database.len > 0) return params.database;
+    if (params.kind == .postgres and params.user.len > 0) return params.user;
+    if (params.kind == .postgres) return "postgres";
+    return connection_name;
+}
+
+test "database label follows driver defaults" {
+    try std.testing.expectEqualStrings("app", databaseLabel(.{ .kind = .postgres, .database = "app" }, "local"));
+    try std.testing.expectEqualStrings("alice", databaseLabel(.{ .kind = .postgres, .user = "alice" }, "local"));
+    try std.testing.expectEqualStrings("notes.db", databaseLabel(.{ .kind = .sqlite, .database = "/tmp/notes.db" }, "notes"));
+    try std.testing.expectEqualStrings("shop", databaseLabel(.{ .kind = .mysql }, "shop"));
 }
 
 fn startBrowseReload(app: *App) !void {
@@ -1352,7 +1522,8 @@ fn draw(app: *App) !void {
 }
 
 fn spinnerFrame(i: usize) []const u8 {
-    const frames = [_][]const u8{ "·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢" };
+    // WGL4 characters only, so every terminal font can draw the spinner.
+    const frames = [_][]const u8{ "·", "•", "●", "•" };
     return frames[(i / 1) % frames.len];
 }
 
@@ -1427,7 +1598,7 @@ fn drawInput(app: *App, a: Allocator, box: vaxis.Window) !CursorPos {
 
     // prompt
     const prompt_style: vaxis.Style = if (app.job == null) theme.accent_bold else theme.dim;
-    if (first == 0) _ = box.print(&.{.{ .text = " ❯ ", .style = prompt_style }}, .{ .row_offset = 0, .wrap = .none });
+    if (first == 0) _ = box.print(&.{.{ .text = " > ", .style = prompt_style }}, .{ .row_offset = 0, .wrap = .none });
 
     for (cells.items) |c| {
         if (c.row < first or c.row >= first + visible) continue;
@@ -1508,13 +1679,15 @@ fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16
             while (cx < pop.width) : (cx += 1) pop.writeCell(cx, @intCast(i), .{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = bg } });
         }
         const icon: []const u8 = switch (c.kind) {
-            .command => "›",
-            .table => "▦",
-            .column => "◦",
+            // Plain letters: decorative symbols are missing from many terminal fonts.
+            .command => "·",
+            .table => "t",
+            .column => "c",
             .operator => "=",
             .keyword => "k",
-            .function => "ƒ",
+            .function => "f",
             .connection => "●",
+            .query => "q",
         };
         const fit = render.fitWidth(c.text, label_w);
         _ = pop.print(&.{

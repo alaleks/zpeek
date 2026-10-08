@@ -61,6 +61,7 @@ default = "local"
 
 [connections.local]
 url = "postgres://postgres@localhost:5432/app"
+color = "#2F6B43" # database badge background in browse mode
 
 [connections.shop]
 driver = "mysql"
@@ -84,9 +85,10 @@ path = "~/notes.db"
 | `/describe <table>` | columns, indexes, constraints |
 | `/browse <table> [where …]` | open table data full-screen |
 | `/def <name>` | source of a view, function, trigger or enum |
+| `/save <name>`, `/queries [name]`, `/unsave <name>` | save the last SQL, pick a saved one, delete it |
 | `/databases`, `/refresh`, `/clear`, `/help`, `/quit` | |
 
-Anything else you type is run as SQL.
+Anything else you type is run as SQL. `DELETE` without `WHERE` is refused.
 
 ### Keys
 
@@ -99,6 +101,8 @@ Anything else you type is run as SQL.
 | `ctrl+o` | open last result as a table | `n` / `p` | next / previous page |
 | `ctrl+c` | cancel query · clear · exit (twice) | `y` / `Y` | copy cell / row |
 | `ctrl+l` | clear screen | `c` / `x` | choose columns / hide current column |
+| | | `d` | delete row (asks to confirm, needs a primary key) |
+| | | `r` / `F5` | refresh |
 | | | `q` | back |
 
 ---
@@ -160,9 +164,10 @@ zpeek prod -e "select count(*) from users"  # выполнить запрос и
 | `/describe <таблица>` | колонки, индексы, ограничения |
 | `/browse <таблица> [where …]` | данные таблицы на весь экран |
 | `/def <имя>` | исходный код view, функции, триггера или enum |
+| `/save <имя>`, `/queries [имя]`, `/unsave <имя>` | сохранить последний SQL, выбрать сохранённый, удалить |
 | `/databases`, `/refresh`, `/clear`, `/help`, `/quit` | |
 
-Всё остальное выполняется как SQL.
+Всё остальное выполняется как SQL. `DELETE` без `WHERE` не выполняется.
 
 ### Клавиши
 
@@ -175,4 +180,6 @@ zpeek prod -e "select count(*) from users"  # выполнить запрос и
 | `ctrl+o` | открыть последний результат таблицей | `n` / `p` | следующая / предыдущая страница |
 | `ctrl+c` | отменить запрос · очистить · выйти (дважды) | `y` / `Y` | копировать ячейку / строку |
 | `ctrl+l` | очистить экран | `c` / `x` | выбрать колонки / скрыть текущую |
+| | | `d` | удалить строку (с подтверждением, нужен первичный ключ) |
+| | | `r` / `F5` | обновить |
 | | | `q` | назад |

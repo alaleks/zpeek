@@ -5,6 +5,7 @@
 //!
 //! [connections.local]
 //! url = "postgres://me@localhost/app"
+//! color = "#2F6B43"                # optional database badge color
 //!
 //! [connections.shop]
 //! driver = "mysql"                 # postgres | mysql | mariadb | sqlite
@@ -30,6 +31,21 @@ const conninfo = @import("conninfo.zig");
 pub const Entry = struct {
     name: []const u8,
     params: conninfo.Params,
+    color: ?Color = null,
+};
+
+pub const Color = struct {
+    r: u8,
+    g: u8,
+    b: u8,
+
+    /// Nearest color in the portable 6×6×6 ANSI terminal palette.
+    pub fn ansi256(c: Color) u8 {
+        const r: u8 = @intCast((@as(u16, c.r) * 5 + 127) / 255);
+        const g: u8 = @intCast((@as(u16, c.g) * 5 + 127) / 255);
+        const b: u8 = @intCast((@as(u16, c.b) * 5 + 127) / 255);
+        return 16 + 36 * r + 6 * g + b;
+    }
 };
 
 pub const Config = struct {
@@ -59,8 +75,15 @@ pub fn defaultPath(arena: Allocator, env: *const std.process.Environ.Map) Alloca
     if (env.get("XDG_CONFIG_HOME")) |x| {
         if (x.len > 0) return try std.fs.path.join(arena, &.{ x, "zpeek", "config.toml" });
     }
-    const home = env.get("HOME") orelse return null;
-    return try std.fs.path.join(arena, &.{ home, ".config", "zpeek", "config.toml" });
+    if (env.get("HOME")) |home| return try std.fs.path.join(arena, &.{ home, ".config", "zpeek", "config.toml" });
+    // Windows outside of Git Bash/MSYS has no HOME.
+    if (env.get("APPDATA")) |appdata| return try std.fs.path.join(arena, &.{ appdata, "zpeek", "config.toml" });
+    return null;
+}
+
+/// The user's home directory: $HOME, or %USERPROFILE% on Windows.
+pub fn homeDir(env: *const std.process.Environ.Map) ?[]const u8 {
+    return env.get("HOME") orelse env.get("USERPROFILE");
 }
 
 /// Loads the config. A missing file yields an empty config with `found = false`.
@@ -121,7 +144,10 @@ pub fn parse(
             error.OutOfMemory => return error.OutOfMemory,
             else => return invalid(arena, diag, "{s}: connections.{s}: {s}", .{ path, name, errorText(err) }),
         };
-        try entries.append(arena, .{ .name = name, .params = params });
+        const color = entryColor(t) catch |err| {
+            return invalid(arena, diag, "{s}: connections.{s}: {s}", .{ path, name, errorText(err) });
+        };
+        try entries.append(arena, .{ .name = name, .params = params, .color = color });
     }
     cfg.connections = entries.items;
 
@@ -135,6 +161,7 @@ const EntryError = error{
     MissingDriver,
     UnknownDriver,
     InvalidField,
+    InvalidColor,
 } || conninfo.ParseError;
 
 fn errorText(err: EntryError) []const u8 {
@@ -142,6 +169,7 @@ fn errorText(err: EntryError) []const u8 {
         error.MissingDriver => "set 'url', 'path' or 'driver'",
         error.UnknownDriver => "unknown driver (expected postgres, mysql, mariadb or sqlite)",
         error.InvalidField => "field has the wrong type",
+        error.InvalidColor => "invalid color (expected #RRGGBB)",
         error.InvalidConnectionString => "invalid 'url'",
         error.UnknownScheme => "unknown scheme in 'url'",
         error.InvalidPort => "invalid port",
@@ -188,9 +216,23 @@ fn getString(t: *const toml.Table, key: []const u8) error{InvalidField}!?[]const
     };
 }
 
+fn entryColor(t: *const toml.Table) EntryError!?Color {
+    const value = (try getString(t, "color")) orelse return null;
+    return try parseColor(value);
+}
+
+fn parseColor(value: []const u8) error{InvalidColor}!Color {
+    if (value.len != 7 or value[0] != '#') return error.InvalidColor;
+    return .{
+        .r = std.fmt.parseInt(u8, value[1..3], 16) catch return error.InvalidColor,
+        .g = std.fmt.parseInt(u8, value[3..5], 16) catch return error.InvalidColor,
+        .b = std.fmt.parseInt(u8, value[5..7], 16) catch return error.InvalidColor,
+    };
+}
+
 pub fn expandHome(arena: Allocator, env: *const std.process.Environ.Map, path: []const u8) Allocator.Error![]const u8 {
-    if (!std.mem.startsWith(u8, path, "~/")) return path;
-    const home = env.get("HOME") orelse return path;
+    if (!std.mem.startsWith(u8, path, "~/") and !std.mem.startsWith(u8, path, "~\\")) return path;
+    const home = homeDir(env) orelse return path;
     return std.fs.path.join(arena, &.{ home, path[2..] });
 }
 
@@ -205,6 +247,7 @@ pub const example =
     \\
     \\# [connections.local]
     \\# url = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
+    \\# color = "#2F6B43"          # database badge background
     \\
     \\# [connections.shop]
     \\# driver = "mysql"            # postgres | mysql | mariadb | sqlite
@@ -234,6 +277,7 @@ test "config entries" {
         \\[connections.pg]
         \\url = "postgres://u@h/db"
         \\port = 6000
+        \\color = "#2F6B43"
         \\[connections.my]
         \\driver = "mariadb"
         \\user = "root"
@@ -248,6 +292,8 @@ test "config entries" {
     const pg = cfg.find("pg").?.params;
     try testing.expectEqual(@as(u16, 6000), pg.port);
     try testing.expectEqualStrings("h", pg.host);
+    try testing.expectEqual(Color{ .r = 0x2f, .g = 0x6b, .b = 0x43 }, cfg.find("pg").?.color.?);
+    try testing.expectEqual(@as(u8, 209), (try parseColor("#FF6347")).ansi256());
     const my = cfg.find("my").?.params;
     try testing.expectEqual(conninfo.Kind.mysql, my.kind);
     try testing.expectEqualStrings("secret", my.password);
@@ -263,4 +309,5 @@ test "config errors" {
     try testing.expectError(error.InvalidConfig, parse(a, &env, "c", "[connections.x]\nhost = \"h\"\n", &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message, "connections.x") != null);
     try testing.expectError(error.InvalidConfig, parse(a, &env, "c", "default = \"nope\"\n", &diag));
+    try testing.expectError(error.InvalidConfig, parse(a, &env, "c", "[connections.x]\nurl = \"postgres://h/db\"\ncolor = \"green\"\n", &diag));
 }

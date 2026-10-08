@@ -27,7 +27,7 @@ pub fn fitWidth(s: []const u8, max: usize) struct { text: []const u8, width: usi
 }
 
 /// Makes a value printable on one line: control characters become spaces,
-/// newlines become `↵`. Returns `s` itself when nothing needs changing.
+/// newlines become `¶` (Latin-1, present in every font). Returns `s` itself when nothing needs changing.
 pub fn singleLine(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
     const needs = for (s) |ch| {
         if (ch < 0x20 or ch == 0x7f) break true;
@@ -35,7 +35,7 @@ pub fn singleLine(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
     if (!needs) return s;
     var out: std.ArrayList(u8) = .empty;
     for (s) |ch| switch (ch) {
-        '\n' => try out.appendSlice(a, "↵"),
+        '\n' => try out.appendSlice(a, "¶"),
         '\r' => {},
         0...9, 11...12, 14...0x1f, 0x7f => try out.append(a, ' '),
         else => try out.append(a, ch),
@@ -115,5 +115,5 @@ test "fitWidth and singleLine" {
     try std.testing.expectEqual(@as(usize, 4), displayWidth("日本"));
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("a↵b", try singleLine(arena.allocator(), "a\r\nb"));
+    try std.testing.expectEqualStrings("a¶b", try singleLine(arena.allocator(), "a\r\nb"));
 }
