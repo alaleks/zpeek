@@ -548,7 +548,8 @@ fn maybeQuote(app: *App, a: Allocator, name: []const u8) Allocator.Error![]const
     for (name) |c| {
         if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_' or c == '.')) plain = false;
     }
-    if (kind == .mysql and !lexer.isKeyword(name)) {
+    // MySQL and ClickHouse accept mixed-case bare identifiers.
+    if ((kind == .mysql or kind == .clickhouse) and !lexer.isKeyword(name)) {
         for (name) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '.')) return schema.quoteName(a, kind, name);
         return name;
     }
@@ -704,6 +705,8 @@ fn submit(app: *App) !void {
         .postgres => .postgres,
         .mysql => .mysql,
         .sqlite => .sqlite,
+        // Backslash escapes in strings, like MySQL.
+        .clickhouse => .mysql,
     };
     if (lexer.hasDeleteWithoutWhere(text, dialect)) {
         return app.transcript.addMessage(.err, "{s}", .{delete_without_where_message});
@@ -920,7 +923,7 @@ fn welcome(app: *App) !void {
         &.{.{ .text = "  zpeek", .style = .{ .fg = theme.accent } }},
         &.{.{ .text = "  terminal database client", .style = theme.dim }},
         &.{},
-        &.{.{ .text = "  PostgreSQL · MySQL/MariaDB · SQLite", .style = theme.dim }},
+        &.{.{ .text = "  PostgreSQL · MySQL/MariaDB · SQLite · ClickHouse", .style = theme.dim }},
         &.{.{ .text = "  /help · tab completes · ctrl+c twice exits", .style = theme.dim }},
     };
     for (rows) |segs| {
@@ -1175,7 +1178,10 @@ fn processJob(app: *App, job: *Job) !void {
             if (ddl and !job.connection_lost) try app.startCacheLoad(false);
         },
         .list => |obj| try app.showOutcomes(job, &.{obj.title()}, true),
-        .describe => try app.showOutcomes(job, &.{ "Columns", "Indexes", "Constraints" }, false),
+        .describe => {
+            const third: []const u8 = if (app.conn != null and app.conn.?.kind == .clickhouse) "Engine" else "Constraints";
+            try app.showOutcomes(job, &.{ "Columns", "Indexes", third }, false);
+        },
         .definition => |name| {
             const o = if (job.outcomes.items.len > 0) &job.outcomes.items[0] else return;
             switch (o.*) {

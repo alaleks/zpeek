@@ -9,6 +9,7 @@ pub const Kind = conninfo.Kind;
 const sqlite = @import("sqlite.zig");
 const postgres = @import("postgres.zig");
 const mysql = @import("mysql.zig");
+const clickhouse = @import("clickhouse.zig");
 
 /// Result of one statement. Values are kept in their text form; `null` is SQL NULL.
 pub const Result = struct {
@@ -144,6 +145,7 @@ pub fn connect(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *ErrorT
         .sqlite => sqlite.connect(gpa, params, err_out),
         .postgres => postgres.connect(gpa, io, params, err_out),
         .mysql => mysql.connect(gpa, io, params, err_out),
+        .clickhouse => clickhouse.connect(gpa, io, params, err_out),
     };
 }
 
@@ -151,4 +153,5 @@ test {
     _ = sqlite;
     _ = postgres;
     _ = mysql;
+    _ = clickhouse;
 }

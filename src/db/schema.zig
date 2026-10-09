@@ -24,7 +24,8 @@ pub const Object = enum {
 };
 
 // Leading space: it is concatenated right after multi-line string literals.
-const pg_user_ns = " n.nspname not in ('pg_catalog', 'information_schema') and n.nspname not like 'pg\\_toast%' and n.nspname not like 'pg\\_temp%'";
+// crdb_internal / pg_extension: CockroachDB's system schemas.
+const pg_user_ns = " n.nspname not in ('pg_catalog', 'information_schema', 'crdb_internal', 'pg_extension') and n.nspname not like 'pg\\_toast%' and n.nspname not like 'pg\\_temp%'";
 
 /// SQL listing objects of one kind, or null when the database has no such objects.
 pub fn listSql(kind: Kind, obj: Object) ?[]const u8 {
@@ -37,7 +38,7 @@ pub fn listSql(kind: Kind, obj: Object) ?[]const u8 {
             \\  pg_size_pretty(pg_total_relation_size(c.oid)) as size,
             \\  obj_description(c.oid, 'pg_class') as comment
             \\from pg_class c join pg_namespace n on n.oid = c.relnamespace
-            \\where c.relkind in ('r', 'p', 'f') and not c.relispartition and
+            \\where c.relkind in ('r', 'p', 'f') and not coalesce(c.relispartition, false) and
             ++ pg_user_ns ++
                 \\
                 \\order by 1, 2
@@ -152,12 +153,41 @@ pub fn listSql(kind: Kind, obj: Object) ?[]const u8 {
             .triggers => "select tbl_name as \"table\", name from sqlite_schema where type = 'trigger' order by 1, 2",
             .types, .functions => null,
         },
+        .clickhouse => switch (obj) {
+            .tables =>
+            \\select name, engine, total_rows as rows, formatReadableSize(total_bytes) as size, comment
+            \\from system.tables
+            \\where database = currentDatabase() and not is_temporary
+            \\  and engine not in ('View', 'MaterializedView', 'LiveView')
+            \\order by name
+            ,
+            .views =>
+            \\select name, engine as kind, as_select as query
+            \\from system.tables
+            \\where database = currentDatabase() and engine in ('View', 'MaterializedView', 'LiveView')
+            \\order by name
+            ,
+            // ClickHouse has no named types; enum columns carry their values in the type.
+            .types =>
+            \\select table, name as column, type
+            \\from system.columns
+            \\where database = currentDatabase() and match(type, 'Enum(8|16)?\\(')
+            \\order by table, name
+            ,
+            .functions =>
+            \\select name, create_query as definition
+            \\from system.functions
+            \\where origin = 'SQLUserDefined'
+            \\order by name
+            ,
+            .triggers => null,
+        },
     };
 }
 
 /// Explains why `listSql` returned null.
 pub fn unsupportedReason(kind: Kind, obj: Object) []const u8 {
-    _ = kind;
+    if (kind == .clickhouse) return "ClickHouse has no triggers (use materialized views)";
     return switch (obj) {
         .types => "SQLite has no user-defined types",
         .functions => "SQLite has no stored functions",
@@ -247,7 +277,37 @@ pub fn describeSql(a: Allocator, kind: Kind, table: []const u8) Allocator.Error!
                 , .{lit}),
             });
         },
+        .clickhouse => {
+            const where = try chWhere(a, table, "table");
+            return a.dupe([]const u8, &.{
+                try std.fmt.allocPrint(a,
+                    \\select name as column, type, default_kind, default_expression as default,
+                    \\  multiIf(is_in_primary_key, 'PK', is_in_sorting_key, 'sort', '') as key, comment
+                    \\from system.columns
+                    \\where {s}
+                    \\order by position
+                , .{where}),
+                try std.fmt.allocPrint(a,
+                    \\select name as index, type, expr
+                    \\from system.data_skipping_indices
+                    \\where {s}
+                    \\order by name
+                , .{where}),
+                try std.fmt.allocPrint(a,
+                    \\select engine, sorting_key, primary_key, partition_key
+                    \\from system.tables
+                    \\where {s}
+                , .{try chWhere(a, table, "name")}),
+            });
+        },
     }
+}
+
+/// `database = … and <name_column> = …` for an optionally qualified ClickHouse table.
+fn chWhere(a: Allocator, table: []const u8, name_column: []const u8) Allocator.Error![]const u8 {
+    const parts = splitName(table);
+    const db_expr = if (parts.schema) |s| try quoteLiteral(a, .clickhouse, s) else "currentDatabase()";
+    return std.fmt.allocPrint(a, "database = {s} and {s} = {s}", .{ db_expr, name_column, try quoteLiteral(a, .clickhouse, parts.name) });
 }
 
 /// SQL returning (kind, name, definition) for views, functions and triggers named `name`.
@@ -308,6 +368,14 @@ pub fn definitionSql(a: Allocator, kind: Kind, name: []const u8) Allocator.Error
         .sqlite => return std.fmt.allocPrint(a,
             \\select type as kind, name, sql as definition from sqlite_schema where name = {s} and sql is not null
         , .{try quoteLiteral(a, kind, name)}),
+        .clickhouse => return std.fmt.allocPrint(a,
+            \\select if(engine in ('View', 'MaterializedView', 'LiveView'), 'view', 'table') as kind, name,
+            \\  create_table_query as definition
+            \\from system.tables where {[w]s}
+            \\union all
+            \\select 'function', name, create_query from system.functions
+            \\where origin = 'SQLUserDefined' and name = {[n]s}
+        , .{ .w = try chWhere(a, name, "name"), .n = try quoteLiteral(a, kind, splitName(name).name) }),
     }
 }
 
@@ -334,6 +402,10 @@ pub fn completionSql(kind: Kind) []const u8 {
         \\where m.type in ('table', 'view') and m.name not like 'sqlite\_%' escape '\'
         \\order by m.name, p.cid
         ,
+        .clickhouse =>
+        \\select table, name from system.columns
+        \\where database = currentDatabase() order by table, position
+        ,
     };
 }
 
@@ -343,6 +415,7 @@ pub fn databasesSql(kind: Kind) ?[]const u8 {
         .postgres => "select datname as database, pg_size_pretty(pg_database_size(datname)) as size from pg_database where not datistemplate order by 1",
         .mysql => "show databases",
         .sqlite => "select name, file from pragma_database_list",
+        .clickhouse => "select name as database, engine from system.databases order by name",
     };
 }
 
@@ -389,6 +462,8 @@ pub fn primaryKeySql(a: Allocator, kind: Kind, table: []const u8) Allocator.Erro
         .sqlite => std.fmt.allocPrint(a,
             \\select name from pragma_table_info({s}) where pk > 0 order by pk
         , .{try quoteLiteral(a, kind, table)}),
+        // Row deletion is disabled for ClickHouse (no point deletes); no key needed.
+        .clickhouse => a.dupe(u8, "select 1 where 0"),
     };
 }
 
@@ -457,7 +532,7 @@ pub fn quoteName(a: Allocator, kind: Kind, name: []const u8) Allocator.Error![]c
 }
 
 pub fn quoteIdent(a: Allocator, kind: Kind, ident: []const u8) Allocator.Error![]const u8 {
-    const q: u8 = if (kind == .mysql) '`' else '"';
+    const q: u8 = if (kind == .mysql or kind == .clickhouse) '`' else '"';
     var out: std.ArrayList(u8) = .empty;
     try out.append(a, q);
     for (ident) |c| {
@@ -473,8 +548,8 @@ pub fn quoteLiteral(a: Allocator, kind: Kind, s: []const u8) Allocator.Error![]c
     try out.append(a, '\'');
     for (s) |c| {
         if (c == '\'') try out.append(a, '\'');
-        // MySQL treats backslash as an escape inside literals by default.
-        if (c == '\\' and kind == .mysql) try out.append(a, '\\');
+        // MySQL and ClickHouse treat backslash as an escape inside literals.
+        if (c == '\\' and (kind == .mysql or kind == .clickhouse)) try out.append(a, '\\');
         try out.append(a, c);
     }
     try out.append(a, '\'');

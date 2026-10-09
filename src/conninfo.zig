@@ -15,12 +15,15 @@ pub const Kind = enum {
     postgres,
     mysql,
     sqlite,
+    /// ClickHouse over its HTTP interface.
+    clickhouse,
 
     pub fn defaultPort(kind: Kind) u16 {
         return switch (kind) {
             .postgres => 5432,
             .mysql => 3306,
             .sqlite => 0,
+            .clickhouse => 8123,
         };
     }
 
@@ -29,6 +32,7 @@ pub const Kind = enum {
             .postgres => "PostgreSQL",
             .mysql => "MySQL/MariaDB",
             .sqlite => "SQLite",
+            .clickhouse => "ClickHouse",
         };
     }
 
@@ -42,6 +46,8 @@ pub const Kind = enum {
             .{ "mariadb", .mysql },
             .{ "sqlite", .sqlite },
             .{ "sqlite3", .sqlite },
+            .{ "clickhouse", .clickhouse },
+            .{ "ch", .clickhouse },
         });
         return map.get(name);
     }
@@ -109,6 +115,7 @@ pub fn passwordFromEnv(p: *Params, env: *const std.process.Environ.Map) void {
     const name: []const u8 = switch (p.kind) {
         .postgres => "PGPASSWORD",
         .mysql => "MYSQL_PWD",
+        .clickhouse => "CLICKHOUSE_PASSWORD",
         .sqlite => return,
     };
     if (env.get(name)) |v| p.password = v;

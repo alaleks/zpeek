@@ -8,7 +8,7 @@
 //! color = "#2F6B43"                # optional database badge color
 //!
 //! [connections.shop]
-//! driver = "mysql"                 # postgres | mysql | mariadb | sqlite
+//! driver = "mysql"                 # postgres | mysql | mariadb | sqlite | clickhouse
 //! host = "127.0.0.1"
 //! port = 3306
 //! user = "root"
@@ -250,7 +250,7 @@ pub const example =
     \\# color = "#2F6B43"          # database badge background
     \\
     \\# [connections.shop]
-    \\# driver = "mysql"            # postgres | mysql | mariadb | sqlite
+    \\# driver = "mysql"            # postgres | mysql | mariadb | sqlite | clickhouse
     \\# host = "127.0.0.1"
     \\# port = 3306
     \\# user = "root"

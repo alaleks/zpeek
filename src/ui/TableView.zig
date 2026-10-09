@@ -553,7 +553,7 @@ fn acceptCompletion(tv: *TableView) Allocator.Error!void {
 fn quoteIfNeeded(a: Allocator, kind: Kind, name: []const u8) Allocator.Error![]const u8 {
     var plain = name.len > 0 and !std.ascii.isDigit(name[0]) and !lexer.isKeyword(name);
     for (name) |c| {
-        const ok = if (kind == .mysql) std.ascii.isAlphanumeric(c) or c == '_' else std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_';
+        const ok = if (kind == .mysql or kind == .clickhouse) std.ascii.isAlphanumeric(c) or c == '_' else std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_';
         if (!ok) plain = false;
     }
     return if (plain) name else schema.quoteIdent(a, kind, name);
@@ -610,6 +610,9 @@ fn clearPrimaryKey(tv: *TableView) void {
 /// the row could not be identified unambiguously.
 fn requestDelete(tv: *TableView) Allocator.Error!Action {
     const b = tv.browse orelse return .{ .notice = "row delete works in /browse" };
+    // ClickHouse has no cheap point deletes (mutations rewrite data parts), so
+    // deleting single rows from the viewer is not offered.
+    if (b.kind == .clickhouse) return .{ .notice = "row delete is not available for ClickHouse" };
     if (tv.view.items.len == 0) return .{ .notice = "no row to delete" };
     if (tv.primary_key.items.len == 0) return .{ .notice = "table has no primary key — delete with an SQL statement" };
     const row = tv.result.rows[tv.view.items[tv.row]];
@@ -928,8 +931,10 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
             " enter apply · esc cancel · empty clears · columns and operators autocomplete"
         else
             " text · col:text · col=value · enter apply · esc cancel")
-    else if (tv.browse != null)
-        " ↑↓←→ move · enter cell · / where · s sort · c columns · x hide · d delete · n/p page · r/F5 refresh · q back"
+    else if (tv.browse) |b| (if (b.kind == .clickhouse)
+        " ↑↓←→ move · enter cell · / where · s sort · c columns · x hide · n/p page · r/F5 refresh · q back"
+    else
+        " ↑↓←→ move · enter cell · / where · s sort · c columns · x hide · d delete · n/p page · r/F5 refresh · q back")
     else
         " ↑↓←→ move · enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
     _ = win.print(&.{.{ .text = hint, .style = theme.dim }}, .{ .row_offset = 1, .wrap = .none });

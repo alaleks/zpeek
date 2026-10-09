@@ -18,19 +18,19 @@ fn panicHandler(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 const usage =
-    \\zpeek — terminal client for PostgreSQL, MySQL/MariaDB and SQLite
+    \\zpeek — terminal client for PostgreSQL, MySQL/MariaDB, SQLite and ClickHouse
     \\
     \\Usage:
     \\  zpeek [options] [connection]
     \\
     \\  connection   a name from the config file, a URL
-    \\               (postgres://…, mysql://…, mariadb://…, sqlite://…),
+    \\               (postgres://…, mysql://…, mariadb://…, clickhouse://…, sqlite://…),
     \\               a libpq "host=… dbname=…" string, or a path to a SQLite file
     \\
     \\Options:
     \\  -e, --execute SQL   run SQL, print the result and exit
     \\  -c, --config PATH   use this config file
-    \\      --driver NAME   postgres | mysql | mariadb | sqlite
+    \\      --driver NAME   postgres | mysql | mariadb | sqlite | clickhouse
     \\      --host HOST     server host (or a Unix socket directory/path)
     \\      --port PORT     server port
     \\      --user USER     user name
@@ -246,6 +246,8 @@ fn executeOnce(gpa: Allocator, io: Io, entry: config.Entry, sql: []const u8, std
         .postgres => .postgres,
         .mysql => .mysql,
         .sqlite => .sqlite,
+        // Backslash escapes in strings, like MySQL.
+        .clickhouse => .mysql,
     };
     if (@import("sql/lexer.zig").hasDeleteWithoutWhere(sql, dialect)) {
         try stderr.print("zpeek: {s}\n", .{App.delete_without_where_message});

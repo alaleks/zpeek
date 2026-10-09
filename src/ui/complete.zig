@@ -160,11 +160,31 @@ const sqlite_operators = [_]Candidate{
     .{ .text = ">=", .kind = .operator, .detail = "at least" },
 };
 
+const clickhouse_operators = [_]Candidate{
+    .{ .text = "IN", .kind = .operator, .detail = "membership" },
+    .{ .text = "NOT IN", .kind = .operator, .detail = "not a member" },
+    .{ .text = "GLOBAL IN", .kind = .operator, .detail = "distributed membership" },
+    .{ .text = "LIKE", .kind = .operator, .detail = "pattern match" },
+    .{ .text = "NOT LIKE", .kind = .operator, .detail = "pattern mismatch" },
+    .{ .text = "ILIKE", .kind = .operator, .detail = "case-insensitive match" },
+    .{ .text = "NOT ILIKE", .kind = .operator, .detail = "case-insensitive mismatch" },
+    .{ .text = "IS NULL", .kind = .operator, .detail = "null check" },
+    .{ .text = "IS NOT NULL", .kind = .operator, .detail = "null check" },
+    .{ .text = "BETWEEN", .kind = .operator, .detail = "range" },
+    .{ .text = "=", .kind = .operator, .detail = "equal" },
+    .{ .text = "!=", .kind = .operator, .detail = "not equal" },
+    .{ .text = "<", .kind = .operator, .detail = "less than" },
+    .{ .text = "<=", .kind = .operator, .detail = "at most" },
+    .{ .text = ">", .kind = .operator, .detail = "greater than" },
+    .{ .text = ">=", .kind = .operator, .detail = "at least" },
+};
+
 pub fn operators(kind: db.Kind) []const Candidate {
     return switch (kind) {
         .postgres => &postgres_operators,
         .mysql => &mysql_operators,
         .sqlite => &sqlite_operators,
+        .clickhouse => &clickhouse_operators,
     };
 }
 
@@ -346,11 +366,18 @@ const statements_sqlite = statements_common ++ [_][]const u8{
     "PRAGMA", "REPLACE INTO", "CREATE TRIGGER", "VACUUM", "ANALYZE", "ATTACH DATABASE",
 };
 
+const statements_clickhouse = [_][]const u8{
+    "SELECT", "WITH", "INSERT INTO", "ALTER TABLE", "CREATE TABLE", "CREATE VIEW", "CREATE MATERIALIZED VIEW",
+    "CREATE DATABASE", "DROP TABLE", "TRUNCATE TABLE", "DELETE FROM", "SHOW TABLES", "SHOW DATABASES",
+    "SHOW CREATE TABLE", "DESCRIBE TABLE", "EXPLAIN", "OPTIMIZE TABLE", "EXISTS", "SYSTEM", "KILL QUERY",
+};
+
 fn statementKeywords(kind: db.Kind) []const []const u8 {
     return switch (kind) {
         .postgres => &statements_postgres,
         .mysql => &statements_mysql,
         .sqlite => &statements_sqlite,
+        .clickhouse => &statements_clickhouse,
     };
 }
 
@@ -369,11 +396,17 @@ const clauses_mysql = clauses_common ++ [_][]const u8{
 };
 const clauses_sqlite = clauses_common ++ [_][]const u8{ "GLOB", "RETURNING", "ON CONFLICT" };
 
+const clauses_clickhouse = clauses_common ++ [_][]const u8{
+    "PREWHERE", "FINAL", "SAMPLE", "ARRAY JOIN", "LEFT ARRAY JOIN", "LIMIT BY", "ILIKE", "GLOBAL IN",
+    "ANY JOIN", "ASOF JOIN", "SETTINGS", "FORMAT", "WITH TOTALS",
+};
+
 fn clauseKeywords(kind: db.Kind) []const []const u8 {
     return switch (kind) {
         .postgres => &clauses_postgres,
         .mysql => &clauses_mysql,
         .sqlite => &clauses_sqlite,
+        .clickhouse => &clauses_clickhouse,
     };
 }
 

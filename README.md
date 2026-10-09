@@ -4,7 +4,7 @@
 
 <h1 align="center">zpeek</h1>
 
-<p align="center">A fast terminal client for PostgreSQL, MySQL/MariaDB and SQLite, in the spirit of Claude Code.</p>
+<p align="center">A fast terminal client for PostgreSQL, MySQL/MariaDB, SQLite and ClickHouse, in the spirit of Claude Code.</p>
 
 <p align="center"><a href="#english">English</a> · <a href="#русский">Русский</a></p>
 
@@ -20,7 +20,7 @@ zpeek gives you **one tool for all three databases** right in the terminal: type
 ### Highlights
 
 - **One binary, no dependencies.** No libpq, libmysqlclient or system SQLite needed: the drivers are written in Zig and SQLite is built in.
-- **All three databases, one interface.** PostgreSQL, MySQL, MariaDB and SQLite with the same commands.
+- **Many databases, one interface.** PostgreSQL, MySQL, MariaDB, SQLite and ClickHouse with the same commands. Wire-compatible databases work too — tested with CockroachDB, YugabyteDB and TiDB (also Aurora, Neon, Supabase, PlanetScale…).
 - **Schema at a glance.** Tables, views, enum values and other types, functions, triggers, and their source code.
 - **Comfortable SQL console.** Syntax highlighting, Tab completion for tables, columns (including aliases) and keywords, history, multi-statement input.
 - **Data browser.** Full-screen table with server-side `WHERE` filters, sorting, paging and copy to clipboard.
@@ -46,13 +46,14 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local   # installs ~/.local/bin/zpe
 ```sh
 zpeek                                       # default connection from the config, or pick from a list
 zpeek prod                                  # a named connection from the config
-zpeek postgres://user:pass@host:5432/db     # URL: postgres://, mysql://, mariadb://, sqlite://
+zpeek postgres://user:pass@host:5432/db     # URL: postgres://, mysql://, mariadb://, clickhouse://, sqlite://
 zpeek ./data.sqlite                         # SQLite file
 zpeek --driver mysql --host 127.0.0.1 --user root --database shop
 zpeek prod -e "select count(*) from users"  # run one query and exit
 ```
 
-The password can also come from `$PGPASSWORD` / `$MYSQL_PWD`. TLS: `?sslmode=disable|prefer|require` (default `prefer`).
+The password can also come from `$PGPASSWORD` / `$MYSQL_PWD` / `$CLICKHOUSE_PASSWORD`. TLS: `?sslmode=disable|prefer|require` (default `prefer`).
+ClickHouse is reached over its HTTP interface (port 8123; `?sslmode=require` or port 8443 for HTTPS). Row deletion in `/browse` is disabled for ClickHouse.
 
 Save connections in `~/.config/zpeek/config.toml` (`zpeek --init-config` creates an example):
 
@@ -117,7 +118,7 @@ zpeek — **один инструмент для трёх баз** прямо в
 ### Преимущества
 
 - **Один бинарник без зависимостей.** Не нужны libpq, libmysqlclient или системный SQLite: драйверы написаны на Zig, SQLite встроен.
-- **Три базы, один интерфейс.** PostgreSQL, MySQL, MariaDB и SQLite с одинаковыми командами.
+- **Много баз, один интерфейс.** PostgreSQL, MySQL, MariaDB, SQLite и ClickHouse с одинаковыми командами. Работают и совместимые по протоколу базы — проверено на CockroachDB, YugabyteDB и TiDB (а также Aurora, Neon, Supabase, PlanetScale…).
 - **Схема под рукой.** Таблицы, view, значения enum и другие типы, функции, триггеры и их исходный код.
 - **Удобная SQL-консоль.** Подсветка синтаксиса, автодополнение по Tab (таблицы, колонки, в том числе через алиасы, ключевые слова), история, несколько запросов за раз.
 - **Просмотр данных.** Таблица на весь экран с фильтром `WHERE` на сервере, сортировкой, страницами и копированием.
@@ -143,13 +144,14 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local   # установит ~/.loc
 ```sh
 zpeek                                       # подключение по умолчанию из конфига или выбор из списка
 zpeek prod                                  # подключение по имени из конфига
-zpeek postgres://user:pass@host:5432/db     # URL: postgres://, mysql://, mariadb://, sqlite://
+zpeek postgres://user:pass@host:5432/db     # URL: postgres://, mysql://, mariadb://, clickhouse://, sqlite://
 zpeek ./data.sqlite                         # файл SQLite
 zpeek --driver mysql --host 127.0.0.1 --user root --database shop
 zpeek prod -e "select count(*) from users"  # выполнить запрос и выйти
 ```
 
-Пароль можно передать через `$PGPASSWORD` / `$MYSQL_PWD`. TLS: `?sslmode=disable|prefer|require` (по умолчанию `prefer`).
+Пароль можно передать через `$PGPASSWORD` / `$MYSQL_PWD` / `$CLICKHOUSE_PASSWORD`. TLS: `?sslmode=disable|prefer|require` (по умолчанию `prefer`).
+ClickHouse подключается через HTTP-интерфейс (порт 8123; `?sslmode=require` или порт 8443 — HTTPS). Удаление строк в `/browse` для ClickHouse отключено.
 
 Подключения хранятся в `~/.config/zpeek/config.toml` (пример создаёт `zpeek --init-config`). Формат — как в примере выше: `url`, либо `driver` + `host` / `port` / `user` / `password_env` / `database`, либо `path` для SQLite.
 
