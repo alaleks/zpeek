@@ -894,10 +894,12 @@ fn showHelp(app: *App) !void {
         .{ "enter", "run SQL / command (several statements separated by ;)" },
         .{ "shift+enter, alt+enter, ctrl+j, \\", "new line" },
         .{ "tab", "complete commands, tables, columns, operators, keywords" },
+        .{ "tab, enter (list open)", "insert the highlighted suggestion; esc closes the list" },
         .{ "↑ ↓", "history (or move between lines)" },
         .{ "ctrl+o", "open the last result in the table viewer" },
         .{ "pgup pgdn, mouse wheel", "scroll" },
         .{ "ctrl+c", "cancel query / clear input / exit (twice)" },
+        .{ "ctrl+d", "exit (on an empty input)" },
         .{ "ctrl+l", "clear the screen" },
     };
     for (keys) |k| {
@@ -924,6 +926,7 @@ fn welcome(app: *App) !void {
         &.{.{ .text = "  terminal database client", .style = theme.dim }},
         &.{},
         &.{.{ .text = "  PostgreSQL · MySQL/MariaDB · SQLite · ClickHouse", .style = theme.dim }},
+        &.{.{ .text = "  + CockroachDB · YugabyteDB · TiDB · Redshift · Aurora…", .style = theme.dim }},
         &.{.{ .text = "  /help · tab completes · ctrl+c twice exits", .style = theme.dim }},
     };
     for (rows) |segs| {

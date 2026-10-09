@@ -20,7 +20,7 @@
 //! ```
 //!
 //! Location: $ZPEEK_CONFIG, else $XDG_CONFIG_HOME/zpeek/config.toml, else
-//! ~/.config/zpeek/config.toml.
+//! ~/.config/zpeek/config.toml, else (Windows) %APPDATA%\zpeek\config.toml.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

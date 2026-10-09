@@ -4,7 +4,7 @@
 
 <h1 align="center">zpeek</h1>
 
-<p align="center">A fast terminal client for PostgreSQL, MySQL/MariaDB, SQLite and ClickHouse, in the spirit of Claude Code.</p>
+<p align="center">A fast terminal client for PostgreSQL, MySQL/MariaDB, SQLite, ClickHouse and compatible databases, in the spirit of Claude Code.</p>
 
 <p align="center"><a href="#english">English</a> · <a href="#русский">Русский</a></p>
 
@@ -14,18 +14,31 @@
 
 ### Why
 
-Desktop database GUIs are heavy, and `psql` / `mysql` / `sqlite3` each have their own commands and are awkward for browsing data.
-zpeek gives you **one tool for all three databases** right in the terminal: type SQL or `/commands` in a prompt, see results as tables, browse data full-screen.
+Desktop database GUIs are heavy, and `psql`, `mysql`, `sqlite3` and `clickhouse-client` each have their own commands and are awkward for browsing data.
+zpeek gives you **one tool for all of them** right in the terminal: type SQL or `/commands` in a prompt, see results as tables, browse data full-screen.
 
 ### Highlights
 
 - **One binary, no dependencies.** No libpq, libmysqlclient or system SQLite needed: the drivers are written in Zig and SQLite is built in.
-- **Many databases, one interface.** PostgreSQL, MySQL, MariaDB, SQLite and ClickHouse with the same commands. Wire-compatible databases work too — tested with CockroachDB, YugabyteDB and TiDB (also Aurora, Neon, Supabase, PlanetScale…).
+- **Many databases, one interface.** The same commands everywhere — see [supported databases](#supported-databases).
 - **Schema at a glance.** Tables, views, enum values and other types, functions, triggers, and their source code.
-- **Comfortable SQL console.** Syntax highlighting, Tab completion for tables, columns (including aliases) and keywords, history, multi-statement input.
-- **Data browser.** Full-screen table with server-side `WHERE` filters, sorting, paging and copy to clipboard.
-- **Responsive.** Queries run in the background; `ctrl+c` cancels a long query on the server.
-- **Secure connections.** TLS, SCRAM-SHA-256, `caching_sha2_password`.
+- **Comfortable SQL console.** Syntax highlighting; completion that knows the SQL dialect and the current schema (`SE` → `SELECT`, tables after `FROM`, columns after `WHERE`, including aliases); history; saved queries.
+- **Data browser.** Full-screen table with server-side `WHERE` filters, sorting, paging, hiding columns, copying, and deleting a row with confirmation.
+- **Safe by default.** `DELETE` without `WHERE` is refused; queries run in the background and `ctrl+c` cancels them on the server.
+- **Secure connections.** TLS with optional certificate verification, SCRAM-SHA-256, `caching_sha2_password`.
+
+### Supported databases
+
+| Database | Connect with | Status |
+|---|---|---|
+| PostgreSQL | `postgres://` | full support |
+| MySQL, MariaDB | `mysql://`, `mariadb://` | full support |
+| SQLite | file path or `sqlite://` | full support (no types/functions in SQLite) |
+| ClickHouse | `clickhouse://` (HTTP interface) | full support; row delete in `/browse` is disabled |
+| CockroachDB, YugabyteDB | `postgres://` | tested |
+| TiDB | `mysql://` | tested (TiDB has no functions/triggers) |
+| Redshift, Aurora, Neon, Supabase, AlloyDB | `postgres://` | PostgreSQL protocol, not tested |
+| PlanetScale/Vitess, Aurora MySQL, SingleStore | `mysql://` | MySQL protocol, not tested |
 
 ### Install
 
@@ -44,67 +57,98 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local   # installs ~/.local/bin/zpe
 ### Connect
 
 ```sh
-zpeek                                       # default connection from the config, or pick from a list
-zpeek prod                                  # a named connection from the config
-zpeek postgres://user:pass@host:5432/db     # URL: postgres://, mysql://, mariadb://, clickhouse://, sqlite://
-zpeek ./data.sqlite                         # SQLite file
+zpeek                                          # default connection from the config, or pick from a list
+zpeek prod                                     # a named connection from the config
+zpeek postgres://user:pass@host:5432/db        # URL; the scheme picks the driver
+zpeek clickhouse://user:pass@host:8123/db
+zpeek ./data.sqlite                            # SQLite file
+zpeek "host=localhost dbname=app user=me"      # libpq keyword string
+zpeek "user:pass@tcp(host:3306)/db"            # Go MySQL DSN
 zpeek --driver mysql --host 127.0.0.1 --user root --database shop
-zpeek prod -e "select count(*) from users"  # run one query and exit
+zpeek prod -e "select count(*) from users"     # run SQL, print the result and exit
+zpeek --list                                   # configured connections
+zpeek --init-config                            # write an example config
 ```
 
-The password can also come from `$PGPASSWORD` / `$MYSQL_PWD` / `$CLICKHOUSE_PASSWORD`. TLS: `?sslmode=disable|prefer|require` (default `prefer`).
-ClickHouse is reached over its HTTP interface (port 8123; `?sslmode=require` or port 8443 for HTTPS). Row deletion in `/browse` is disabled for ClickHouse.
+- **Password:** from the URL, `--password`, or `$PGPASSWORD` / `$MYSQL_PWD` / `$CLICKHOUSE_PASSWORD`.
+- **TLS:** `?sslmode=disable|prefer|require|verify-ca|verify-full` (MySQL spellings `ssl-mode`, `tls=true` work too). The default `prefer` uses TLS when the server offers it; `require` encrypts without checking the certificate; `verify-ca` checks it against the system CA store, `verify-full` also checks the host name.
+- **ClickHouse** uses the HTTP interface: port 8123, or HTTPS on 8443 / with `sslmode=require`.
 
-Save connections in `~/.config/zpeek/config.toml` (`zpeek --init-config` creates an example):
+### Config
+
+`~/.config/zpeek/config.toml` (or `$ZPEEK_CONFIG`, `$XDG_CONFIG_HOME/zpeek/`, `%APPDATA%\zpeek\` on Windows):
 
 ```toml
 default = "local"
 
 [connections.local]
 url = "postgres://postgres@localhost:5432/app"
-color = "#2F6B43" # database badge background in browse mode
+color = "#2F6B43"                   # badge color in /browse
 
 [connections.shop]
-driver = "mysql"
+driver = "mysql"                    # postgres | mysql | mariadb | sqlite | clickhouse
 host = "127.0.0.1"
+port = 3306
 user = "root"
-password_env = "SHOP_DB_PASSWORD"
+password_env = "SHOP_DB_PASSWORD"   # or password = "…"
 database = "shop"
+sslmode = "require"
 
 [connections.notes]
 path = "~/notes.db"
 ```
 
+Fields override the matching parts of `url`. Saved queries live in `queries/*.sql` next to the config; history in `~/.local/state/zpeek/history`.
+
 ### Commands
 
-| Command | |
-|---|---|
-| `/connect [name\|url]` | connect; without an argument, pick from the config |
-| `/tables`, `/views` | list tables and views |
-| `/types` | user types and enum values |
-| `/functions`, `/triggers` | list functions/procedures and triggers |
-| `/describe <table>` | columns, indexes, constraints |
-| `/browse <table> [where …]` | open table data full-screen |
-| `/def <name>` | source of a view, function, trigger or enum |
-| `/save <name>`, `/queries [name]`, `/unsave <name>` | save the last SQL, pick a saved one, delete it |
-| `/databases`, `/refresh`, `/clear`, `/help`, `/quit` | |
+| Command | Alias | |
+|---|---|---|
+| `/connect [name\|url]` | `/c` | connect; without an argument, pick from the config |
+| `/disconnect` | | close the connection |
+| `/tables`, `/views` | `/t`, `/v` | tables (with size and row estimate) and views |
+| `/types` | `/enums` | user types and enum values |
+| `/functions`, `/triggers` | `/fn` | functions/procedures and triggers |
+| `/describe <table>` | `/d` | columns, indexes, constraints |
+| `/browse <table> [where …]` | `/b` | table data full-screen; without an argument, pick a table |
+| `/def <name>` | | source of a view, function, trigger or enum |
+| `/save <name>` | | save the last SQL you ran |
+| `/queries [name]` | `/sq` | pick a saved query (it goes into the input, not run) |
+| `/unsave <name>` | | delete a saved query |
+| `/databases`, `/refresh`, `/clear`, `/help`, `/quit` | `/dbs`, `/q` | |
 
-Anything else you type is run as SQL. `DELETE` without `WHERE` is refused.
+Anything else is run as SQL; several statements can be separated by `;`. The feed shows the first 50 rows of a result (`ctrl+o` opens all of it); ad-hoc queries keep at most 10,000 rows. `DELETE` without `WHERE` is refused.
 
 ### Keys
 
-| Console | | Table view | |
-|---|---|---|---|
-| `enter` | run | `↑↓←→` / `hjkl` | move |
-| `shift+enter` | new line | `enter` | show full value |
-| `tab` | complete | `/` | filter (`WHERE …` in `/browse`) |
-| `↑` `↓` | history | `s` | sort by column |
-| `ctrl+o` | open last result as a table | `n` / `p` | next / previous page |
-| `ctrl+c` | cancel query · clear · exit (twice) | `y` / `Y` | copy cell / row |
-| `ctrl+l` | clear screen | `c` / `x` | choose columns / hide current column |
-| | | `d` | delete row (asks to confirm, needs a primary key) |
-| | | `r` / `F5` | refresh |
-| | | `q` | back |
+**Console**
+
+| Key | |
+|---|---|
+| `enter` | run |
+| `shift+enter`, `alt+enter`, `ctrl+j`, `\` at line end | new line |
+| `tab` | complete; with the suggestion list open, `tab`/`enter` insert, `esc` closes it |
+| `↑` `↓` | history (or move between lines) |
+| `ctrl+o` | open the last result as a table |
+| `pgup` `pgdn`, mouse wheel | scroll |
+| `ctrl+c` | cancel query · clear input · exit (twice) |
+| `ctrl+d` | exit (on empty input) |
+| `ctrl+l` | clear the screen |
+
+**Table view**
+
+| Key | |
+|---|---|
+| `↑↓←→` / `hjkl`, `pgup` `pgdn`, `g` `G`, `0` `$` | move |
+| `enter` | show the full value |
+| `/` | filter: `WHERE …` in `/browse`; otherwise `text`, `column:text` or `column=value` |
+| `s` | sort by the column (asc → desc → off) |
+| `c` / `x` | choose columns / hide the current one |
+| `n` / `p` | next / previous page (500 rows) |
+| `r` / `F5` | refresh |
+| `d` | delete the row (shows the SQL, `y` confirms; needs a primary key; not for ClickHouse) |
+| `y` / `Y` | copy cell / row (OSC 52) |
+| `q` / `esc` | back |
 
 ---
 
@@ -112,18 +156,31 @@ Anything else you type is run as SQL. `DELETE` without `WHERE` is refused.
 
 ### Зачем
 
-Графические клиенты баз данных тяжёлые, а у `psql`, `mysql` и `sqlite3` свои команды, и данные в них смотреть неудобно.
-zpeek — **один инструмент для трёх баз** прямо в терминале: пишете SQL или `/команды` в строке ввода, видите результат таблицей, листаете данные на весь экран.
+Графические клиенты баз данных тяжёлые, а у `psql`, `mysql`, `sqlite3` и `clickhouse-client` свои команды, и данные в них смотреть неудобно.
+zpeek — **один инструмент для всех этих баз** прямо в терминале: пишете SQL или `/команды` в строке ввода, видите результат таблицей, листаете данные на весь экран.
 
 ### Преимущества
 
 - **Один бинарник без зависимостей.** Не нужны libpq, libmysqlclient или системный SQLite: драйверы написаны на Zig, SQLite встроен.
-- **Много баз, один интерфейс.** PostgreSQL, MySQL, MariaDB, SQLite и ClickHouse с одинаковыми командами. Работают и совместимые по протоколу базы — проверено на CockroachDB, YugabyteDB и TiDB (а также Aurora, Neon, Supabase, PlanetScale…).
+- **Много баз, один интерфейс.** Одинаковые команды везде — см. [поддерживаемые базы](#поддерживаемые-базы).
 - **Схема под рукой.** Таблицы, view, значения enum и другие типы, функции, триггеры и их исходный код.
-- **Удобная SQL-консоль.** Подсветка синтаксиса, автодополнение по Tab (таблицы, колонки, в том числе через алиасы, ключевые слова), история, несколько запросов за раз.
-- **Просмотр данных.** Таблица на весь экран с фильтром `WHERE` на сервере, сортировкой, страницами и копированием.
-- **Не зависает.** Запросы выполняются в фоне, `ctrl+c` отменяет долгий запрос на сервере.
-- **Защищённые подключения.** TLS, SCRAM-SHA-256, `caching_sha2_password`.
+- **Удобная SQL-консоль.** Подсветка синтаксиса; автодополнение с учётом диалекта и текущей схемы (`SE` → `SELECT`, таблицы после `FROM`, колонки после `WHERE`, в том числе через алиасы); история; сохранённые запросы.
+- **Просмотр данных.** Таблица на весь экран с фильтром `WHERE` на сервере, сортировкой, страницами, скрытием колонок, копированием и удалением строки с подтверждением.
+- **Безопасно по умолчанию.** `DELETE` без `WHERE` не выполняется; запросы идут в фоне, `ctrl+c` отменяет их на сервере.
+- **Защищённые подключения.** TLS с проверкой сертификата по желанию, SCRAM-SHA-256, `caching_sha2_password`.
+
+### Поддерживаемые базы
+
+| База | Как подключаться | Статус |
+|---|---|---|
+| PostgreSQL | `postgres://` | полная поддержка |
+| MySQL, MariaDB | `mysql://`, `mariadb://` | полная поддержка |
+| SQLite | путь к файлу или `sqlite://` | полная поддержка (типов и функций в SQLite нет) |
+| ClickHouse | `clickhouse://` (HTTP-интерфейс) | полная поддержка; удаление строк в `/browse` отключено |
+| CockroachDB, YugabyteDB | `postgres://` | проверено |
+| TiDB | `mysql://` | проверено (функций и триггеров в TiDB нет) |
+| Redshift, Aurora, Neon, Supabase, AlloyDB | `postgres://` | протокол PostgreSQL, не проверялось |
+| PlanetScale/Vitess, Aurora MySQL, SingleStore | `mysql://` | протокол MySQL, не проверялось |
 
 ### Установка
 
@@ -142,46 +199,95 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local   # установит ~/.loc
 ### Подключение
 
 ```sh
-zpeek                                       # подключение по умолчанию из конфига или выбор из списка
-zpeek prod                                  # подключение по имени из конфига
-zpeek postgres://user:pass@host:5432/db     # URL: postgres://, mysql://, mariadb://, clickhouse://, sqlite://
-zpeek ./data.sqlite                         # файл SQLite
+zpeek                                          # подключение по умолчанию из конфига или выбор из списка
+zpeek prod                                     # подключение по имени из конфига
+zpeek postgres://user:pass@host:5432/db        # URL; драйвер определяется по схеме
+zpeek clickhouse://user:pass@host:8123/db
+zpeek ./data.sqlite                            # файл SQLite
+zpeek "host=localhost dbname=app user=me"      # строка в формате libpq
+zpeek "user:pass@tcp(host:3306)/db"            # DSN в стиле Go MySQL
 zpeek --driver mysql --host 127.0.0.1 --user root --database shop
-zpeek prod -e "select count(*) from users"  # выполнить запрос и выйти
+zpeek prod -e "select count(*) from users"     # выполнить SQL, вывести результат и выйти
+zpeek --list                                   # подключения из конфига
+zpeek --init-config                            # создать пример конфига
 ```
 
-Пароль можно передать через `$PGPASSWORD` / `$MYSQL_PWD` / `$CLICKHOUSE_PASSWORD`. TLS: `?sslmode=disable|prefer|require` (по умолчанию `prefer`).
-ClickHouse подключается через HTTP-интерфейс (порт 8123; `?sslmode=require` или порт 8443 — HTTPS). Удаление строк в `/browse` для ClickHouse отключено.
+- **Пароль:** из URL, `--password` или `$PGPASSWORD` / `$MYSQL_PWD` / `$CLICKHOUSE_PASSWORD`.
+- **TLS:** `?sslmode=disable|prefer|require|verify-ca|verify-full` (для MySQL также `ssl-mode`, `tls=true`). По умолчанию `prefer`: TLS, если сервер его предлагает; `require` шифрует без проверки сертификата; `verify-ca` проверяет сертификат по системным корневым сертификатам, `verify-full` — ещё и имя хоста.
+- **ClickHouse** подключается через HTTP-интерфейс: порт 8123, HTTPS — порт 8443 или `sslmode=require`.
 
-Подключения хранятся в `~/.config/zpeek/config.toml` (пример создаёт `zpeek --init-config`). Формат — как в примере выше: `url`, либо `driver` + `host` / `port` / `user` / `password_env` / `database`, либо `path` для SQLite.
+### Конфиг
+
+`~/.config/zpeek/config.toml` (или `$ZPEEK_CONFIG`, `$XDG_CONFIG_HOME/zpeek/`, `%APPDATA%\zpeek\` в Windows):
+
+```toml
+default = "local"
+
+[connections.local]
+url = "postgres://postgres@localhost:5432/app"
+color = "#2F6B43"                   # цвет плашки в /browse
+
+[connections.shop]
+driver = "mysql"                    # postgres | mysql | mariadb | sqlite | clickhouse
+host = "127.0.0.1"
+port = 3306
+user = "root"
+password_env = "SHOP_DB_PASSWORD"   # или password = "…"
+database = "shop"
+sslmode = "require"
+
+[connections.notes]
+path = "~/notes.db"
+```
+
+Отдельные поля переопределяют соответствующие части `url`. Сохранённые запросы лежат в `queries/*.sql` рядом с конфигом, история — в `~/.local/state/zpeek/history`.
 
 ### Команды
 
-| Команда | |
-|---|---|
-| `/connect [имя\|url]` | подключиться; без аргумента — выбор из конфига |
-| `/tables`, `/views` | таблицы и представления |
-| `/types` | пользовательские типы и значения enum |
-| `/functions`, `/triggers` | функции и процедуры, триггеры |
-| `/describe <таблица>` | колонки, индексы, ограничения |
-| `/browse <таблица> [where …]` | данные таблицы на весь экран |
-| `/def <имя>` | исходный код view, функции, триггера или enum |
-| `/save <имя>`, `/queries [имя]`, `/unsave <имя>` | сохранить последний SQL, выбрать сохранённый, удалить |
-| `/databases`, `/refresh`, `/clear`, `/help`, `/quit` | |
+| Команда | Сокращение | |
+|---|---|---|
+| `/connect [имя\|url]` | `/c` | подключиться; без аргумента — выбор из конфига |
+| `/disconnect` | | закрыть подключение |
+| `/tables`, `/views` | `/t`, `/v` | таблицы (с размером и оценкой числа строк) и view |
+| `/types` | `/enums` | пользовательские типы и значения enum |
+| `/functions`, `/triggers` | `/fn` | функции и процедуры, триггеры |
+| `/describe <таблица>` | `/d` | колонки, индексы, ограничения |
+| `/browse <таблица> [where …]` | `/b` | данные таблицы на весь экран; без аргумента — выбор таблицы |
+| `/def <имя>` | | исходный код view, функции, триггера или enum |
+| `/save <имя>` | | сохранить последний выполненный SQL |
+| `/queries [имя]` | `/sq` | выбрать сохранённый запрос (попадает в строку ввода, не выполняется) |
+| `/unsave <имя>` | | удалить сохранённый запрос |
+| `/databases`, `/refresh`, `/clear`, `/help`, `/quit` | `/dbs`, `/q` | |
 
-Всё остальное выполняется как SQL. `DELETE` без `WHERE` не выполняется.
+Всё остальное выполняется как SQL; несколько запросов разделяются `;`. В ленте показываются первые 50 строк результата (`ctrl+o` открывает весь), для произвольных запросов хранится не больше 10 000 строк. `DELETE` без `WHERE` не выполняется.
 
 ### Клавиши
 
-| Консоль | | Просмотр таблицы | |
-|---|---|---|---|
-| `enter` | выполнить | `↑↓←→` / `hjkl` | перемещение |
-| `shift+enter` | новая строка | `enter` | значение целиком |
-| `tab` | автодополнение | `/` | фильтр (`WHERE …` в `/browse`) |
-| `↑` `↓` | история | `s` | сортировка по колонке |
-| `ctrl+o` | открыть последний результат таблицей | `n` / `p` | следующая / предыдущая страница |
-| `ctrl+c` | отменить запрос · очистить · выйти (дважды) | `y` / `Y` | копировать ячейку / строку |
-| `ctrl+l` | очистить экран | `c` / `x` | выбрать колонки / скрыть текущую |
-| | | `d` | удалить строку (с подтверждением, нужен первичный ключ) |
-| | | `r` / `F5` | обновить |
-| | | `q` | назад |
+**Консоль**
+
+| Клавиша | |
+|---|---|
+| `enter` | выполнить |
+| `shift+enter`, `alt+enter`, `ctrl+j`, `\` в конце строки | новая строка |
+| `tab` | автодополнение; при открытом списке `tab`/`enter` вставляют вариант, `esc` закрывает список |
+| `↑` `↓` | история (или переход между строками) |
+| `ctrl+o` | открыть последний результат таблицей |
+| `pgup` `pgdn`, колесо мыши | прокрутка |
+| `ctrl+c` | отменить запрос · очистить ввод · выйти (дважды) |
+| `ctrl+d` | выйти (при пустом вводе) |
+| `ctrl+l` | очистить экран |
+
+**Просмотр таблицы**
+
+| Клавиша | |
+|---|---|
+| `↑↓←→` / `hjkl`, `pgup` `pgdn`, `g` `G`, `0` `$` | перемещение |
+| `enter` | значение целиком |
+| `/` | фильтр: `WHERE …` в `/browse`; иначе `текст`, `колонка:текст` или `колонка=значение` |
+| `s` | сортировка по колонке (по возрастанию → по убыванию → выкл.) |
+| `c` / `x` | выбрать колонки / скрыть текущую |
+| `n` / `p` | следующая / предыдущая страница (по 500 строк) |
+| `r` / `F5` | обновить |
+| `d` | удалить строку (показывает SQL, `y` подтверждает; нужен первичный ключ; не для ClickHouse) |
+| `y` / `Y` | копировать ячейку / строку (OSC 52) |
+| `q` / `esc` | назад |

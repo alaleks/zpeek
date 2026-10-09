@@ -34,13 +34,15 @@ const usage =
     \\      --host HOST     server host (or a Unix socket directory/path)
     \\      --port PORT     server port
     \\      --user USER     user name
-    \\      --password PW   password (default: $PGPASSWORD / $MYSQL_PWD)
+    \\      --password PW   password (default: $PGPASSWORD / $MYSQL_PWD / $CLICKHOUSE_PASSWORD)
     \\      --database DB   database name (or SQLite file)
     \\  -l, --list          list configured connections
     \\      --init-config   write an example config file if none exists
     \\  -h, --help          show this help
     \\
     \\Connection fields override the matching parts of [connection].
+    \\PostgreSQL- and MySQL-compatible servers (CockroachDB, YugabyteDB, TiDB,
+    \\Redshift, Aurora, …) work with postgres:// and mysql:// URLs.
     \\
 ;
 
