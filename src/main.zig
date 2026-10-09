@@ -38,6 +38,7 @@ const usage =
     \\      --database DB   database name (or SQLite file)
     \\  -l, --list          list configured connections
     \\      --init-config   write an example config file if none exists
+    \\  -V, --version       print the version
     \\  -h, --help          show this help
     \\
     \\Connection fields override the matching parts of [connection].
@@ -59,6 +60,7 @@ const Cli = struct {
     list: bool = false,
     init_config: bool = false,
     help: bool = false,
+    version: bool = false,
 };
 
 fn parseArgs(args: []const [:0]const u8, stderr: *Io.Writer) !Cli {
@@ -68,6 +70,8 @@ fn parseArgs(args: []const [:0]const u8, stderr: *Io.Writer) !Cli {
         const arg: []const u8 = args[i];
         if (eqlAny(arg, &.{ "-h", "--help" })) {
             cli.help = true;
+        } else if (eqlAny(arg, &.{ "-V", "--version" })) {
+            cli.version = true;
         } else if (eqlAny(arg, &.{ "-l", "--list" })) {
             cli.list = true;
         } else if (std.mem.eql(u8, arg, "--init-config")) {
@@ -176,6 +180,10 @@ pub fn main(init: std.process.Init) !u8 {
     const cli = parseArgs(args, stderr) catch return 2;
     if (cli.help) {
         try stdout.writeAll(usage);
+        return 0;
+    }
+    if (cli.version) {
+        try stdout.print("zpeek {s}\n", .{@import("build_options").version});
         return 0;
     }
 

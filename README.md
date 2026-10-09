@@ -42,11 +42,19 @@ zpeek gives you **one tool for all of them** right in the terminal: type SQL or 
 
 ### Install
 
-macOS, Linux or Windows (Git Bash / WSL). This downloads the latest release and adds `zpeek` to your `PATH`; run it again to update:
+**macOS, Linux, WSL, Git Bash** — downloads the latest release, verifies its checksum and adds `zpeek` to your `PATH`; run it again to update:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/aleksandraleksandrov/zpeek/main/install.sh | bash
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/aleksandraleksandrov/zpeek/main/install.ps1 | iex
+```
+
+Set `ZPEEK_VERSION=v1.2.3` to install a specific release, `ZPEEK_INSTALL_DIR` to choose the folder. Linux builds are static and run on any distribution. Check with `zpeek --version`.
 
 Or build from source with Zig 0.17.0:
 
@@ -184,11 +192,19 @@ zpeek — **один инструмент для всех этих баз** пр
 
 ### Установка
 
-macOS, Linux или Windows (Git Bash / WSL). Команда скачает последнюю версию и добавит `zpeek` в `PATH`; для обновления запустите её снова:
+**macOS, Linux, WSL, Git Bash** — скачает последнюю версию, проверит контрольную сумму и добавит `zpeek` в `PATH`; для обновления запустите снова:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/aleksandraleksandrov/zpeek/main/install.sh | bash
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/aleksandraleksandrov/zpeek/main/install.ps1 | iex
+```
+
+`ZPEEK_VERSION=v1.2.3` ставит конкретную версию, `ZPEEK_INSTALL_DIR` задаёт папку. Сборки для Linux статические и работают в любом дистрибутиве. Проверить: `zpeek --version`.
 
 Или соберите из исходников (нужен Zig 0.17.0):
 

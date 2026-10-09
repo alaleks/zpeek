@@ -4,6 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Release builds pass the tag, e.g. -Dversion=v0.2.0.
+    const version = b.option([]const u8, "version", "Version string shown by --version") orelse "dev";
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+
     const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
     const sqlite_dep = b.dependency("sqlite", .{});
 
@@ -21,6 +26,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
             .{ .name = "sqlite_c", .module = sqlite_c.createModule() },
+            .{ .name = "build_options", .module = build_options.createModule() },
         },
     });
     root_mod.addCSourceFile(.{

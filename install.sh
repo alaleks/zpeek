@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Environment overrides:
+#   ZPEEK_VERSION      install a specific release tag (default: latest)
+#   ZPEEK_INSTALL_DIR  where to put the binary
+#   ZPEEK_REPO         GitHub repository (owner/name)
+#   ZPEEK_RELEASE_URL  base URL with the release assets (mirrors, local tests)
 repo="${ZPEEK_REPO:-aleksandraleksandrov/zpeek}"
-release_base="https://github.com/${repo}/releases/latest/download"
+if [[ -n "${ZPEEK_RELEASE_URL:-}" ]]; then
+    release_base="${ZPEEK_RELEASE_URL%/}"
+elif [[ -n "${ZPEEK_VERSION:-}" ]]; then
+    release_base="https://github.com/${repo}/releases/download/${ZPEEK_VERSION}"
+else
+    release_base="https://github.com/${repo}/releases/latest/download"
+fi
 
 die() {
     printf 'zpeek installer: %s\n' "$*" >&2
@@ -26,6 +37,11 @@ case "$machine" in
     arm64 | aarch64) arch="aarch64" ;;
     *) die "unsupported architecture: ${machine}" ;;
 esac
+
+# A shell running under Rosetta reports x86_64 on Apple Silicon: prefer the native build.
+if [[ "$os" == "macos" && "$arch" == "x86_64" ]] && [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" == "1" ]]; then
+    arch="aarch64"
+fi
 
 if [[ "$os" == "windows" ]]; then
     extension="zip"
@@ -78,8 +94,13 @@ fi
 extract_dir="$temp_dir/extract"
 mkdir -p "$extract_dir"
 if [[ "$extension" == "zip" ]]; then
-    command -v unzip >/dev/null 2>&1 || die "unzip is required on Windows"
-    unzip -q "$archive" -d "$extract_dir"
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q "$archive" -d "$extract_dir"
+    elif command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+        powershell.exe -NoProfile -Command "Expand-Archive -Force -LiteralPath '$(cygpath -w "$archive")' -DestinationPath '$(cygpath -w "$extract_dir")'" >/dev/null
+    else
+        die "unzip (or PowerShell) is required on Windows"
+    fi
 else
     command -v tar >/dev/null 2>&1 || die "tar is required"
     tar -xzf "$archive" -C "$extract_dir"
@@ -102,6 +123,7 @@ esac
 if [[ "$path_contains_install_dir" == false ]]; then
     if [[ "$os" == "windows" ]] && command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
         install_dir_windows="$(cygpath -w "$install_dir")"
+        # shellcheck disable=SC2016 # PowerShell code: $ is for PowerShell, not bash.
         ZPEEK_INSTALL_DIR_WINDOWS="$install_dir_windows" powershell.exe -NoProfile -Command \
             '$dir=$env:ZPEEK_INSTALL_DIR_WINDOWS; $path=[Environment]::GetEnvironmentVariable("Path", "User"); if (($path -split ";") -notcontains $dir) { [Environment]::SetEnvironmentVariable("Path", (($path.TrimEnd(";") + ";" + $dir).TrimStart(";")), "User") }' \
             >/dev/null
@@ -126,7 +148,8 @@ if [[ "$path_contains_install_dir" == false ]]; then
     fi
 fi
 
-printf 'zpeek installed at %s\n' "$destination"
+installed_version="$("$destination" --version 2>/dev/null || true)"
+printf '%s installed at %s\n' "${installed_version:-zpeek}" "$destination"
 if [[ "$path_contains_install_dir" == false ]]; then
     printf 'Restart the terminal, then run: zpeek\n'
 else
