@@ -916,15 +916,12 @@ fn welcome(app: *App) !void {
     const top = try std.mem.concat(a, u8, &.{ " ╭", try repeat(a, "─", inner), "╮" });
     const bottom = try std.mem.concat(a, u8, &.{ " ╰", try repeat(a, "─", inner), "╯" });
     try lines.append(a, try a.dupe(Segment, &.{.{ .text = top, .style = theme.border_focus }}));
-    // Text logo from block elements (▀ ▄ █): part of every terminal font,
-    // unlike inline images, which only some terminals support.
     const rows = [_][]const Segment{
-        &.{.{ .text = "   ▀▀█ █▀█ █▀▀ █▀▀ █ ▄", .style = theme.accent_bold }},
-        &.{.{ .text = "   ▄▀  █▀▀ █▀▀ █▀▀ █▀▄", .style = theme.accent_bold }},
-        &.{ .{ .text = "   ▀▀▀ ▀   ▀▀▀ ▀▀▀ ▀ ▀", .style = theme.accent_bold }, .{ .text = "   terminal database client", .style = theme.dim } },
+        &.{.{ .text = "  zpeek", .style = .{ .fg = theme.accent } }},
+        &.{.{ .text = "  terminal database client", .style = theme.dim }},
         &.{},
-        &.{.{ .text = "   PostgreSQL · MySQL/MariaDB · SQLite", .style = theme.dim }},
-        &.{.{ .text = "   /help for commands · tab completes · ctrl+c twice exits", .style = theme.dim }},
+        &.{.{ .text = "  PostgreSQL · MySQL/MariaDB · SQLite", .style = theme.dim }},
+        &.{.{ .text = "  /help · tab completes · ctrl+c twice exits", .style = theme.dim }},
     };
     for (rows) |segs| {
         var line: std.ArrayList(Segment) = .empty;
