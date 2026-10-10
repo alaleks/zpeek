@@ -687,6 +687,10 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
 fn submit(app: *App) !void {
     const raw = std.mem.trim(u8, app.editor.text(), " \t\r\n");
     if (raw.len == 0) return;
+    if (raw[0] != '/') {
+        if (app.job != null) return app.transcript.addMessage(.warn, "a query is still running (ctrl+c cancels it)", .{});
+        if (app.conn == null) return app.transcript.addMessage(.err, "not connected — use /connect", .{});
+    }
     app.closePopup();
     const text = try app.gpa.dupe(u8, raw);
     defer app.gpa.free(text);
@@ -696,8 +700,7 @@ fn submit(app: *App) !void {
     try app.transcript.add(.{ .input = visible_text });
 
     if (text[0] == '/') return app.runCommand(text);
-    if (app.job != null) return app.transcript.addMessage(.warn, "a query is still running (ctrl+c cancels it)", .{});
-    const conn = app.conn orelse return app.transcript.addMessage(.err, "not connected — use /connect", .{});
+    const conn = app.conn.?;
 
     var stmts: std.ArrayList([]const u8) = .empty;
     defer stmts.deinit(app.gpa);

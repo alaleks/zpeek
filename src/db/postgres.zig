@@ -518,7 +518,8 @@ fn connectImpl(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *db.Err
         try std.fmt.allocPrint(gpa, "{s}/.s.PGSQL.{d}", .{ std.mem.trimEnd(u8, host, "/"), port })
     else
         null;
-    errdefer if (unix_path) |p| gpa.free(p);
+    var unowned_unix_path = unix_path;
+    errdefer if (unowned_unix_path) |p| gpa.free(p);
 
     var diag: []const u8 = "";
     const t = Transport.connect(gpa, io, host, port, unix_path, &diag) catch |err| switch (err) {
@@ -545,6 +546,7 @@ fn connectImpl(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *db.Err
         .port = port,
         .unix_path = unix_path,
     };
+    unowned_unix_path = null;
 
     negotiateTlsImpl(self, params, host) catch |err| {
         switch (err) {
