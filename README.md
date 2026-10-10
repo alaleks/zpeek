@@ -23,7 +23,7 @@ zpeek gives you **one tool for all of them** right in the terminal: type SQL or 
 - **Many databases, one interface.** The same commands everywhere — see [supported databases](#supported-databases).
 - **Schema at a glance.** Tables, views, enum values and other types, functions, triggers, and their source code.
 - **Comfortable SQL console.** Syntax highlighting; completion that knows the SQL dialect and the current schema (`SE` → `SELECT`, tables after `FROM`, columns after `WHERE`, including aliases); history; saved queries.
-- **Data browser.** Full-screen table with server-side `WHERE` filters, a row count that follows the filter, sorting, paging, hiding columns, copying, and deleting a row with confirmation.
+- **Data browser.** Full-screen table with server-side `WHERE` filters, row count on demand, sorting, paging, hiding columns, copying, and deleting a row with confirmation.
 - **Safe by default.** `DELETE` without `WHERE` is refused; queries run in the background and `ctrl+c` cancels them on the server.
 - **Secure connections.** TLS with optional certificate verification, SCRAM-SHA-256, `caching_sha2_password`.
 
@@ -150,6 +150,7 @@ Anything else is run as SQL; several statements can be separated by `;`. The fee
 | `↑↓←→` / `hjkl`, `pgup` `pgdn`, `g` `G`, `0` `$` | move |
 | `enter` | show the full value |
 | `/` | filter: `WHERE …` in `/browse`; otherwise `text`, `column:text` or `column=value` |
+| `t` | count rows matching the current `WHERE` in `/browse` |
 | `s` | sort by the column (asc → desc → off) |
 | `c` / `x` | choose columns / hide the current one |
 | `n` / `p` | next / previous page (500 rows) |
@@ -173,7 +174,7 @@ zpeek — **один инструмент для всех этих баз** пр
 - **Много баз, один интерфейс.** Одинаковые команды везде — см. [поддерживаемые базы](#поддерживаемые-базы).
 - **Схема под рукой.** Таблицы, view, значения enum и другие типы, функции, триггеры и их исходный код.
 - **Удобная SQL-консоль.** Подсветка синтаксиса; автодополнение с учётом диалекта и текущей схемы (`SE` → `SELECT`, таблицы после `FROM`, колонки после `WHERE`, в том числе через алиасы); история; сохранённые запросы.
-- **Просмотр данных.** Таблица на весь экран с фильтром `WHERE` на сервере, числом строк с учётом фильтра, сортировкой, страницами, скрытием колонок, копированием и удалением строки с подтверждением.
+- **Просмотр данных.** Таблица на весь экран с фильтром `WHERE` на сервере, подсчётом строк по запросу, сортировкой, страницами, скрытием колонок, копированием и удалением строки с подтверждением.
 - **Безопасно по умолчанию.** `DELETE` без `WHERE` не выполняется; запросы идут в фоне, `ctrl+c` отменяет их на сервере.
 - **Защищённые подключения.** TLS с проверкой сертификата по желанию, SCRAM-SHA-256, `caching_sha2_password`.
 
@@ -300,6 +301,7 @@ path = "~/notes.db"
 | `↑↓←→` / `hjkl`, `pgup` `pgdn`, `g` `G`, `0` `$` | перемещение |
 | `enter` | значение целиком |
 | `/` | фильтр: `WHERE …` в `/browse`; иначе `текст`, `колонка:текст` или `колонка=значение` |
+| `t` | подсчитать строки с учётом текущего `WHERE` в `/browse` |
 | `s` | сортировка по колонке (по возрастанию → по убыванию → выкл.) |
 | `c` / `x` | выбрать колонки / скрыть текущую |
 | `n` / `p` | следующая / предыдущая страница (по 500 строк) |

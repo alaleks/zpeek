@@ -82,6 +82,7 @@ const JobKind = union(enum) {
     definition: []const u8,
     browse_open: TableView.Browse,
     browse_reload,
+    browse_count,
     /// A confirmed single-row DELETE from the table viewer.
     browse_delete,
     cache,
@@ -669,6 +670,7 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
             app.mode = .console;
         },
         .reload => try app.startBrowseReload(),
+        .count => try app.startBrowseCount(),
         .copy => |text| {
             try app.vx.copyToSystemClipboard(app.tty.writer(), text, app.gpa);
             tv.notice = "copied to clipboard";
@@ -1241,9 +1243,6 @@ fn processJob(app: *App, job: *Job) !void {
                         },
                         else => {},
                     };
-                    if (job.outcomes.items.len > 2) {
-                        if (countFromOutcome(job.outcomes.items[2])) |total| tv.browse.?.total = total;
-                    }
                     app.mode = .table;
                     try app.transcript.addMessage(.dim, "{s}: {d} rows loaded in {d} ms", .{ b.table, r.result.rows.len, r.ms });
                 },
@@ -1280,9 +1279,6 @@ fn processJob(app: *App, job: *Job) !void {
                     owned.* = r.result;
                     job.outcomes.items[0] = .canceled;
                     try tv.setResult(owned);
-                    if (job.outcomes.items.len > 1) {
-                        if (countFromOutcome(job.outcomes.items[1])) |total| tv.browse.?.total = total;
-                    }
                 },
                 .failed => |msg| {
                     app.notice.clearRetainingCapacity();
@@ -1290,6 +1286,26 @@ fn processJob(app: *App, job: *Job) !void {
                     tv.notice = app.notice.items;
                 },
                 .canceled => tv.notice = "canceled",
+            }
+        },
+        .browse_count => {
+            const tv = app.table_view orelse return;
+            if (tv.browse == null or job.outcomes.items.len == 0) return;
+            switch (job.outcomes.items[0]) {
+                .result => {
+                    if (countFromOutcome(job.outcomes.items[0])) |total| {
+                        tv.browse.?.total = total;
+                        tv.notice = null;
+                    } else {
+                        tv.notice = "could not read row count";
+                    }
+                },
+                .failed => |msg| {
+                    app.notice.clearRetainingCapacity();
+                    try app.notice.appendSlice(app.gpa, msg);
+                    tv.notice = app.notice.items;
+                },
+                .canceled => tv.notice = "count canceled",
             }
         },
         .cache => {
@@ -1410,7 +1426,6 @@ fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
     job.sqls = try a.dupe([]const u8, &.{
         try schema.browseSql(a, kind, b.table, b.filter, null, b.page_size, 0),
         try schema.primaryKeySql(a, kind, b.table),
-        try schema.countSql(a, kind, b.table, b.filter),
     });
     job.stop_on_error = false;
     try app.startJob(job);
@@ -1437,12 +1452,16 @@ fn startBrowseReload(app: *App) !void {
     const job = try app.newJob(.browse_reload);
     const a = job.arena.allocator();
     const kind = app.conn.?.kind;
-    const page_sql = try schema.browseSql(a, kind, b.table, b.filter, b.order, b.page_size, b.offset);
-    job.sqls = if (b.total == null)
-        try a.dupe([]const u8, &.{ page_sql, try schema.countSql(a, kind, b.table, b.filter) })
-    else
-        try a.dupe([]const u8, &.{page_sql});
-    job.stop_on_error = false;
+    job.sqls = try a.dupe([]const u8, &.{try schema.browseSql(a, kind, b.table, b.filter, b.order, b.page_size, b.offset)});
+    try app.startJob(job);
+}
+
+fn startBrowseCount(app: *App) !void {
+    const tv = app.table_view orelse return;
+    const b = tv.browse orelse return;
+    const job = try app.newJob(.browse_count);
+    const a = job.arena.allocator();
+    job.sqls = try a.dupe([]const u8, &.{try schema.countSql(a, b.kind, b.table, b.filter)});
     try app.startJob(job);
 }
 

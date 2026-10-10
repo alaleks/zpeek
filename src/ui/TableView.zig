@@ -40,6 +40,8 @@ pub const Action = union(enum) {
     close,
     /// Browse parameters changed; the App should fetch a new page.
     reload,
+    /// Count rows matching the current browse filter on demand.
+    count,
     copy: []const u8,
     /// Show a short message in the status bar.
     notice: []const u8,
@@ -405,6 +407,8 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
             b.total = null;
             return .reload;
         }
+    } else if (key.matches('t', .{})) {
+        if (tv.browse != null) return .count;
     } else if (key.matches('y', .{})) {
         return .{ .copy = tv.currentValue() orelse "" };
     } else if (key.matches('Y', .{}) or key.matches('y', .{ .shift = true })) {
@@ -970,9 +974,9 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
         else
             " text · col:text · col=value · enter apply · esc cancel")
     else if (tv.browse) |b| (if (b.kind == .clickhouse)
-        " ↑↓←→ move · enter cell · / where · s sort · c columns · x hide · n/p page · r/F5 refresh · q back"
+        " ↑↓←→ move · enter cell · / where · t count · s sort · c columns · x hide · n/p page · r/F5 refresh · q back"
     else
-        " ↑↓←→ move · enter cell · / where · s sort · c columns · x hide · d delete · n/p page · r/F5 refresh · q back") else " ↑↓←→ move · enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
+        " ↑↓←→ move · enter cell · / where · t count · s sort · c columns · x hide · d delete · n/p page · r/F5 refresh · q back") else " ↑↓←→ move · enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
     _ = win.print(&.{.{ .text = hint, .style = theme.dim }}, .{ .row_offset = 1, .wrap = .none });
 }
 
