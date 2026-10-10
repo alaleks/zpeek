@@ -296,7 +296,11 @@ const My = struct {
             error.Canceled => return error.Canceled,
             else => {
                 self.broken = true;
-                self.err.set(self.gpa, "connection lost: {t}", .{err});
+                if (self.t.read_timed_out) {
+                    self.err.set(self.gpa, "database response timed out after 300 s", .{});
+                } else {
+                    self.err.set(self.gpa, "connection lost: {t}", .{err});
+                }
                 return error.ConnectionLost;
             },
         };
@@ -388,7 +392,7 @@ const My = struct {
                                 cell.* = try a.dupe(u8, try rr.take(len));
                             }
                         }
-                        try b.addRow(row);
+                        try b.addRow(row, opts);
                     }
                     const n = b.rows.items.len;
                     b.result.status = try std.fmt.allocPrint(a, "{d}{s} row{s}", .{ n, if (b.result.truncated) "+" else "", if (n == 1) "" else "s" });
@@ -648,7 +652,10 @@ fn connectImpl(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *db.Err
         switch (err) {
             error.OutOfMemory => {},
             error.AuthFailed, error.ServerError, error.TlsFailed, error.TlsRequired => err_out.set(gpa, "{s}", .{self.err.slice()}),
-            else => err_out.set(gpa, "connection to {s}:{d} failed during handshake: {t}", .{ host, port, err }),
+            else => if (self.t.read_timed_out)
+                err_out.set(gpa, "database response timed out after 300 s during handshake", .{})
+            else
+                err_out.set(gpa, "connection to {s}:{d} failed during handshake: {t}", .{ host, port, err }),
         }
         self.t.close();
         self.destroy();

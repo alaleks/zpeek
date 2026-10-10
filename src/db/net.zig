@@ -9,6 +9,7 @@ const TlsClient = @import("tls/Client.zig");
 const conninfo = @import("../conninfo.zig");
 
 const connect_timeout: Io.Duration = .fromSeconds(10);
+const read_timeout: Io.Duration = .fromSeconds(300);
 
 /// std.Io.Threaded (Zig 0.17) panics on `ConnectOptions.timeout`, so the
 /// timeout is implemented by racing the connect against a sleep.
@@ -50,6 +51,7 @@ pub const Transport = struct {
     sock_writer: Io.net.Stream.Writer,
     sock_read_buf: []u8,
     sock_write_buf: []u8,
+    read_timed_out: bool = false,
     tls_state: ?*TlsState = null,
     ca_bundle_lock: Io.RwLock = .init,
     ca_bundle: std.crypto.Certificate.Bundle = .empty,
@@ -110,7 +112,49 @@ pub const Transport = struct {
             .sock_reader = stream.reader(io, read_buf),
             .sock_writer = stream.writer(io, write_buf),
         };
+        t.sock_reader.interface.vtable = &.{
+            .stream = timedStream,
+            .readVec = timedReadVec,
+        };
         return t;
+    }
+
+    // Zig 0.17's Stream.Reader has no read deadline, so use the same vector
+    // read path with an Io timeout. TLS reads through this reader too.
+    fn timedStream(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try timedReadVec(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn timedReadVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const socket_reader: *Io.net.Stream.Reader = @alignCast(@fieldParentPtr("interface", io_r));
+        const t: *Transport = @alignCast(@fieldParentPtr("sock_reader", socket_reader));
+        var vectors: [8][]u8 = undefined;
+        const count, const data_size = try io_r.writableVector(&vectors, data);
+        const result = t.io.operateTimeout(.{ .net_read = .{
+            .socket_handle = t.stream.socket.handle,
+            .data = vectors[0..count],
+            .control = socket_reader.control_buffer[socket_reader.control_len..],
+        } }, .{ .duration = .{ .raw = read_timeout, .clock = .awake } }) catch |err| {
+            if (err == error.Timeout) t.read_timed_out = true;
+            if (err == error.Canceled) socket_reader.err = error.Canceled;
+            return error.ReadFailed;
+        };
+        const received = result.net_read catch |err| {
+            socket_reader.err = err;
+            return error.ReadFailed;
+        };
+        socket_reader.control_len += received.control_len;
+        socket_reader.control_truncated = socket_reader.control_truncated or received.control_truncated;
+        if (received.data_len == 0) return error.EndOfStream;
+        if (received.data_len > data_size) {
+            io_r.end += received.data_len - data_size;
+            return data_size;
+        }
+        return received.data_len;
     }
 
     pub fn reader(t: *Transport) *Io.Reader {

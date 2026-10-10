@@ -38,6 +38,7 @@ pub const Entry = struct {
     layout_arena: std.heap.ArenaAllocator,
     layout: []const Line = &.{},
     layout_width: u16 = 0,
+    retained_bytes: usize = 0,
 
     fn deinit(e: *Entry) void {
         if (e.content == .result) e.content.result.result.deinit();
@@ -49,6 +50,8 @@ pub const Entry = struct {
 /// Max rows of a result shown inline; the rest is in the table viewer.
 pub const inline_rows = 50;
 const max_col_width = 40;
+pub const max_entries = 200;
+pub const max_retained_bytes = 64 * 1024 * 1024;
 
 gpa: Allocator,
 entries: std.ArrayList(*Entry) = .empty,
@@ -56,6 +59,9 @@ entries: std.ArrayList(*Entry) = .empty,
 scroll: usize = 0,
 /// Total line count from the last draw, used to clamp scrolling.
 total_lines: usize = 0,
+layout_width: u16 = 0,
+layout_dirty: bool = true,
+retained_bytes: usize = 0,
 
 pub fn init(gpa: Allocator) Transcript {
     return .{ .gpa = gpa };
@@ -76,6 +82,9 @@ pub fn clear(t: *Transcript) void {
     }
     t.entries.clearRetainingCapacity();
     t.scroll = 0;
+    t.total_lines = 0;
+    t.layout_dirty = true;
+    t.retained_bytes = 0;
 }
 
 /// Adds an entry; string data in `content` is copied.
@@ -83,6 +92,8 @@ pub fn add(t: *Transcript, content: Content) Allocator.Error!void {
     const e = try t.gpa.create(Entry);
     errdefer t.gpa.destroy(e);
     e.* = .{ .arena = .init(t.gpa), .layout_arena = .init(t.gpa), .content = undefined };
+    errdefer e.arena.deinit();
+    errdefer e.layout_arena.deinit();
     const a = e.arena.allocator();
     e.content = switch (content) {
         .input => |s| .{ .input = try a.dupe(u8, s) },
@@ -95,8 +106,44 @@ pub fn add(t: *Transcript, content: Content) Allocator.Error!void {
         .code => |s| .{ .code = try a.dupe(u8, s) },
         .lines => |lines| .{ .lines = try dupeLines(a, lines) },
     };
+    e.retained_bytes = switch (e.content) {
+        .input => |s| s.len,
+        .result => |r| r.result.retained_bytes,
+        .message => |m| m.text.len,
+        .code => |s| s.len,
+        .lines => |lines| blk: {
+            var size: usize = 0;
+            for (lines) |line| for (line) |segment| {
+                size +|= segment.text.len;
+            };
+            break :blk size;
+        },
+    };
     try t.entries.append(t.gpa, e);
+    t.retained_bytes +|= e.retained_bytes;
     t.scroll = 0;
+    t.layout_dirty = true;
+}
+
+/// Drops old entries after the App has released any borrowed table result.
+pub fn prune(t: *Transcript) void {
+    while (t.entries.items.len > 1 and
+        (t.entries.items.len > max_entries or t.retained_bytes > max_retained_bytes))
+    {
+        const oldest = t.entries.orderedRemove(0);
+        t.retained_bytes -= oldest.retained_bytes;
+        oldest.deinit();
+        t.gpa.destroy(oldest);
+        t.layout_dirty = true;
+    }
+}
+
+test "prune old transcript entries" {
+    var transcript: Transcript = .init(std.testing.allocator);
+    defer transcript.deinit();
+    for (0..max_entries + 1) |_| try transcript.add(.{ .input = "select 1" });
+    transcript.prune();
+    try std.testing.expectEqual(@as(usize, max_entries), transcript.entries.items.len);
 }
 
 pub fn addMessage(t: *Transcript, kind: MessageKind, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
@@ -137,14 +184,18 @@ pub fn scrollBy(t: *Transcript, delta: isize, viewport: u16) void {
 
 pub fn draw(t: *Transcript, win: vaxis.Window) Allocator.Error!void {
     if (win.height == 0 or win.width == 0) return;
-    var total: usize = 0;
-    for (t.entries.items, 0..) |e, i| {
-        try ensureLayout(e, win.width);
-        total += e.layout.len;
-        if (i + 1 < t.entries.items.len and gapAfter(e, t.entries.items[i + 1])) total += 1;
+    if (t.layout_dirty or t.layout_width != win.width) {
+        var total: usize = 0;
+        for (t.entries.items, 0..) |e, i| {
+            try ensureLayout(e, win.width);
+            total += e.layout.len;
+            if (i + 1 < t.entries.items.len and gapAfter(e, t.entries.items[i + 1])) total += 1;
+        }
+        t.total_lines = total;
+        t.layout_width = win.width;
+        t.layout_dirty = false;
     }
-    t.total_lines = total;
-    t.scroll = @min(t.scroll, total -| win.height);
+    t.scroll = @min(t.scroll, t.total_lines -| win.height);
 
     // Walk lines from the bottom up and draw those inside the viewport.
     const bottom_skip = t.scroll;

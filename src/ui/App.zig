@@ -49,7 +49,7 @@ const Loop = vaxis.Loop(Event);
 /// Max rows kept for ad-hoc queries; protects memory on `select * from huge`.
 const console_row_limit = 10_000;
 const history_limit = 1000;
-const connect_job_timeout_ms = 15_000;
+const connect_job_timeout_ms = 30_000;
 
 const commands = [_]complete.Command{
     .{ .name = "/help", .help = "show commands and keys", .aliases = &.{"/?"} },
@@ -217,6 +217,7 @@ pub fn run(opts: Options) !void {
         try app.handleEvent(event);
         while (try app.loop.tryEvent()) |ev| try app.handleEvent(ev);
         if (!app.running) break;
+        if (app.table_view == null or app.table_view.?.owns_result) app.transcript.prune();
         try app.draw();
         try app.vx.render(writer);
         try writer.flush();
@@ -245,7 +246,7 @@ fn deinit(app: *App) void {
 
 fn tickerTask(app: *App) void {
     while (true) {
-        app.io.sleep(.fromMilliseconds(90), .awake) catch return;
+        app.io.sleep(.fromMilliseconds(250), .awake) catch return;
         if (app.busy.load(.acquire)) {
             _ = app.loop.tryPostEvent(.tick) catch return;
         }
@@ -1021,6 +1022,7 @@ fn connectTarget(app: *App, target: []const u8) !void {
 fn disconnect(app: *App) void {
     if (app.conn) |c| c.close();
     app.conn = null;
+    if (app.conn_params) |p| @memset(@constCast(p.password), 0);
     app.conn_params = null;
     app.conn_color = null;
     if (app.cache) |*c| c.deinit();
@@ -1131,8 +1133,20 @@ fn finishJob(app: *App) void {
         app.transcript.addMessage(.err, "internal error: {t}", .{err}) catch {};
     };
     if (job.connection_lost) {
+        if (app.conn_params) |params| {
+            if (app.job == null) {
+                app.startConnect(app.conn_name, params) catch |err| {
+                    app.transcript.addMessage(.err, "cannot reconnect: {t}", .{err}) catch {};
+                };
+            }
+        }
+        const reconnecting = app.job != null;
         app.disconnect();
-        app.transcript.addMessage(.warn, "connection lost — disconnected", .{}) catch {};
+        if (reconnecting) {
+            app.transcript.addMessage(.warn, "connection lost — reconnecting", .{}) catch {};
+        } else {
+            app.transcript.addMessage(.warn, "connection lost — disconnected", .{}) catch {};
+        }
     }
 }
 
@@ -1157,7 +1171,7 @@ fn processJob(app: *App, job: *Job) !void {
                 p.host = try a.dupe(u8, p.host);
                 p.user = try a.dupe(u8, p.user);
                 p.database = try a.dupe(u8, p.database);
-                p.password = "";
+                p.password = try a.dupe(u8, p.password);
                 app.conn_params = p;
                 app.conn_color = if (app.cfg.find(c.name)) |entry| entry.color else null;
                 try app.transcript.addMessage(.ok, "connected to {s} · {s} {s}", .{ c.name, conn.kind.label(), conn.server_version });
@@ -1209,8 +1223,7 @@ fn processJob(app: *App, job: *Job) !void {
                     const owned = try app.gpa.create(db.Result);
                     owned.* = r.result;
                     job.outcomes.items[0] = .canceled;
-                    var browse = b;
-                    browse.total = countFrom(job);
+                    const browse = b;
                     const tv = TableView.init(app.gpa, owned, true, b.table, browse) catch |err| {
                         owned.deinit();
                         app.gpa.destroy(owned);
@@ -1218,8 +1231,8 @@ fn processJob(app: *App, job: *Job) !void {
                     };
                     if (app.table_view) |old| old.deinit();
                     app.table_view = tv;
-                    // Primary key (third query) enables row deletion.
-                    if (job.outcomes.items.len > 2) switch (job.outcomes.items[2]) {
+                    // Primary key (second query) enables row deletion.
+                    if (job.outcomes.items.len > 1) switch (job.outcomes.items[1]) {
                         .result => |pk| {
                             var names: std.ArrayList([]const u8) = .empty;
                             defer names.deinit(app.gpa);
@@ -1264,7 +1277,6 @@ fn processJob(app: *App, job: *Job) !void {
                     owned.* = r.result;
                     job.outcomes.items[0] = .canceled;
                     try tv.setResult(owned);
-                    if (countFrom(job)) |t| tv.browse.?.total = t;
                 },
                 .failed => |msg| {
                     app.notice.clearRetainingCapacity();
@@ -1286,17 +1298,6 @@ fn processJob(app: *App, job: *Job) !void {
             }
         },
     }
-}
-
-fn countFrom(job: *Job) ?u64 {
-    if (job.outcomes.items.len < 2) return null;
-    return switch (job.outcomes.items[1]) {
-        .result => |r| if (r.result.rows.len > 0 and r.result.rows[0].len > 0)
-            std.fmt.parseInt(u64, r.result.rows[0][0] orelse return null, 10) catch null
-        else
-            null,
-        else => null,
-    };
 }
 
 /// Adds results with titles; secondary empty results are skipped.
@@ -1392,7 +1393,6 @@ fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
     job.kind = .{ .browse_open = b };
     job.sqls = try a.dupe([]const u8, &.{
         try schema.browseSql(a, kind, b.table, b.filter, null, b.page_size, 0),
-        try schema.countSql(a, kind, b.table, b.filter),
         try schema.primaryKeySql(a, kind, b.table),
     });
     try app.startJob(job);
@@ -1419,10 +1419,7 @@ fn startBrowseReload(app: *App) !void {
     const job = try app.newJob(.browse_reload);
     const a = job.arena.allocator();
     const kind = app.conn.?.kind;
-    var sqls: std.ArrayList([]const u8) = .empty;
-    try sqls.append(a, try schema.browseSql(a, kind, b.table, b.filter, b.order, b.page_size, b.offset));
-    if (b.total == null) try sqls.append(a, try schema.countSql(a, kind, b.table, b.filter));
-    job.sqls = sqls.items;
+    job.sqls = try a.dupe([]const u8, &.{try schema.browseSql(a, kind, b.table, b.filter, b.order, b.page_size, b.offset)});
     try app.startJob(job);
 }
 

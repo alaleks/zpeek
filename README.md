@@ -125,7 +125,7 @@ Fields override the matching parts of `url`. Saved queries live in `queries/*.sq
 | `/unsave <name>` | | delete a saved query |
 | `/databases`, `/refresh`, `/clear`, `/help`, `/quit` | `/dbs`, `/q` | |
 
-Anything else is run as SQL; several statements can be separated by `;`. The feed shows the first 50 rows of a result (`ctrl+o` opens all of it); ad-hoc queries keep at most 10,000 rows. `DELETE` without `WHERE` is refused.
+Anything else is run as SQL; several statements can be separated by `;`. The feed shows the first 50 rows of a result (`ctrl+o` opens all of it); ad-hoc queries keep at most 10,000 rows and 16 MiB of row data. Scrollback keeps up to 200 entries and roughly 64 MiB of results. A lost connection is re-established once without replaying the failed SQL. `DELETE` without `WHERE` is refused.
 
 ### Keys
 
@@ -275,7 +275,7 @@ path = "~/notes.db"
 | `/unsave <имя>` | | удалить сохранённый запрос |
 | `/databases`, `/refresh`, `/clear`, `/help`, `/quit` | `/dbs`, `/q` | |
 
-Всё остальное выполняется как SQL; несколько запросов разделяются `;`. В ленте показываются первые 50 строк результата (`ctrl+o` открывает весь), для произвольных запросов хранится не больше 10 000 строк. `DELETE` без `WHERE` не выполняется.
+Всё остальное выполняется как SQL; несколько запросов разделяются `;`. В ленте показываются первые 50 строк результата (`ctrl+o` открывает весь), для произвольных запросов хранится не больше 10 000 строк и 16 МиБ данных строк. Лента хранит до 200 записей и примерно 64 МиБ результатов. После обрыва соединения zpeek один раз переподключается без повторного выполнения неудавшегося SQL. `DELETE` без `WHERE` не выполняется.
 
 ### Клавиши
 

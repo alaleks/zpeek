@@ -23,6 +23,8 @@ pub const Result = struct {
     /// True when more rows were returned than `QueryOptions.max_rows`; the
     /// extra rows were read and discarded.
     truncated: bool = false,
+    /// Approximate retained row storage, used to bound transcript memory.
+    retained_bytes: usize = 0,
 
     pub fn deinit(r: *Result) void {
         r.arena.deinit();
@@ -37,6 +39,7 @@ pub const Result = struct {
 pub const ResultBuilder = struct {
     result: Result,
     rows: std.ArrayList([]const ?[]const u8) = .empty,
+    stored_bytes: usize = 0,
 
     pub fn init(gpa: Allocator) ResultBuilder {
         return .{ .result = .{ .arena = .init(gpa) } };
@@ -51,17 +54,27 @@ pub const ResultBuilder = struct {
         b.rows.clearRetainingCapacity();
     }
 
-    pub fn addRow(b: *ResultBuilder, row: []const ?[]const u8) Allocator.Error!void {
+    pub fn addRow(b: *ResultBuilder, row: []const ?[]const u8, opts: QueryOptions) Allocator.Error!void {
+        var row_bytes: usize = row.len *| @sizeOf(?[]const u8);
+        for (row) |cell| if (cell) |value| {
+            row_bytes +|= value.len;
+        };
+        if (row_bytes > opts.max_bytes -| b.stored_bytes) {
+            b.result.truncated = true;
+            return;
+        }
         try b.rows.append(b.allocator(), row);
+        b.stored_bytes += row_bytes;
     }
 
-    /// True when the row limit is reached; drivers then skip storing rows.
+    /// True when a result limit is reached; drivers then skip storing rows.
     pub fn full(b: *const ResultBuilder, opts: QueryOptions) bool {
-        return b.rows.items.len >= opts.max_rows;
+        return b.result.truncated or b.rows.items.len >= opts.max_rows or b.stored_bytes >= opts.max_bytes;
     }
 
     pub fn finish(b: *ResultBuilder) Result {
         b.result.rows = b.rows.items;
+        b.result.retained_bytes +|= b.stored_bytes;
         return b.result;
     }
 
@@ -72,6 +85,7 @@ pub const ResultBuilder = struct {
 
 pub const QueryOptions = struct {
     max_rows: usize = std.math.maxInt(usize),
+    max_bytes: usize = 16 * 1024 * 1024,
 };
 
 pub const QueryError = error{
@@ -141,6 +155,42 @@ pub const Connection = struct {
 
 /// Opens a connection. On failure `err_out` receives a description.
 pub fn connect(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *ErrorText) ConnectError!Connection {
+    const Race = union(enum) {
+        connection: ConnectError!Connection,
+        timer: Io.Cancelable!void,
+    };
+    var results: [2]Race = undefined;
+    var race: Io.Select(Race) = .init(io, &results);
+    race.concurrent(.connection, connectRaw, .{ gpa, io, params, err_out }) catch return connectRaw(gpa, io, params, err_out);
+    race.concurrent(.timer, Io.sleep, .{ io, Io.Duration.fromSeconds(30), Io.Clock.awake }) catch {
+        const first = race.await() catch {
+            while (race.cancel()) |late| closeLateConnection(late);
+            return error.ConnectFailed;
+        };
+        return first.connection;
+    };
+    const first = race.await() catch {
+        while (race.cancel()) |late| closeLateConnection(late);
+        return error.ConnectFailed;
+    };
+    while (race.cancel()) |late| closeLateConnection(late);
+    return switch (first) {
+        .connection => |result| result,
+        .timer => {
+            err_out.set(gpa, "connection timed out after 30 s during handshake", .{});
+            return error.ConnectFailed;
+        },
+    };
+}
+
+fn closeLateConnection(result: anytype) void {
+    switch (result) {
+        .connection => |conn| if (conn) |c| c.close() else |_| {},
+        .timer => {},
+    }
+}
+
+fn connectRaw(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *ErrorText) ConnectError!Connection {
     return switch (params.kind) {
         .sqlite => sqlite.connect(gpa, params, err_out),
         .postgres => postgres.connect(gpa, io, params, err_out),
@@ -154,4 +204,14 @@ test {
     _ = postgres;
     _ = mysql;
     _ = clickhouse;
+}
+
+test "result byte limit stops storing rows" {
+    var b: ResultBuilder = .init(std.testing.allocator);
+    defer b.deinit();
+    const opts: QueryOptions = .{ .max_bytes = 3 };
+    try b.addRow(&.{"abcd"}, opts);
+    try std.testing.expect(b.result.truncated);
+    try std.testing.expectEqual(@as(usize, 0), b.rows.items.len);
+    try std.testing.expect(b.full(opts));
 }

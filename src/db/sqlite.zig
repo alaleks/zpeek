@@ -73,7 +73,7 @@ const Sqlite = struct {
             }
             const row = try a.alloc(?[]const u8, ncols);
             for (row, 0..) |*cell, i| cell.* = try columnText(a, s, @intCast(i));
-            try b.addRow(row);
+            try b.addRow(row, opts);
         }
 
         if (ncols > 0) {
@@ -150,10 +150,12 @@ pub fn connect(gpa: Allocator, params: conninfo.Params, err_out: *db.ErrorText) 
         }
         return error.ConnectFailed;
     }
+    errdefer _ = c.sqlite3_close_v2(handle.?);
 
     const self = try gpa.create(Sqlite);
     self.* = .{ .gpa = gpa, .handle = handle.? };
     _ = c.sqlite3_extended_result_codes(self.handle, 1);
+    _ = c.sqlite3_busy_timeout(self.handle, 2000);
     return .{
         .ptr = self,
         .vtable = &Sqlite.vtable,

@@ -244,7 +244,11 @@ const Pg = struct {
             error.Canceled => return error.Canceled,
             else => {
                 self.broken = true;
-                self.err.set(self.gpa, "connection lost: {t}", .{err});
+                if (self.t.read_timed_out) {
+                    self.err.set(self.gpa, "database response timed out after 300 s", .{});
+                } else {
+                    self.err.set(self.gpa, "connection lost: {t}", .{err});
+                }
                 return error.ConnectionLost;
             },
         };
@@ -289,7 +293,7 @@ const Pg = struct {
                         const len = try r.takeInt(i32, .big);
                         cell.* = if (len < 0) null else try a.dupe(u8, try r.take(@intCast(len)));
                     }
-                    try b.addRow(row);
+                    try b.addRow(row, opts);
                 },
                 'C' => {
                     const tag = std.mem.sliceTo(m, 0);
@@ -329,7 +333,7 @@ const Pg = struct {
                 'd' => if (copy_out and !b.full(opts)) {
                     const row = try a.alloc(?[]const u8, 1);
                     row[0] = try a.dupe(u8, std.mem.trimEnd(u8, m, "\r\n"));
-                    try b.addRow(row);
+                    try b.addRow(row, opts);
                 } else if (copy_out) {
                     b.result.truncated = true;
                 },
@@ -562,7 +566,10 @@ fn connectImpl(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *db.Err
         switch (err) {
             error.OutOfMemory => {},
             error.AuthFailed, error.ServerError => err_out.set(gpa, "{s}", .{self.err.slice()}),
-            else => err_out.set(gpa, "connection to {s}:{d} failed during startup: {t}", .{ host, port, err }),
+            else => if (self.t.read_timed_out)
+                err_out.set(gpa, "database response timed out after 300 s during startup", .{})
+            else
+                err_out.set(gpa, "connection to {s}:{d} failed during startup: {t}", .{ host, port, err }),
         }
         self.t.close();
         self.destroy();

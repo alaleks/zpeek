@@ -42,6 +42,7 @@ const Ch = struct {
 
     fn query(ptr: *anyopaque, gpa: Allocator, sql: []const u8, opts: db.QueryOptions) db.QueryError!db.Result {
         const self: *Ch = @ptrCast(@alignCast(ptr));
+        self.err.set(self.gpa, "", .{});
         var id_buf: [16]u8 = undefined;
         self.io.random(&id_buf);
         const id = std.fmt.bytesToHex(id_buf, .lower);
@@ -49,26 +50,29 @@ const Ch = struct {
         self.query_id_len.store(id.len, .release);
         defer self.query_id_len.store(0, .release);
 
-        var resp = self.request(gpa, sql, &id, opts.max_rows) catch |err| switch (err) {
+        var b: db.ResultBuilder = .init(gpa);
+        errdefer b.deinit();
+        const a = b.allocator();
+        const resp = self.request(a, sql, &id, opts.max_rows, opts.max_bytes, true) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ConnectFailed => return error.ConnectionLost,
+            error.ResponseTooLarge => {
+                self.err.set(self.gpa, "ClickHouse response exceeds {d} bytes", .{opts.max_bytes});
+                return error.QueryFailed;
+            },
             else => {
-                self.err.set(self.gpa, "ClickHouse request failed: {t}", .{err});
+                if (self.err.slice().len == 0) self.err.set(self.gpa, "ClickHouse request failed: {t}", .{err});
                 return error.ConnectionLost;
             },
         };
-        defer resp.deinit(gpa);
-
         if (resp.status != 200 or resp.exceptionCode() != null) {
             const code = resp.exceptionCode() orelse "";
             self.err.set(self.gpa, "{s}", .{std.mem.trim(u8, resp.body.items, " \t\r\n")});
             return if (std.mem.eql(u8, code, query_was_cancelled)) error.Canceled else error.QueryFailed;
         }
 
-        var b: db.ResultBuilder = .init(gpa);
-        errdefer b.deinit();
-        const a = b.allocator();
         const body = resp.body.items;
+        b.result.retained_bytes = body.len;
 
         if (body.len == 0) {
             // DDL / INSERT: no result set.
@@ -86,9 +90,13 @@ const Ch = struct {
             try b.setColumns(try a.dupe([]const u8, &.{"output"}));
             var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, body, "\n"), '\n');
             while (lines.next()) |line| {
+                if (b.full(opts)) {
+                    b.result.truncated = true;
+                    break;
+                }
                 const row = try a.alloc(?[]const u8, 1);
-                row[0] = try a.dupe(u8, line);
-                try b.addRow(row);
+                row[0] = line;
+                try b.addRow(row, opts);
             }
             b.result.status = try std.fmt.allocPrint(a, "{d} lines ({s})", .{ b.rows.items.len, resp.format() });
             return b.finish();
@@ -110,7 +118,7 @@ const Ch = struct {
             const row = try a.alloc(?[]const u8, names.items.len);
             var it = std.mem.splitScalar(u8, line, '\t');
             for (row) |*cell| cell.* = try unescape(a, it.next() orelse "");
-            try b.addRow(row);
+            try b.addRow(row, opts);
         }
         const n = b.rows.items.len;
         b.result.status = try std.fmt.allocPrint(a, "{d}{s} row{s}", .{ n, if (b.result.truncated) "+" else "", if (n == 1) "" else "s" });
@@ -141,18 +149,19 @@ const Ch = struct {
     };
 
     /// Sends one POST request with `sql` as the body and reads the full response.
-    fn request(self: *Ch, gpa: Allocator, sql: []const u8, query_id: []const u8, max_rows: usize) !Response {
+    fn request(self: *Ch, gpa: Allocator, sql: []const u8, query_id: []const u8, max_rows: usize, max_bytes: usize, record_error: bool) !Response {
         const p = self.params;
         const host = if (p.host.len > 0) p.host else "localhost";
         var diag: []const u8 = "";
         const t = Transport.connect(self.gpa, self.io, host, port(p), null, &diag) catch |err| {
-            self.err.set(self.gpa, "cannot connect to {s}:{d}: {s}", .{ host, port(p), diag });
+            if (record_error) self.err.set(self.gpa, "cannot connect to {s}:{d}: {s}", .{ host, port(p), diag });
             return err;
         };
         defer t.close();
+        errdefer if (record_error and t.read_timed_out) self.err.set(self.gpa, "database response timed out after 300 s", .{});
         if (useTls(p)) {
             t.startTls(host, if (p.ssl.requiresTls()) p.ssl else .require, &diag) catch |err| {
-                self.err.set(self.gpa, "TLS handshake failed: {s}", .{diag});
+                if (record_error) self.err.set(self.gpa, "TLS handshake failed: {s}", .{diag});
                 return err;
             };
         }
@@ -221,19 +230,22 @@ const Ch = struct {
                 const size = std.fmt.parseInt(usize, size_line[0..semi], 16) catch return error.ProtocolError;
                 if (size == 0) break;
                 const start = resp.body.items.len;
+                if (size > max_bytes -| start) return error.ResponseTooLarge;
                 try resp.body.resize(gpa, start + size);
                 try r.readSliceAll(resp.body.items[start..]);
                 _ = try r.takeDelimiterInclusive('\n'); // CRLF after the chunk
             }
         } else if (content_length) |len| {
+            if (len > max_bytes) return error.ResponseTooLarge;
             try resp.body.resize(gpa, len);
             try r.readSliceAll(resp.body.items);
         } else {
             // Connection: close without length: read to the end.
             var buf: [4096]u8 = undefined;
             while (true) {
-                const n = r.readSliceShort(&buf) catch break;
+                const n = try r.readSliceShort(&buf);
                 if (n == 0) break;
+                if (n > max_bytes -| resp.body.items.len) return error.ResponseTooLarge;
                 try resp.body.appendSlice(gpa, buf[0..n]);
             }
         }
@@ -249,7 +261,7 @@ const Ch = struct {
         var id_buf: [16]u8 = undefined;
         self.io.random(&id_buf);
         const id = std.fmt.bytesToHex(id_buf, .lower);
-        var resp = self.request(self.gpa, sql, &id, std.math.maxInt(usize)) catch return;
+        var resp = self.request(self.gpa, sql, &id, std.math.maxInt(usize), 16 * 1024 * 1024, false) catch return;
         resp.deinit(self.gpa);
     }
 
@@ -289,7 +301,7 @@ fn percentEncode(gpa: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
 /// Decodes one TSV field; `\N` is NULL.
 fn unescape(a: Allocator, field: []const u8) Allocator.Error!?[]const u8 {
     if (std.mem.eql(u8, field, "\\N")) return null;
-    if (std.mem.indexOfScalar(u8, field, '\\') == null) return try a.dupe(u8, field);
+    if (std.mem.indexOfScalar(u8, field, '\\') == null) return field;
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
     while (i < field.len) : (i += 1) {
