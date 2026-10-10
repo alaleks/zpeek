@@ -147,7 +147,6 @@ Anything else is run as SQL; several statements can be separated by `;`. The fee
 
 | Key | |
 |---|---|
-| `?` | show `/browse` shortcuts |
 | `↑↓←→` / `hjkl`, `pgup` `pgdn`, `g` `G`, `0` `$` | move |
 | `enter` | show the full value |
 | `/` | filter: `WHERE …` in `/browse`; otherwise `text`, `column:text` or `column=value` |
@@ -299,7 +298,6 @@ path = "~/notes.db"
 
 | Клавиша | |
 |---|---|
-| `?` | показать клавиши `/browse` |
 | `↑↓←→` / `hjkl`, `pgup` `pgdn`, `g` `G`, `0` `$` | перемещение |
 | `enter` | значение целиком |
 | `/` | фильтр: `WHERE …` в `/browse`; иначе `текст`, `колонка:текст` или `колонка=значение` |
