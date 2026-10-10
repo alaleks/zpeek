@@ -53,6 +53,9 @@ result: *db.Result,
 owns_result: bool,
 title: []const u8,
 browse: ?Browse,
+/// Connection badge for a result opened outside browse mode.
+result_database: []const u8 = "",
+result_database_color: ?BadgeColor = null,
 
 /// Row indices into `result.rows` after local filter/sort.
 view: std.ArrayList(usize) = .empty,
@@ -96,22 +99,50 @@ page_rows: usize = 20,
 
 frame_arena: std.heap.ArenaAllocator,
 
-pub fn init(gpa: Allocator, result: *db.Result, owns_result: bool, title: []const u8, browse: ?Browse) Allocator.Error!*TableView {
+pub fn init(gpa: Allocator, result: *db.Result, owns_result: bool, title: []const u8, browse: ?Browse, database: []const u8, database_color: ?BadgeColor) Allocator.Error!*TableView {
     const tv = try gpa.create(TableView);
+    errdefer gpa.destroy(tv);
+    const owned_title = try gpa.dupe(u8, title);
+    errdefer gpa.free(owned_title);
+    const owned_database = try gpa.dupe(u8, database);
+    errdefer gpa.free(owned_database);
     tv.* = .{
         .gpa = gpa,
         .result = result,
         .owns_result = owns_result,
-        .title = try gpa.dupe(u8, title),
+        .title = owned_title,
         .browse = browse,
+        .result_database = owned_database,
+        .result_database_color = database_color,
         .filter_editor = .init(gpa),
         .frame_arena = .init(gpa),
     };
+    errdefer {
+        tv.view.deinit(gpa);
+        tv.widths.deinit(gpa);
+        tv.hidden.deinit(gpa);
+        tv.visible.deinit(gpa);
+        tv.local_filter.deinit(gpa);
+        tv.filter_editor.deinit();
+        tv.completion.deinit(gpa);
+        tv.primary_key.deinit(gpa);
+        tv.frame_arena.deinit();
+    }
     if (tv.browse) |*b| {
         b.table = try gpa.dupe(u8, b.table);
+        errdefer gpa.free(b.table);
         b.database = try gpa.dupe(u8, b.database);
+        errdefer gpa.free(b.database);
         b.filter = try gpa.dupe(u8, b.filter);
-        if (b.order) |*o| o.column = try gpa.dupe(u8, o.column);
+        errdefer gpa.free(b.filter);
+        if (b.order) |*o| {
+            o.column = try gpa.dupe(u8, o.column);
+            errdefer gpa.free(o.column);
+            try tv.rebuild();
+            return tv;
+        }
+        try tv.rebuild();
+        return tv;
     }
     try tv.rebuild();
     return tv;
@@ -129,6 +160,7 @@ pub fn deinit(tv: *TableView) void {
         if (b.order) |o| tv.gpa.free(o.column);
     }
     tv.gpa.free(tv.title);
+    tv.gpa.free(tv.result_database);
     tv.view.deinit(tv.gpa);
     tv.widths.deinit(tv.gpa);
     tv.hidden.deinit(tv.gpa);
@@ -369,7 +401,10 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
     } else if (key.matches('p', .{}) or key.matches('[', .{})) {
         return tv.prevPage();
     } else if (key.matches('r', .{}) or key.matches(vaxis.Key.f5, .{})) {
-        if (tv.browse != null) return .reload;
+        if (tv.browse) |*b| {
+            b.total = null;
+            return .reload;
+        }
     } else if (key.matches('y', .{})) {
         return .{ .copy = tv.currentValue() orelse "" };
     } else if (key.matches('Y', .{}) or key.matches('y', .{ .shift = true })) {
@@ -685,6 +720,9 @@ fn toggleSort(tv: *TableView) Allocator.Error!Action {
 fn nextPage(tv: *TableView) Action {
     const b = &(tv.browse orelse return .none);
     if (tv.result.rows.len < b.page_size) return .{ .notice = "last page" };
+    if (b.total) |total| {
+        if (@as(u128, b.offset) + b.page_size >= total) return .{ .notice = "last page" };
+    }
     b.offset += b.page_size;
     return .reload;
 }
@@ -725,14 +763,13 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
     {
         var title: std.ArrayList(Segment) = .empty;
         try title.append(a, .{ .text = " ", .style = .{} });
+        const database = if (tv.browse) |b| b.database else tv.result_database;
+        const database_color = if (tv.browse) |b| b.database_color else tv.result_database_color;
+        if (database.len > 0) {
+            try title.append(a, .{ .text = try std.fmt.allocPrint(a, " {s} ", .{database}), .style = databaseBadgeStyle(database_color) });
+            try title.append(a, .{ .text = "  ", .style = .{} });
+        }
         if (tv.browse) |b| {
-            if (b.database.len > 0) {
-                try title.append(a, .{
-                    .text = try std.fmt.allocPrint(a, " {s} ", .{b.database}),
-                    .style = databaseBadgeStyle(b.database_color),
-                });
-                try title.append(a, .{ .text = "  ", .style = .{} });
-            }
             try title.append(a, .{ .text = tv.title, .style = theme.accent_bold });
             if (b.filter.len > 0) {
                 try title.append(a, .{ .text = "  where ", .style = theme.dim });
@@ -843,7 +880,7 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
     if (tv.confirm_delete) |sql| try tv.drawConfirmDelete(a, win, sql);
 }
 
-fn databaseBadgeStyle(color: ?BadgeColor) vaxis.Style {
+pub fn databaseBadgeStyle(color: ?BadgeColor) vaxis.Style {
     const c = color orelse return .{ .fg = .{ .index = 15 }, .bg = .{ .index = 2 }, .bold = true };
     const luminance = @as(u32, c.r) * 299 + @as(u32, c.g) * 587 + @as(u32, c.b) * 114;
     const foreground: vaxis.Color = if (luminance >= 128_000) .{ .index = 0 } else .{ .index = 15 };
@@ -903,6 +940,7 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
             const last = b.offset + r.rows.len;
             if (r.rows.len == 0) {
                 try info.print(a, " no rows", .{});
+                if (b.total) |t| try info.print(a, " of {d}", .{t});
             } else {
                 try info.print(a, " rows {d}–{d}", .{ first, last });
                 if (b.total) |t| try info.print(a, " of {d}", .{t});
@@ -934,9 +972,7 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
     else if (tv.browse) |b| (if (b.kind == .clickhouse)
         " ↑↓←→ move · enter cell · / where · s sort · c columns · x hide · n/p page · r/F5 refresh · q back"
     else
-        " ↑↓←→ move · enter cell · / where · s sort · c columns · x hide · d delete · n/p page · r/F5 refresh · q back")
-    else
-        " ↑↓←→ move · enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
+        " ↑↓←→ move · enter cell · / where · s sort · c columns · x hide · d delete · n/p page · r/F5 refresh · q back") else " ↑↓←→ move · enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
     _ = win.print(&.{.{ .text = hint, .style = theme.dim }}, .{ .row_offset = 1, .wrap = .none });
 }
 

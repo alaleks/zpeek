@@ -583,4 +583,8 @@ test "quoting" {
         "select * from \"t\" where id > 3 order by \"name\" desc limit 100 offset 200",
         try browseSql(a, .sqlite, "t", "id > 3", .{ .column = "name", .descending = true }, 100, 200),
     );
+    try testing.expectEqualStrings(
+        "select count(*) from \"t\" where id > 3",
+        try countSql(a, .sqlite, "t", "id > 3"),
+    );
 }

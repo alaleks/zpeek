@@ -999,7 +999,7 @@ fn openTablePicker(app: *App, purpose: Picker.Purpose) !void {
 
 fn openLastResult(app: *App) !void {
     const r = app.transcript.lastResult() orelse return app.transcript.addMessage(.dim, "no result to open yet", .{});
-    app.table_view = try TableView.init(app.gpa, r, false, "Result", null);
+    app.table_view = try TableView.init(app.gpa, r, false, "Result", null, app.conn_name, app.conn_color);
     app.mode = .table;
 }
 
@@ -1224,7 +1224,7 @@ fn processJob(app: *App, job: *Job) !void {
                     owned.* = r.result;
                     job.outcomes.items[0] = .canceled;
                     const browse = b;
-                    const tv = TableView.init(app.gpa, owned, true, b.table, browse) catch |err| {
+                    const tv = TableView.init(app.gpa, owned, true, b.table, browse, "", null) catch |err| {
                         owned.deinit();
                         app.gpa.destroy(owned);
                         return err;
@@ -1241,6 +1241,9 @@ fn processJob(app: *App, job: *Job) !void {
                         },
                         else => {},
                     };
+                    if (job.outcomes.items.len > 2) {
+                        if (countFromOutcome(job.outcomes.items[2])) |total| tv.browse.?.total = total;
+                    }
                     app.mode = .table;
                     try app.transcript.addMessage(.dim, "{s}: {d} rows loaded in {d} ms", .{ b.table, r.result.rows.len, r.ms });
                 },
@@ -1277,6 +1280,9 @@ fn processJob(app: *App, job: *Job) !void {
                     owned.* = r.result;
                     job.outcomes.items[0] = .canceled;
                     try tv.setResult(owned);
+                    if (job.outcomes.items.len > 1) {
+                        if (countFromOutcome(job.outcomes.items[1])) |total| tv.browse.?.total = total;
+                    }
                 },
                 .failed => |msg| {
                     app.notice.clearRetainingCapacity();
@@ -1298,6 +1304,16 @@ fn processJob(app: *App, job: *Job) !void {
             }
         },
     }
+}
+
+fn countFromOutcome(outcome: Outcome) ?u64 {
+    const r = switch (outcome) {
+        .result => |value| value.result,
+        else => return null,
+    };
+    if (r.rows.len != 1 or r.rows[0].len == 0) return null;
+    const value = r.rows[0][0] orelse return null;
+    return std.fmt.parseInt(u64, value, 10) catch null;
 }
 
 /// Adds results with titles; secondary empty results are skipped.
@@ -1394,7 +1410,9 @@ fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
     job.sqls = try a.dupe([]const u8, &.{
         try schema.browseSql(a, kind, b.table, b.filter, null, b.page_size, 0),
         try schema.primaryKeySql(a, kind, b.table),
+        try schema.countSql(a, kind, b.table, b.filter),
     });
+    job.stop_on_error = false;
     try app.startJob(job);
 }
 
@@ -1419,7 +1437,12 @@ fn startBrowseReload(app: *App) !void {
     const job = try app.newJob(.browse_reload);
     const a = job.arena.allocator();
     const kind = app.conn.?.kind;
-    job.sqls = try a.dupe([]const u8, &.{try schema.browseSql(a, kind, b.table, b.filter, b.order, b.page_size, b.offset)});
+    const page_sql = try schema.browseSql(a, kind, b.table, b.filter, b.order, b.page_size, b.offset);
+    job.sqls = if (b.total == null)
+        try a.dupe([]const u8, &.{ page_sql, try schema.countSql(a, kind, b.table, b.filter) })
+    else
+        try a.dupe([]const u8, &.{page_sql});
+    job.stop_on_error = false;
     try app.startJob(job);
 }
 
@@ -1634,7 +1657,9 @@ fn drawFooter(app: *App, a: Allocator, win: vaxis.Window) !void {
         var buf: [256]u8 = undefined;
         const desc = if (app.conn_params) |p| p.describe(&buf) else "";
         try left.append(a, .{ .text = "  ● ", .style = theme.ok });
-        try left.append(a, .{ .text = app.conn_name, .style = theme.bold });
+        if (app.conn_name.len > 0) {
+            try left.append(a, .{ .text = try std.fmt.allocPrint(a, " {s} ", .{app.conn_name}), .style = TableView.databaseBadgeStyle(app.conn_color) });
+        }
         try left.append(a, .{ .text = try std.fmt.allocPrint(a, "  {s} {s}", .{ c.kind.label(), c.server_version }), .style = theme.dim });
         if (!std.mem.eql(u8, desc, app.conn_name)) try left.append(a, .{ .text = try std.fmt.allocPrint(a, " · {s}", .{desc}), .style = theme.dim });
     } else {

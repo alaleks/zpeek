@@ -247,7 +247,7 @@ pub const example =
     \\
     \\# [connections.local]
     \\# url = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-    \\# color = "#2F6B43"          # database badge background
+    \\# color = "#2F6B43"          # connection name badge background
     \\
     \\# [connections.shop]
     \\# driver = "mysql"            # postgres | mysql | mariadb | sqlite | clickhouse
