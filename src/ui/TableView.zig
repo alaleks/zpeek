@@ -94,6 +94,7 @@ completion_sel: usize = 0,
 completion_len: usize = 0,
 detail: bool = false,
 detail_scroll: usize = 0,
+browse_help: bool = false,
 notice: ?[]const u8 = null,
 
 /// Visible rows from the last draw (for paging).
@@ -327,6 +328,10 @@ fn currentValue(tv: *const TableView) ?[]const u8 {
 
 pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
     tv.notice = null;
+    if (tv.browse_help) {
+        if (isHelpKey(key) or key.matchesAny(&.{ 'q', vaxis.Key.escape }, .{})) tv.browse_help = false;
+        return .none;
+    }
     if (tv.editing_filter) return tv.handleFilterKey(key);
     if (tv.chooser != null) return tv.handleChooserKey(key);
     if (tv.confirm_delete) |sql| {
@@ -352,6 +357,10 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
 
     const nrows = tv.view.items.len;
     const ncols = tv.visible.items.len;
+    if (tv.browse != null and isHelpKey(key)) {
+        tv.browse_help = true;
+        return .none;
+    }
     if (key.matchesAny(&.{ vaxis.Key.escape, 'q' }, .{}) or key.matches('c', .{ .ctrl = true })) return .close;
     if (key.matchesAny(&.{ vaxis.Key.down, 'j' }, .{})) {
         if (tv.row + 1 < nrows) tv.row += 1 else return tv.nextPage();
@@ -415,6 +424,10 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
         return .{ .copy = try tv.rowAsTsv() };
     }
     return .none;
+}
+
+fn isHelpKey(key: vaxis.Key) bool {
+    return key.matches('?', .{}) or key.matches('?', .{ .shift = true }) or key.matches('/', .{ .shift = true });
 }
 
 fn handleFilterKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
@@ -882,6 +895,7 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
     if (tv.detail) try tv.drawDetail(a, win);
     if (tv.chooser != null) try tv.drawChooser(a, win);
     if (tv.confirm_delete) |sql| try tv.drawConfirmDelete(a, win, sql);
+    if (tv.browse_help) tv.drawBrowseHelp(win);
 }
 
 pub fn databaseBadgeStyle(color: ?BadgeColor) vaxis.Style {
@@ -973,11 +987,55 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
             " enter apply · esc cancel · empty clears · columns and operators autocomplete"
         else
             " text · col:text · col=value · enter apply · esc cancel")
-    else if (tv.browse) |b| (if (b.kind == .clickhouse)
-        " ↑↓←→ move · enter cell · / where · t count · s sort · c columns · x hide · n/p page · r/F5 refresh · q back"
+    else if (tv.browse != null)
+        (if (win.width < render.displayWidth(" ? keys · ↑↓ move · / where · t count · s sort · n/p page · q back"))
+            " ? keys · / where · t count · q back"
+        else
+            " ? keys · ↑↓ move · / where · t count · s sort · n/p page · q back")
     else
-        " ↑↓←→ move · enter cell · / where · t count · s sort · c columns · x hide · d delete · n/p page · r/F5 refresh · q back") else " ↑↓←→ move · enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
+        " ↑↓←→ move · enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
     _ = win.print(&.{.{ .text = hint, .style = theme.dim }}, .{ .row_offset = 1, .wrap = .none });
+}
+
+fn drawBrowseHelp(tv: *TableView, win: vaxis.Window) void {
+    const keys = [_][2][]const u8{
+        .{ "↑↓←→ / hjkl", "move between rows and columns" },
+        .{ "pgup / pgdn", "move by screen" },
+        .{ "g / G, 0 / $", "first or last row/column" },
+        .{ "enter", "show the full cell value" },
+        .{ "/", "edit the server-side WHERE filter" },
+        .{ "t", "count rows matching WHERE" },
+        .{ "s", "sort by the current column" },
+        .{ "c / x", "choose or hide columns" },
+        .{ "n / p", "next or previous page" },
+        .{ "r / F5", "refresh the page" },
+        .{ "d", "delete the current row" },
+        .{ "y / Y", "copy cell or row" },
+    };
+    const width: u16 = @min(win.width -| 4, 62);
+    const height: u16 = @min(win.height -| 4, keys.len + 4);
+    const box = win.child(.{
+        .x_off = (win.width - width) / 2,
+        .y_off = (win.height - height) / 2,
+        .width = width,
+        .height = height,
+        .border = .{ .where = .all, .style = theme.border_focus },
+    });
+    box.clear();
+    _ = box.print(&.{.{ .text = " Browse keys", .style = theme.accent_bold }}, .{ .row_offset = 0, .wrap = .none });
+    var row: u16 = 2;
+    for (keys) |entry| {
+        if (tv.browse.?.kind == .clickhouse and std.mem.eql(u8, entry[0], "d")) continue;
+        if (row >= height -| 1) break;
+        _ = box.print(&.{
+            .{ .text = "  " },
+            .{ .text = entry[0], .style = theme.info },
+            .{ .text = "                "[0..16 -| render.displayWidth(entry[0])] },
+            .{ .text = entry[1] },
+        }, .{ .row_offset = row, .wrap = .none });
+        row += 1;
+    }
+    _ = box.print(&.{.{ .text = "  ? / esc / q  close", .style = theme.dim }}, .{ .row_offset = height -| 1, .wrap = .none });
 }
 
 fn drawDetail(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!void {
