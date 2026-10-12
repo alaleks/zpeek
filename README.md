@@ -27,6 +27,25 @@ zpeek gives you **one tool for all of them** right in the terminal: type SQL or 
 - **Safe by default.** `DELETE` without `WHERE` is refused; queries run in the background and `ctrl+c` cancels them on the server.
 - **Secure connections.** TLS with optional certificate verification, SCRAM-SHA-256, `caching_sha2_password`.
 
+### Demo
+
+![zpeek connects to an example SQLite database, lists tables, runs SQL and filters rows in /browse](examples/demo.gif)
+
+The GIF uses the sample data in [examples/demo.sql](examples/demo.sql). To try it locally after building zpeek:
+
+```sh
+sqlite3 /tmp/zpeek-demo.db < examples/demo.sql
+./zig-out/bin/zpeek /tmp/zpeek-demo.db
+```
+
+In the recording, run `/tables`, `select * from orders`, then `/browse orders`. Inside `/browse`, press `/` to filter with `total_usd >= 100`, `t` to count matching rows, `s` to sort the selected column, and `enter` to inspect a cell.
+
+To regenerate the GIF, build zpeek with `zig build -Doptimize=ReleaseSafe` and run `vhs examples/demo.tape` from the repository root. The [tape](examples/demo.tape) creates the sample database with `sqlite3`.
+
+### Memory use
+
+On macOS arm64, a Zig 0.17.0 `ReleaseSafe` build used **5,160,960 bytes (4.92 MiB) maximum resident memory** while opening the sample SQLite database, listing tables, running `select name, city from customers order by name`, and viewing its result with `ctrl+o` (measured October 2026). Reproduce it with `/usr/bin/time -l ./zig-out/bin/zpeek /tmp/zpeek-demo.db`, perform those steps, then quit with `q` and `ctrl+d`. This is peak process RSS for that session; other systems and larger results will differ.
+
 ### Supported databases
 
 | Database | Connect with | Status |
@@ -45,13 +64,13 @@ zpeek gives you **one tool for all of them** right in the terminal: type SQL or 
 **macOS, Linux, WSL, Git Bash** — downloads the latest release, verifies its checksum and adds `zpeek` to your `PATH`; run it again to update:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/aleksandraleksandrov/zpeek/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/alaleks/zpeek/master/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/aleksandraleksandrov/zpeek/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/alaleks/zpeek/master/install.ps1 | iex
 ```
 
 Set `ZPEEK_VERSION=v1.2.3` to install a specific release, `ZPEEK_INSTALL_DIR` to choose the folder. Linux builds are static and run on any distribution. Check with `zpeek --version`.
@@ -159,6 +178,10 @@ Anything else is run as SQL; several statements can be separated by `;`. The fee
 | `y` / `Y` | copy cell / row (OSC 52) |
 | `q` / `esc` | back |
 
+### Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build steps and starter tasks. The project is licensed under [MIT](LICENSE).
+
 ---
 
 ## Русский
@@ -178,6 +201,14 @@ zpeek — **один инструмент для всех этих баз** пр
 - **Безопасно по умолчанию.** `DELETE` без `WHERE` не выполняется; запросы идут в фоне, `ctrl+c` отменяет их на сервере.
 - **Защищённые подключения.** TLS с проверкой сертификата по желанию, SCRAM-SHA-256, `caching_sha2_password`.
 
+### Демо
+
+[GIF-демонстрация](examples/demo.gif): подключение к примерной SQLite-базе, список таблиц, SQL-запрос и работа с `/browse` — фильтр, подсчёт строк, сортировка и просмотр ячейки. Данные и команда для запуска приведены в [разделе Demo](#demo).
+
+### Память
+
+На macOS arm64 сборка Zig 0.17.0 `ReleaseSafe` использовала **максимум 5 160 960 байт (4,92 МиБ RSS)** при открытии примерной SQLite-базы, просмотре списка таблиц, выполнении `select name, city from customers order by name` и открытии результата через `ctrl+o` (замер в октябре 2026 года). Команда и условия замера приведены в [разделе Memory use](#memory-use). На других системах и больших результатах цифра будет иной.
+
 ### Поддерживаемые базы
 
 | База | Как подключаться | Статус |
@@ -196,13 +227,13 @@ zpeek — **один инструмент для всех этих баз** пр
 **macOS, Linux, WSL, Git Bash** — скачает последнюю версию, проверит контрольную сумму и добавит `zpeek` в `PATH`; для обновления запустите снова:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/aleksandraleksandrov/zpeek/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/alaleks/zpeek/master/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/aleksandraleksandrov/zpeek/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/alaleks/zpeek/master/install.ps1 | iex
 ```
 
 `ZPEEK_VERSION=v1.2.3` ставит конкретную версию, `ZPEEK_INSTALL_DIR` задаёт папку. Сборки для Linux статические и работают в любом дистрибутиве. Проверить: `zpeek --version`.
@@ -309,3 +340,7 @@ path = "~/notes.db"
 | `d` | удалить строку (показывает SQL, `y` подтверждает; нужен первичный ключ; не для ClickHouse) |
 | `y` / `Y` | копировать ячейку / строку (OSC 52) |
 | `q` / `esc` | назад |
+
+### Участие в проекте
+
+Инструкции по сборке и задачи для первого вклада — в [CONTRIBUTING.md](CONTRIBUTING.md). Лицензия проекта — [MIT](LICENSE).

@@ -1,3 +1,33 @@
+# Zig build output
 .zig-cache/
 zig-out/
 zig-pkg/
+release-root/
+dist/
+zpeek-*.tar.gz
+zpeek-*.zip
+
+# Local databases and configuration
+*.db
+*.db3
+*.sqlite
+*.sqlite3
+*.db*-journal
+*.db*-shm
+*.db*-wal
+*.sqlite*-journal
+*.sqlite*-shm
+*.sqlite*-wal
+.env
+.env.*
+!.env.example
+config.toml
+
+# Editor and OS files
+.claude/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+*~

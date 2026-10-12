@@ -1,6 +1,6 @@
 # zpeek installer for Windows PowerShell 5.1+ and PowerShell 7+.
 #
-#   irm https://raw.githubusercontent.com/aleksandraleksandrov/zpeek/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/alaleks/zpeek/master/install.ps1 | iex
 #
 # Environment overrides:
 #   ZPEEK_VERSION      install a specific release tag (default: latest)
@@ -16,7 +16,7 @@ function Fail($message) {
     throw "zpeek installer: $message"
 }
 
-$repo = if ($env:ZPEEK_REPO) { $env:ZPEEK_REPO } else { 'aleksandraleksandrov/zpeek' }
+$repo = if ($env:ZPEEK_REPO) { $env:ZPEEK_REPO } else { 'alaleks/zpeek' }
 if ($env:ZPEEK_RELEASE_URL) {
     $base = $env:ZPEEK_RELEASE_URL.TrimEnd('/')
 } elseif ($env:ZPEEK_VERSION) {

@@ -6,7 +6,7 @@ set -Eeuo pipefail
 #   ZPEEK_INSTALL_DIR  where to put the binary
 #   ZPEEK_REPO         GitHub repository (owner/name)
 #   ZPEEK_RELEASE_URL  base URL with the release assets (mirrors, local tests)
-repo="${ZPEEK_REPO:-aleksandraleksandrov/zpeek}"
+repo="${ZPEEK_REPO:-alaleks/zpeek}"
 if [[ -n "${ZPEEK_RELEASE_URL:-}" ]]; then
     release_base="${ZPEEK_RELEASE_URL%/}"
 elif [[ -n "${ZPEEK_VERSION:-}" ]]; then
