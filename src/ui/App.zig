@@ -55,11 +55,11 @@ const commands = [_]complete.Command{
     .{ .name = "/help", .help = "show commands and keys", .aliases = &.{"/?"} },
     .{ .name = "/connect", .args = "[name|url]", .help = "connect (no argument: pick from config)", .arg = .connection, .aliases = &.{"/c"} },
     .{ .name = "/disconnect", .help = "close the connection" },
-    .{ .name = "/tables", .help = "list tables", .aliases = &.{"/t"} },
-    .{ .name = "/views", .help = "list views", .aliases = &.{"/v"} },
-    .{ .name = "/types", .help = "list user types and enum values", .aliases = &.{"/enums"} },
-    .{ .name = "/functions", .help = "list functions and procedures", .aliases = &.{ "/fn", "/routines" } },
-    .{ .name = "/triggers", .help = "list triggers" },
+    .{ .name = "/tables", .help = "pick a table to browse", .aliases = &.{"/t"} },
+    .{ .name = "/views", .help = "pick a view to show its SQL", .aliases = &.{"/v"} },
+    .{ .name = "/types", .help = "pick a type to show its values", .aliases = &.{"/enums"} },
+    .{ .name = "/functions", .help = "pick a function or procedure to show its source", .aliases = &.{ "/fn", "/routines" } },
+    .{ .name = "/triggers", .help = "pick a trigger to show its source" },
     .{ .name = "/describe", .args = "<table>", .help = "columns, indexes and constraints", .arg = .table, .aliases = &.{"/d"} },
     .{ .name = "/browse", .args = "<table> [where …]", .help = "open table data (no argument: pick a table)", .arg = .table, .aliases = &.{"/b"} },
     .{ .name = "/def", .args = "<name>", .help = "source of a view, function, trigger or enum", .arg = .object },
@@ -631,6 +631,14 @@ fn handlePickerKey(app: *App, key: vaxis.Key) !void {
                     app.closePicker();
                     if (purpose == .browse) try app.startBrowse(name, "") else try app.startDescribe(name);
                 },
+                .definition => {
+                    try app.startDefinitionSql(label, p.items[i].value);
+                    app.closePicker();
+                },
+                .type_value => {
+                    try app.transcript.add(.{ .code = p.items[i].value });
+                    app.closePicker();
+                },
                 .query => {
                     const name = try app.gpa.dupe(u8, label);
                     defer app.gpa.free(name);
@@ -1199,7 +1207,17 @@ fn processJob(app: *App, job: *Job) !void {
             }
             if (ddl and !job.connection_lost) try app.startCacheLoad(false);
         },
-        .list => |obj| try app.showOutcomes(job, &.{obj.title()}, true),
+        .list => |obj| {
+            const o = if (job.outcomes.items.len > 0) job.outcomes.items[0] else return;
+            switch (o) {
+                .result => |r| {
+                    if (r.result.rows.len == 0) return app.transcript.addMessage(.dim, "no {s}", .{try std.ascii.allocLowerString(app.frame_arena.allocator(), obj.title())});
+                    try app.openObjectPicker(obj, r.result);
+                },
+                .failed => |msg| try app.transcript.addMessage(.err, "{s}", .{msg}),
+                .canceled => try app.transcript.addMessage(.warn, "canceled", .{}),
+            }
+        },
         .describe => {
             const third: []const u8 = if (app.conn != null and app.conn.?.kind == .clickhouse) "Engine" else "Constraints";
             try app.showOutcomes(job, &.{ "Columns", "Indexes", third }, false);
@@ -1400,11 +1418,124 @@ fn startDescribe(app: *App, table: []const u8) !void {
 }
 
 fn startDefinition(app: *App, name: []const u8) !void {
+    const a = app.frame_arena.allocator();
+    try app.startDefinitionSql(name, try schema.definitionSql(a, app.conn.?.kind, name));
+}
+
+fn startDefinitionSql(app: *App, name: []const u8, sql: []const u8) !void {
     const job = try app.newJob(.{ .definition = undefined });
     const a = job.arena.allocator();
     job.kind = .{ .definition = try a.dupe(u8, name) };
-    job.sqls = try a.dupe([]const u8, &.{try schema.definitionSql(a, app.conn.?.kind, name)});
+    job.sqls = try a.dupe([]const u8, &.{try a.dupe(u8, sql)});
     try app.startJob(job);
+}
+
+fn objectColumn(result: db.Result, row: []const ?[]const u8, name: []const u8) []const u8 {
+    for (result.columns, 0..) |column, i| {
+        if (std.ascii.eqlIgnoreCase(column, name)) return row[i] orelse "";
+    }
+    return "";
+}
+
+fn formatTypeValues(a: Allocator, dialect: conninfo.Kind, label: []const u8, type_name: []const u8, raw: []const u8) Allocator.Error![]const u8 {
+    var values = raw;
+    if (dialect == .clickhouse) {
+        for ([_][]const u8{ "Enum8(", "Enum16(", "Enum(" }) |prefix| {
+            if (std.mem.indexOf(u8, raw, prefix)) |pos| {
+                values = raw[pos + prefix.len ..];
+                break;
+            }
+        }
+    }
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(a, "{s} {s}\n", .{ type_name, label });
+    var start: usize = 0;
+    var i: usize = 0;
+    var depth: usize = 0;
+    var quote: u8 = 0;
+    var count: usize = 0;
+    scan: while (i < values.len) : (i += 1) {
+        const c = values[i];
+        if (quote != 0) {
+            if (c == '\\' and i + 1 < values.len) {
+                i += 1;
+            } else if (c == quote) {
+                if (i + 1 < values.len and values[i + 1] == quote) i += 1 else quote = 0;
+            }
+            continue;
+        }
+        switch (c) {
+            '\'', '"' => quote = c,
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0 and dialect == .clickhouse) break :scan;
+                depth -|= 1;
+            },
+            ',' => if (depth == 0) {
+                const item = std.mem.trim(u8, values[start..i], " \t\r\n");
+                if (item.len > 0) {
+                    count += 1;
+                    try out.print(a, "  {d}. {s}\n", .{ count, item });
+                }
+                start = i + 1;
+            },
+            else => {},
+        }
+    }
+    const last = std.mem.trim(u8, values[start..i], " \t\r\n");
+    if (last.len > 0) {
+        count += 1;
+        try out.print(a, "  {d}. {s}\n", .{ count, last });
+    }
+    if (count == 0) try out.appendSlice(a, "  (no values available)");
+    return out.toOwnedSlice(a);
+}
+
+test "custom type values are listed without splitting quoted commas" {
+    const a = std.testing.allocator;
+    const pg = try formatTypeValues(a, .postgres, "public.mood", "enum", "'happy, calm', 'sad', 'it''s fine'");
+    defer a.free(pg);
+    try std.testing.expectEqualStrings("enum public.mood\n  1. 'happy, calm'\n  2. 'sad'\n  3. 'it''s fine'\n", pg);
+    const mysql = try formatTypeValues(a, .mysql, "orders.status", "enum", "'new, open','done'");
+    defer a.free(mysql);
+    try std.testing.expectEqualStrings("enum orders.status\n  1. 'new, open'\n  2. 'done'\n", mysql);
+    const ch = try formatTypeValues(a, .clickhouse, "events.state", "type", "LowCardinality(Enum8('new' = 1, 'in, progress' = 2))");
+    defer a.free(ch);
+    try std.testing.expectEqualStrings("type events.state\n  1. 'new' = 1\n  2. 'in, progress' = 2\n", ch);
+    const domain = try formatTypeValues(a, .postgres, "public.price", "domain", "numeric(10, 2) CHECK (VALUE > 0)");
+    defer a.free(domain);
+    try std.testing.expectEqualStrings("domain public.price\n  1. numeric(10, 2) CHECK (VALUE > 0)\n", domain);
+}
+
+fn openObjectPicker(app: *App, obj: schema.Object, result: db.Result) !void {
+    const a = app.frame_arena.allocator();
+    const kind = app.conn.?.kind;
+    var items: std.ArrayList(Picker.Item) = .empty;
+    for (result.rows) |row| {
+        const name = objectColumn(result, row, "name");
+        const namespace = objectColumn(result, row, "schema");
+        const table = objectColumn(result, row, "table");
+        const label = if (obj == .types and name.len == 0)
+            try std.fmt.allocPrint(a, "{s}.{s}", .{ table, objectColumn(result, row, "column") })
+        else if (kind == .postgres and obj == .triggers)
+            try std.fmt.allocPrint(a, "{s}.{s}.{s}", .{ namespace, table, name })
+        else if (kind == .postgres)
+            try std.fmt.allocPrint(a, "{s}.{s}", .{ namespace, name })
+        else
+            name;
+        const detail = if (obj == .functions) objectColumn(result, row, "arguments") else objectColumn(result, row, "kind");
+        const value = if (obj == .tables)
+            ""
+        else if (obj == .types)
+            try formatTypeValues(a, kind, label, if (detail.len > 0) detail else "type", if (objectColumn(result, row, "values").len > 0) objectColumn(result, row, "values") else objectColumn(result, row, "type"))
+        else if (kind == .postgres)
+            try schema.definitionSqlForOid(a, obj, objectColumn(result, row, "oid"))
+        else
+            try schema.definitionSqlForObject(a, kind, obj, name, objectColumn(result, row, "kind"));
+        try items.append(a, .{ .label = label, .detail = detail, .value = value });
+    }
+    app.picker = try Picker.init(app.gpa, if (obj == .tables) .browse else if (obj == .types) .type_value else .definition, obj.title(), items.items, false);
+    app.mode = .picker;
 }
 
 fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {

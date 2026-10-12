@@ -317,6 +317,7 @@ test {
     _ = @import("sql/lexer.zig");
     _ = @import("db/schema.zig");
     _ = @import("ui/Editor.zig");
+    _ = App;
     _ = @import("ui/TableView.zig");
     _ = @import("ui/complete.zig");
     _ = @import("queries.zig");

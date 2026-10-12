@@ -133,9 +133,9 @@ Fields override the matching parts of `url`. Saved queries live in `queries/*.sq
 |---|---|---|
 | `/connect [name\|url]` | `/c` | connect; without an argument, pick from the config |
 | `/disconnect` | | close the connection |
-| `/tables`, `/views` | `/t`, `/v` | tables (with size and row estimate) and views |
-| `/types` | `/enums` | user types and enum values |
-| `/functions`, `/triggers` | `/fn` | functions/procedures and triggers |
+| `/tables`, `/views` | `/t`, `/v` | pick a table to browse or a view to see its SQL |
+| `/types` | `/enums` | pick a type to see its values |
+| `/functions`, `/triggers` | `/fn` | pick a function/procedure or trigger to see its source |
 | `/describe <table>` | `/d` | columns, indexes, constraints |
 | `/browse <table> [where …]` | `/b` | table data full-screen; without an argument, pick a table |
 | `/def <name>` | | source of a view, function, trigger or enum |
@@ -145,6 +145,8 @@ Fields override the matching parts of `url`. Saved queries live in `queries/*.sq
 | `/databases`, `/refresh`, `/clear`, `/help`, `/quit` | `/dbs`, `/q` | |
 
 Anything else is run as SQL; several statements can be separated by `;`. The feed shows the first 50 rows of a result (`ctrl+o` opens all of it); ad-hoc queries keep at most 10,000 rows and 16 MiB of row data. Scrollback keeps up to 200 entries and roughly 64 MiB of results. A lost connection is re-established once without replaying the failed SQL. `DELETE` without `WHERE` is refused.
+
+In the object picker, type to filter, press `enter` to open the selection, or `esc` to close it.
 
 ### Keys
 
@@ -296,9 +298,9 @@ path = "~/notes.db"
 |---|---|---|
 | `/connect [имя\|url]` | `/c` | подключиться; без аргумента — выбор из конфига |
 | `/disconnect` | | закрыть подключение |
-| `/tables`, `/views` | `/t`, `/v` | таблицы (с размером и оценкой числа строк) и view |
-| `/types` | `/enums` | пользовательские типы и значения enum |
-| `/functions`, `/triggers` | `/fn` | функции и процедуры, триггеры |
+| `/tables`, `/views` | `/t`, `/v` | выбор таблицы для `/browse` или view для просмотра SQL |
+| `/types` | `/enums` | выбор типа для просмотра значений |
+| `/functions`, `/triggers` | `/fn` | выбор функции, процедуры или триггера для просмотра кода |
 | `/describe <таблица>` | `/d` | колонки, индексы, ограничения |
 | `/browse <таблица> [where …]` | `/b` | данные таблицы на весь экран; без аргумента — выбор таблицы |
 | `/def <имя>` | | исходный код view, функции, триггера или enum |
@@ -308,6 +310,8 @@ path = "~/notes.db"
 | `/databases`, `/refresh`, `/clear`, `/help`, `/quit` | `/dbs`, `/q` | |
 
 Всё остальное выполняется как SQL; несколько запросов разделяются `;`. В ленте показываются первые 50 строк результата (`ctrl+o` открывает весь), для произвольных запросов хранится не больше 10 000 строк и 16 МиБ данных строк. Лента хранит до 200 записей и примерно 64 МиБ результатов. После обрыва соединения zpeek один раз переподключается без повторного выполнения неудавшегося SQL. `DELETE` без `WHERE` не выполняется.
+
+В списке объектов можно ввести часть имени для поиска, нажать `enter` для просмотра или `esc` для выхода.
 
 ### Клавиши
 

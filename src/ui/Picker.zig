@@ -9,11 +9,12 @@ const render = @import("../render.zig");
 
 const Picker = @This();
 
-pub const Purpose = enum { connect, browse, describe, query };
+pub const Purpose = enum { connect, browse, describe, query, definition, type_value };
 
 pub const Item = struct {
     label: []const u8,
     detail: []const u8 = "",
+    value: []const u8 = "",
 };
 
 pub const Action = union(enum) {
@@ -43,7 +44,7 @@ pub fn init(gpa: Allocator, purpose: Purpose, title: []const u8, items: []const 
     const a = p.arena.allocator();
     p.title = try a.dupe(u8, title);
     const copy = try a.alloc(Item, items.len);
-    for (items, copy) |it, *c| c.* = .{ .label = try a.dupe(u8, it.label), .detail = try a.dupe(u8, it.detail) };
+    for (items, copy) |it, *c| c.* = .{ .label = try a.dupe(u8, it.label), .detail = try a.dupe(u8, it.detail), .value = try a.dupe(u8, it.value) };
     p.items = copy;
     try p.refilter();
     return p;

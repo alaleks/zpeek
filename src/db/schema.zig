@@ -46,7 +46,7 @@ pub fn listSql(kind: Kind, obj: Object) ?[]const u8 {
             .views =>
             \\select n.nspname as schema, c.relname as name,
             \\  case c.relkind when 'm' then 'materialized' else 'view' end as kind,
-            \\  obj_description(c.oid, 'pg_class') as comment
+            \\  obj_description(c.oid, 'pg_class') as comment, c.oid::text as oid
             \\from pg_class c join pg_namespace n on n.oid = c.relnamespace
             \\where c.relkind in ('v', 'm') and
             ++ pg_user_ns ++
@@ -58,7 +58,7 @@ pub fn listSql(kind: Kind, obj: Object) ?[]const u8 {
             \\  case t.typtype when 'e' then 'enum' when 'd' then 'domain' when 'c' then 'composite'
             \\    when 'r' then 'range' when 'm' then 'multirange' end as kind,
             \\  case t.typtype
-            \\    when 'e' then (select string_agg(e.enumlabel, ', ' order by e.enumsortorder) from pg_enum e where e.enumtypid = t.oid)
+            \\    when 'e' then (select string_agg(quote_literal(e.enumlabel), ', ' order by e.enumsortorder) from pg_enum e where e.enumtypid = t.oid)
             \\    when 'd' then format_type(t.typbasetype, t.typtypmod) ||
             \\      coalesce(' ' || (select string_agg(pg_get_constraintdef(k.oid), ' ') from pg_constraint k where k.contypid = t.oid), '')
             \\    when 'c' then (select string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod), ', ' order by a.attnum)
@@ -79,7 +79,7 @@ pub fn listSql(kind: Kind, obj: Object) ?[]const u8 {
             \\  case p.prokind when 'p' then 'procedure' when 'a' then 'aggregate' when 'w' then 'window' else 'function' end as kind,
             \\  pg_get_function_arguments(p.oid) as arguments,
             \\  pg_get_function_result(p.oid) as returns,
-            \\  l.lanname as language
+            \\  l.lanname as language, p.oid::text as oid
             \\from pg_proc p
             \\  join pg_namespace n on n.oid = p.pronamespace
             \\  join pg_language l on l.oid = p.prolang
@@ -91,7 +91,8 @@ pub fn listSql(kind: Kind, obj: Object) ?[]const u8 {
             .triggers =>
             \\select n.nspname as schema, c.relname as "table", t.tgname as name,
             \\  case t.tgenabled when 'D' then 'disabled' else 'enabled' end as status,
-            \\  regexp_replace(pg_get_triggerdef(t.oid, true), '^CREATE (CONSTRAINT )?TRIGGER \S+ ', '') as definition
+            \\  regexp_replace(pg_get_triggerdef(t.oid, true), '^CREATE (CONSTRAINT )?TRIGGER \S+ ', '') as definition,
+            \\  t.oid::text as oid
             \\from pg_trigger t
             \\  join pg_class c on c.oid = t.tgrelid
             \\  join pg_namespace n on n.oid = c.relnamespace
@@ -379,6 +380,83 @@ pub fn definitionSql(a: Allocator, kind: Kind, name: []const u8) Allocator.Error
     }
 }
 
+/// Resolve a selected PostgreSQL row by OID, so overloaded routines and
+/// triggers with the same name on different tables remain distinct.
+pub fn definitionSqlForOid(a: Allocator, obj: Object, oid_text: []const u8) (Allocator.Error || error{InvalidOid})![]const u8 {
+    const oid = std.fmt.parseInt(u32, oid_text, 10) catch return error.InvalidOid;
+    return switch (obj) {
+        .views => std.fmt.allocPrint(a,
+            \\select 'view', n.nspname || '.' || c.relname,
+            \\  'CREATE ' || case c.relkind when 'm' then 'MATERIALIZED ' else '' end || 'VIEW ' ||
+            \\  quote_ident(n.nspname) || '.' || quote_ident(c.relname) || E' AS\n' || pg_get_viewdef(c.oid, true)
+            \\from pg_class c join pg_namespace n on n.oid = c.relnamespace
+            \\where c.oid = {d} and c.relkind in ('v', 'm')
+        , .{oid}),
+        .functions => std.fmt.allocPrint(a,
+            \\select case p.prokind when 'p' then 'procedure' when 'a' then 'aggregate' else 'function' end,
+            \\  n.nspname || '.' || p.proname,
+            \\  case when p.prokind = 'a' then '-- aggregate definition is not available' else pg_get_functiondef(p.oid) end
+            \\from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            \\where p.oid = {d}
+        , .{oid}),
+        .triggers => std.fmt.allocPrint(a,
+            \\select 'trigger', n.nspname || '.' || c.relname || '.' || t.tgname, pg_get_triggerdef(t.oid, true)
+            \\from pg_trigger t join pg_class c on c.oid = t.tgrelid join pg_namespace n on n.oid = c.relnamespace
+            \\where t.oid = {d} and not t.tgisinternal
+        , .{oid}),
+        else => error.InvalidOid,
+    };
+}
+
+pub fn definitionSqlForObject(a: Allocator, kind: Kind, obj: Object, name: []const u8, selected_kind: []const u8) Allocator.Error![]const u8 {
+    const lit = try quoteLiteral(a, kind, name);
+    return switch (kind) {
+        .postgres => definitionSql(a, kind, name),
+        .sqlite => std.fmt.allocPrint(
+            a,
+            "select type as kind, name, sql as definition from sqlite_schema where type = '{s}' and name = {s} and sql is not null",
+            .{ if (obj == .triggers) @as([]const u8, "trigger") else "view", lit },
+        ),
+        .mysql => switch (obj) {
+            .views => std.fmt.allocPrint(a,
+                \\select 'view' as kind, table_name as name,
+                \\  concat('CREATE VIEW ', table_name, ' AS\n', view_definition) as definition
+                \\from information_schema.views where table_schema = database() and table_name = {s}
+            , .{lit}),
+            .functions => std.fmt.allocPrint(a,
+                \\select lower(r.routine_type) as kind, r.routine_name as name,
+                \\  concat('CREATE ', r.routine_type, ' ', r.routine_name, '(',
+                \\    coalesce((select group_concat(concat_ws(' ', p.parameter_mode, p.parameter_name, p.dtd_identifier)
+                \\       order by p.ordinal_position separator ', ')
+                \\     from information_schema.parameters p
+                \\     where p.specific_schema = r.routine_schema and p.specific_name = r.specific_name
+                \\       and p.ordinal_position > 0), ''), ')',
+                \\    if(r.routine_type = 'FUNCTION', concat(' RETURNS ', r.dtd_identifier), ''), '\n', r.routine_definition) as definition
+                \\from information_schema.routines r where r.routine_schema = database() and r.routine_name = {s}
+                \\  and lower(r.routine_type) = {s}
+            , .{ lit, try quoteLiteral(a, kind, selected_kind) }),
+            .triggers => std.fmt.allocPrint(a,
+                \\select 'trigger' as kind, trigger_name as name,
+                \\  concat('CREATE TRIGGER ', trigger_name, ' ', action_timing, ' ', event_manipulation, ' ON ',
+                \\    event_object_table, ' FOR EACH ROW\n', action_statement) as definition
+                \\from information_schema.triggers where trigger_schema = database() and trigger_name = {s}
+            , .{lit}),
+            else => definitionSql(a, kind, name),
+        },
+        .clickhouse => switch (obj) {
+            .views => std.fmt.allocPrint(a,
+                \\select 'view' as kind, name, create_table_query as definition
+                \\from system.tables where {s} and engine in ('View', 'MaterializedView', 'LiveView')
+            , .{try chWhere(a, name, "name")}),
+            .functions => std.fmt.allocPrint(a,
+                \\select 'function' as kind, name, create_query as definition
+                \\from system.functions where origin = 'SQLUserDefined' and name = {s}
+            , .{try quoteLiteral(a, kind, splitName(name).name)}),
+            else => definitionSql(a, kind, name),
+        },
+    };
+}
+
 /// (table, column) pairs for autocompletion.
 pub fn completionSql(kind: Kind) []const u8 {
     return switch (kind) {
@@ -587,4 +665,24 @@ test "quoting" {
         "select count(*) from \"t\" where id > 3",
         try countSql(a, .sqlite, "t", "id > 3"),
     );
+}
+
+test "selected definition resolves by PostgreSQL OID" {
+    const a = testing.allocator;
+    const sql = try definitionSqlForOid(a, .functions, "42");
+    defer a.free(sql);
+    try testing.expect(std.mem.indexOf(u8, sql, "where p.oid = 42") != null);
+    try testing.expectError(error.InvalidOid, definitionSqlForOid(a, .triggers, "42; drop table x"));
+}
+
+test "selected definition filters object kind" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sql = try definitionSqlForObject(a, .sqlite, .triggers, "audit", "");
+    try testing.expect(std.mem.indexOf(u8, sql, "type = 'trigger'") != null);
+    const mysql = try definitionSqlForObject(a, .mysql, .functions, "calculate", "procedure");
+    try testing.expect(std.mem.indexOf(u8, mysql, "lower(r.routine_type) = 'procedure'") != null);
+    const clickhouse = try definitionSqlForObject(a, .clickhouse, .views, "report", "View");
+    try testing.expect(std.mem.indexOf(u8, clickhouse, "engine in ('View', 'MaterializedView', 'LiveView')") != null);
 }
