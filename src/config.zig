@@ -297,7 +297,8 @@ test "config entries" {
     const my = cfg.find("my").?.params;
     try testing.expectEqual(conninfo.Kind.mysql, my.kind);
     try testing.expectEqualStrings("secret", my.password);
-    try testing.expectEqualStrings("/home/me/x.db", cfg.find("lite").?.params.database);
+    const sqlite_path = if (@import("builtin").os.tag == .windows) "/home/me\\x.db" else "/home/me/x.db";
+    try testing.expectEqualStrings(sqlite_path, cfg.find("lite").?.params.database);
 }
 
 test "config errors" {
