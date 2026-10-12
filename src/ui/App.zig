@@ -296,6 +296,42 @@ fn saveHistory(app: *App) void {
     cwd.writeFile(app.io, .{ .sub_path = path, .data = out.items }) catch {};
 }
 
+test "history rewrites connection URLs without credentials" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    const state_dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "state" });
+    defer a.free(state_dir);
+    try env.put("XDG_STATE_HOME", state_dir);
+    const history_file = try std.fs.path.join(a, &.{ state_dir, "zpeek", "history" });
+    defer a.free(history_file);
+    const cwd = Io.Dir.cwd();
+    try cwd.createDirPath(std.testing.io, std.fs.path.dirname(history_file).?);
+    try cwd.writeFile(std.testing.io, .{ .sub_path = history_file, .data = "/connect postgres://user:secret@localhost/db\x00" });
+
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+    };
+    defer app.deinit();
+    try app.loadHistory();
+    try std.testing.expectEqual(@as(usize, 1), app.editor.history.items.len);
+    try std.testing.expectEqualStrings("/connect <redacted>", app.editor.history.items[0]);
+    app.saveHistory();
+    const saved = try cwd.readFileAlloc(std.testing.io, history_file, a, .limited(1024));
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("/connect <redacted>\x00", saved);
+}
+
 // ───────────────────────────── events ─────────────────────────────
 
 fn handleEvent(app: *App, event: Event) !void {
@@ -1128,6 +1164,109 @@ fn jobTask(app: *App, job: *Job) void {
     }
 }
 
+test "query jobs honor cancellation and stop after connection loss" {
+    const Fake = struct {
+        calls: usize = 0,
+        canceled: bool = false,
+        closed: bool = false,
+
+        const vtable: db.Connection.VTable = .{
+            .query = query,
+            .last_error = lastError,
+            .cancel = cancel,
+            .close = close,
+        };
+
+        fn query(ptr: *anyopaque, _: Allocator, _: []const u8, _: db.QueryOptions) db.QueryError!db.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.ConnectionLost;
+        }
+
+        fn lastError(_: *anyopaque) []const u8 {
+            return "server disconnected";
+        }
+
+        fn cancel(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.canceled = true;
+        }
+
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.closed = true;
+        }
+    };
+
+    const a = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+    };
+    defer app.deinit();
+    app.loop = .init(app.io, &app.tty, &app.vx);
+    var fake: Fake = .{};
+    app.conn = .{ .ptr = &fake, .vtable = &Fake.vtable, .kind = .postgres };
+
+    {
+        const job = try app.newJob(.console);
+        defer {
+            job.arena.deinit();
+            a.destroy(job);
+        }
+        job.sqls = &.{"select 1"};
+        app.job = job;
+        app.cancelJob(false);
+        app.jobTask(job);
+        try std.testing.expect(fake.canceled);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+        try std.testing.expect(job.outcomes.items[0] == .canceled);
+        try std.testing.expect((try app.loop.tryEvent()).? == .job_done);
+        app.job = null;
+    }
+
+    {
+        const job = try app.newJob(.console);
+        defer {
+            job.arena.deinit();
+            a.destroy(job);
+        }
+        job.sqls = &.{ "select 1", "select 2" };
+        app.jobTask(job);
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        try std.testing.expect(job.connection_lost);
+        try std.testing.expectEqual(@as(usize, 1), job.outcomes.items.len);
+        try std.testing.expectEqualStrings("server disconnected", job.outcomes.items[0].failed);
+        try std.testing.expect((try app.loop.tryEvent()).? == .job_done);
+    }
+
+    app.conn.?.kind = .sqlite;
+    app.conn_name = "local";
+    app.conn_params = .{ .kind = .sqlite, .database = ":memory:" };
+    const job = try app.newJob(.console);
+    job.sqls = &.{ "select 1", "select 2" };
+    try app.startJob(job);
+    try app.handleEvent(try app.loop.nextEvent());
+    try std.testing.expect(fake.closed);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expect(app.conn == null);
+    try std.testing.expect(app.job != null);
+    try app.handleEvent(try app.loop.nextEvent());
+    try app.handleEvent(try app.loop.nextEvent());
+    try std.testing.expect(app.job == null);
+    try std.testing.expectEqual(db.Kind.sqlite, app.conn.?.kind);
+    try std.testing.expectEqualStrings("local", app.conn_name);
+}
+
 fn finishJob(app: *App) void {
     const job = app.job orelse return;
     job.future.await(app.io);
@@ -1536,6 +1675,109 @@ fn openObjectPicker(app: *App, obj: schema.Object, result: db.Result) !void {
     }
     app.picker = try Picker.init(app.gpa, if (obj == .tables) .browse else if (obj == .types) .type_value else .definition, obj.title(), items.items, false);
     app.mode = .picker;
+}
+
+test "schema pickers select the requested object" {
+    const a = std.testing.allocator;
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = undefined,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+    };
+    defer {
+        if (app.picker) |p| p.deinit();
+        app.editor.deinit();
+        app.transcript.deinit();
+        app.conn_arena.deinit();
+        app.popup_arena.deinit();
+        app.frame_arena.deinit();
+    }
+    app.conn = .{ .ptr = undefined, .vtable = undefined, .kind = .sqlite };
+
+    const table_rows = [_][]const ?[]const u8{ &.{ "users", "table" }, &.{ "orders", "table" } };
+    const tables: db.Result = .{ .arena = .init(a), .columns = &.{ "name", "kind" }, .rows = &table_rows };
+    try app.openObjectPicker(.tables, tables);
+    var p = app.picker.?;
+    try std.testing.expectEqual(Picker.Purpose.browse, p.purpose);
+    _ = try p.handleKey(.{ .codepoint = 'o', .text = "o" });
+    const table_choice = try p.handleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqual(@as(usize, 1), table_choice.choose);
+    try std.testing.expectEqualStrings("orders", p.items[table_choice.choose].label);
+    app.closePicker();
+
+    const view_rows = [_][]const ?[]const u8{&.{"recent_orders"}};
+    const views: db.Result = .{ .arena = .init(a), .columns = &.{"name"}, .rows = &view_rows };
+    try app.openObjectPicker(.views, views);
+    p = app.picker.?;
+    try std.testing.expectEqual(Picker.Purpose.definition, p.purpose);
+    try std.testing.expect(std.mem.indexOf(u8, p.items[0].value, "type = 'view'") != null);
+    app.closePicker();
+
+    const trigger_rows = [_][]const ?[]const u8{&.{ "orders", "audit_orders" }};
+    const triggers: db.Result = .{ .arena = .init(a), .columns = &.{ "table", "name" }, .rows = &trigger_rows };
+    try app.openObjectPicker(.triggers, triggers);
+    p = app.picker.?;
+    try std.testing.expect(std.mem.indexOf(u8, p.items[0].value, "type = 'trigger'") != null);
+    app.closePicker();
+
+    app.conn.?.kind = .mysql;
+    const type_rows = [_][]const ?[]const u8{&.{ "orders", "status", "enum", "'new','done'" }};
+    const types: db.Result = .{ .arena = .init(a), .columns = &.{ "table", "column", "kind", "values" }, .rows = &type_rows };
+    try app.openObjectPicker(.types, types);
+    p = app.picker.?;
+    try std.testing.expectEqual(Picker.Purpose.type_value, p.purpose);
+    try std.testing.expectEqualStrings("enum orders.status\n  1. 'new'\n  2. 'done'\n", p.items[0].value);
+    app.closePicker();
+
+    app.conn.?.kind = .postgres;
+    const function_rows = [_][]const ?[]const u8{ &.{ "public", "calculate", "integer", "101" }, &.{ "public", "calculate", "text", "102" } };
+    const functions: db.Result = .{ .arena = .init(a), .columns = &.{ "schema", "name", "arguments", "oid" }, .rows = &function_rows };
+    try app.openObjectPicker(.functions, functions);
+    p = app.picker.?;
+    try std.testing.expectEqual(@as(usize, 2), p.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, p.items[0].value, "p.oid = 101") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.items[1].value, "p.oid = 102") != null);
+}
+
+test "choosing a table opens its SQLite browse view" {
+    const a = std.testing.allocator;
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try @import("../db/sqlite.zig").connect(a, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = undefined,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+        .conn = conn,
+        .conn_name = "test",
+        .conn_params = .{ .kind = .sqlite, .database = ":memory:" },
+    };
+    defer app.deinit();
+    app.loop = .init(app.io, &app.tty, &app.vx);
+    var setup = try conn.query(a, "create table people(id integer primary key, name text); insert into people values (1, 'Alice');");
+    setup.deinit();
+    var listed = try conn.query(a, schema.listSql(.sqlite, .tables).?);
+    defer listed.deinit();
+    try app.openObjectPicker(.tables, listed);
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(app.picker == null);
+    try std.testing.expect(app.job != null);
+    try app.handleEvent(try app.loop.nextEvent());
+    try std.testing.expectEqual(Mode.table, app.mode);
+    try std.testing.expectEqualStrings("people", app.table_view.?.browse.?.table);
+    try std.testing.expectEqualStrings("Alice", app.table_view.?.result.rows[0][1].?);
 }
 
 fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {

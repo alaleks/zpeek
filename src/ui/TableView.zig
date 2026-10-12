@@ -668,6 +668,57 @@ fn requestDelete(tv: *TableView) Allocator.Error!Action {
     return .none;
 }
 
+test "browse controls reload pages and require confirmation to delete" {
+    const a = std.testing.allocator;
+    var builder = db.ResultBuilder.init(a);
+    try builder.setColumns(&.{ "id", "name" });
+    try builder.addRow(&.{ "1", "Alice" }, .{});
+    try builder.addRow(&.{ "2", "Bob" }, .{});
+    const result = try a.create(db.Result);
+    result.* = builder.finish();
+    const tv = TableView.init(a, result, true, "people", .{ .table = "people", .kind = .sqlite, .page_size = 2, .total = 3 }, "", null) catch |err| {
+        result.deinit();
+        a.destroy(result);
+        return err;
+    };
+    defer tv.deinit();
+
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 'n' })) == .reload);
+    try std.testing.expectEqual(@as(usize, 2), tv.browse.?.offset);
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 'n' })) == .notice);
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 'p' })) == .reload);
+    try std.testing.expectEqual(@as(usize, 0), tv.browse.?.offset);
+
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 's' })) == .reload);
+    try std.testing.expectEqualStrings("id", tv.browse.?.order.?.column);
+    try std.testing.expect(!tv.browse.?.order.?.descending);
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 's' })) == .reload);
+    try std.testing.expect(tv.browse.?.order.?.descending);
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 's' })) == .reload);
+    try std.testing.expect(tv.browse.?.order == null);
+
+    tv.browse.?.offset = 2;
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = '/' })) == .none);
+    try tv.filter_editor.setText("id > 1");
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = vaxis.Key.enter })) == .reload);
+    try std.testing.expectEqualStrings("id > 1", tv.browse.?.filter);
+    try std.testing.expectEqual(@as(usize, 0), tv.browse.?.offset);
+
+    try tv.setPrimaryKey(&.{"id"});
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 'd' })) == .none);
+    try std.testing.expect(tv.confirm_delete != null);
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 'x' })) == .none);
+    try std.testing.expect(tv.confirm_delete == null);
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 'd' })) == .none);
+    const confirmed = try tv.handleKey(.{ .codepoint = 'y' });
+    try std.testing.expect(confirmed == .delete_row);
+    defer a.free(confirmed.delete_row);
+    try std.testing.expectEqualStrings("DELETE FROM \"people\" WHERE \"id\" = '1'", confirmed.delete_row);
+
+    try tv.setPrimaryKey(&.{});
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 'd' })) == .notice);
+}
+
 fn drawConfirmDelete(tv: *TableView, a: Allocator, win: vaxis.Window, sql: []const u8) Allocator.Error!void {
     _ = tv;
     const w: u16 = @min(win.width -| 4, 90);

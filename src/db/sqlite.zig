@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const c = @import("sqlite_c");
 const db = @import("db.zig");
 const conninfo = @import("../conninfo.zig");
+const schema = @import("schema.zig");
 
 const Sqlite = struct {
     gpa: Allocator,
@@ -218,4 +219,64 @@ test "sqlite in-memory round trip" {
 
     try std.testing.expectError(error.QueryFailed, conn.query(gpa, "select * from missing"));
     try std.testing.expect(std.mem.indexOf(u8, conn.lastError(), "missing") != null);
+}
+
+test "schema browsing and selected definitions run on SQLite" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var err: db.ErrorText = .{};
+    defer err.deinit(gpa);
+    const conn = try connect(gpa, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    defer conn.close();
+
+    var setup = try conn.query(gpa,
+        \\create table people(id integer primary key, name text);
+        \\insert into people values (1, 'Alice'), (2, 'Bob');
+        \\create table audit(name text);
+        \\create view named_people as select name from people;
+        \\create trigger audit_delete after delete on people begin insert into audit values(old.name); end;
+    );
+    defer setup.deinit();
+
+    for ([_]struct { object: schema.Object, expected: []const u8 }{
+        .{ .object = .tables, .expected = "people" },
+        .{ .object = .views, .expected = "named_people" },
+        .{ .object = .triggers, .expected = "audit_delete" },
+    }) |case| {
+        var listed = try conn.query(gpa, schema.listSql(.sqlite, case.object).?);
+        defer listed.deinit();
+        var found = false;
+        for (listed.rows) |row| for (row) |cell| {
+            if (cell != null and std.mem.eql(u8, cell.?, case.expected)) found = true;
+        };
+        try std.testing.expect(found);
+    }
+
+    for ([_]struct { object: schema.Object, name: []const u8, source: []const u8 }{
+        .{ .object = .views, .name = "named_people", .source = "select name from people" },
+        .{ .object = .triggers, .name = "audit_delete", .source = "insert into audit" },
+    }) |case| {
+        const sql = try schema.definitionSqlForObject(a, .sqlite, case.object, case.name, "");
+        var definition = try conn.query(gpa, sql);
+        defer definition.deinit();
+        try std.testing.expectEqual(@as(usize, 1), definition.rows.len);
+        try std.testing.expect(std.mem.indexOf(u8, definition.rows[0][2].?, case.source) != null);
+    }
+
+    var page = try conn.query(gpa, try schema.browseSql(a, .sqlite, "people", "id > 1", .{ .column = "id", .descending = true }, 1, 0));
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualStrings("Bob", page.rows[0][1].?);
+
+    var keys = try conn.query(gpa, try schema.primaryKeySql(a, .sqlite, "people"));
+    defer keys.deinit();
+    try std.testing.expectEqualStrings("id", keys.rows[0][0].?);
+    var deleted = try conn.query(gpa, try schema.deleteRowSql(a, .sqlite, "people", &.{"id"}, &.{"1"}));
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), deleted.affected_rows);
+    var audit = try conn.query(gpa, "select name from audit");
+    defer audit.deinit();
+    try std.testing.expectEqualStrings("Alice", audit.rows[0][0].?);
 }

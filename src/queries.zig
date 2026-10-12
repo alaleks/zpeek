@@ -103,3 +103,27 @@ test "valid names" {
     try std.testing.expect(!validName(".hidden"));
     try std.testing.expect(!validName(""));
 }
+
+test "saved queries round trip through files" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "queries" });
+    const io = std.testing.io;
+
+    try std.testing.expectEqual(@as(usize, 0), (try list(a, io, dir)).len);
+    try save(gpa, io, dir, "recent", " \nSELECT *\nFROM people; \n");
+    try save(gpa, io, dir, "active", "select * from people where active = 1;");
+    try std.testing.expectEqualStrings("SELECT *\nFROM people;", try load(a, io, dir, "recent"));
+    const entries = try list(a, io, dir);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("active", entries[0].name);
+    try std.testing.expectEqualStrings("SELECT *", entries[1].preview);
+
+    try remove(io, dir, "recent");
+    try std.testing.expectError(error.FileNotFound, load(a, io, dir, "recent"));
+    try std.testing.expectEqual(@as(usize, 1), (try list(a, io, dir)).len);
+}
