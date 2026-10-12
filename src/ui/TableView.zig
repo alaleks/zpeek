@@ -885,22 +885,33 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
 }
 
 pub fn databaseBadgeStyle(color: ?BadgeColor) vaxis.Style {
-    const c = color orelse return .{ .fg = .{ .index = 15 }, .bg = .{ .index = 2 }, .bold = true };
-    const luminance = @as(u32, c.r) * 299 + @as(u32, c.g) * 587 + @as(u32, c.b) * 114;
-    const foreground: vaxis.Color = if (luminance >= 128_000) .{ .index = 0 } else .{ .index = 15 };
-    return .{ .fg = foreground, .bg = .{ .index = c.ansi256() }, .bold = true };
+    const c = color orelse BadgeColor{ .r = 0x2f, .g = 0x6b, .b = 0x43 };
+    const luminance = 0.2126 * linearChannel(c.r) + 0.7152 * linearChannel(c.g) + 0.0722 * linearChannel(c.b);
+    // Black and white have equal contrast at this relative luminance.
+    const foreground: vaxis.Color = if (luminance > 0.179) .{ .rgb = .{ 0, 0, 0 } } else .{ .rgb = .{ 255, 255, 255 } };
+    return .{ .fg = foreground, .bg = .{ .rgb = .{ c.r, c.g, c.b } }, .bold = true };
+}
+
+fn linearChannel(channel: u8) f64 {
+    const value = @as(f64, @floatFromInt(channel)) / 255.0;
+    return if (value <= 0.04045) value / 12.92 else std.math.pow(f64, (value + 0.055) / 1.055, 2.4);
 }
 
 test "database badge chooses contrasting text" {
+    const default = databaseBadgeStyle(null);
+    try std.testing.expectEqual(vaxis.Color{ .rgb = .{ 0xff, 0xff, 0xff } }, default.fg);
+    try std.testing.expectEqual(vaxis.Color{ .rgb = .{ 0x2f, 0x6b, 0x43 } }, default.bg);
     const dark = databaseBadgeStyle(.{ .r = 0x10, .g = 0x20, .b = 0x30 });
-    try std.testing.expectEqual(vaxis.Color{ .index = 15 }, dark.fg);
+    try std.testing.expectEqual(vaxis.Color{ .rgb = .{ 0xff, 0xff, 0xff } }, dark.fg);
     const light = databaseBadgeStyle(.{ .r = 0xf0, .g = 0xe0, .b = 0xd0 });
-    try std.testing.expectEqual(vaxis.Color{ .index = 0 }, light.fg);
+    try std.testing.expectEqual(vaxis.Color{ .rgb = .{ 0x00, 0x00, 0x00 } }, light.fg);
+    const red = databaseBadgeStyle(.{ .r = 0xff, .g = 0x00, .b = 0x00 });
+    try std.testing.expectEqual(vaxis.Color{ .rgb = .{ 0x00, 0x00, 0x00 } }, red.fg);
 }
 
-test "database badge uses terminal palette background" {
+test "database badge preserves configured background" {
     const tomato = databaseBadgeStyle(.{ .r = 0xff, .g = 0x63, .b = 0x47 });
-    try std.testing.expectEqual(vaxis.Color{ .index = 209 }, tomato.bg);
+    try std.testing.expectEqual(vaxis.Color{ .rgb = .{ 0xff, 0x63, 0x47 } }, tomato.bg);
 }
 
 fn drawCell(win: vaxis.Window, x: u16, y: u16, width: u16, text: []const u8, style: vaxis.Style) void {

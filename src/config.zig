@@ -38,14 +38,6 @@ pub const Color = struct {
     r: u8,
     g: u8,
     b: u8,
-
-    /// Nearest color in the portable 6×6×6 ANSI terminal palette.
-    pub fn ansi256(c: Color) u8 {
-        const r: u8 = @intCast((@as(u16, c.r) * 5 + 127) / 255);
-        const g: u8 = @intCast((@as(u16, c.g) * 5 + 127) / 255);
-        const b: u8 = @intCast((@as(u16, c.b) * 5 + 127) / 255);
-        return 16 + 36 * r + 6 * g + b;
-    }
 };
 
 pub const Config = struct {
@@ -293,7 +285,6 @@ test "config entries" {
     try testing.expectEqual(@as(u16, 6000), pg.port);
     try testing.expectEqualStrings("h", pg.host);
     try testing.expectEqual(Color{ .r = 0x2f, .g = 0x6b, .b = 0x43 }, cfg.find("pg").?.color.?);
-    try testing.expectEqual(@as(u8, 209), (try parseColor("#FF6347")).ansi256());
     const my = cfg.find("my").?.params;
     try testing.expectEqual(conninfo.Kind.mysql, my.kind);
     try testing.expectEqualStrings("secret", my.password);
