@@ -367,12 +367,13 @@ pub fn definitionSql(a: Allocator, kind: Kind, name: []const u8) Allocator.Error
             , .{ .n = lit });
         },
         .sqlite => return std.fmt.allocPrint(a,
-            \\select type as kind, name, sql as definition from sqlite_schema where name = {s} and sql is not null
+            \\select type as kind, name, sql as definition from sqlite_schema
+            \\where type in ('view', 'trigger') and name = {s} and sql is not null
         , .{try quoteLiteral(a, kind, name)}),
         .clickhouse => return std.fmt.allocPrint(a,
-            \\select if(engine in ('View', 'MaterializedView', 'LiveView'), 'view', 'table') as kind, name,
+            \\select 'view' as kind, name,
             \\  create_table_query as definition
-            \\from system.tables where {[w]s}
+            \\from system.tables where {[w]s} and engine in ('View', 'MaterializedView', 'LiveView')
             \\union all
             \\select 'function', name, create_query from system.functions
             \\where origin = 'SQLUserDefined' and name = {[n]s}
@@ -545,6 +546,48 @@ pub fn primaryKeySql(a: Allocator, kind: Kind, table: []const u8) Allocator.Erro
     };
 }
 
+/// Constraint id, source column, target schema, target table, target column.
+pub fn foreignKeySql(a: Allocator, kind: Kind, table: []const u8) Allocator.Error!?[]const u8 {
+    return switch (kind) {
+        .postgres => try std.fmt.allocPrint(a,
+            \\select c.oid::text, src.attname, target_ns.nspname, target.relname, dst.attname
+            \\from pg_constraint c
+            \\join pg_class target on target.oid = c.confrelid
+            \\join pg_namespace target_ns on target_ns.oid = target.relnamespace
+            \\join lateral unnest(c.conkey, c.confkey) with ordinality as k(src_num, dst_num, pos) on true
+            \\join pg_attribute src on src.attrelid = c.conrelid and src.attnum = k.src_num
+            \\join pg_attribute dst on dst.attrelid = c.confrelid and dst.attnum = k.dst_num
+            \\where c.contype = 'f' and c.conrelid = {s}::regclass
+            \\order by c.oid, k.pos
+        , .{try quoteLiteral(a, kind, try quoteName(a, kind, table))}),
+        .mysql => try std.fmt.allocPrint(a,
+            \\select constraint_name, column_name, referenced_table_schema, referenced_table_name, referenced_column_name
+            \\from information_schema.key_column_usage
+            \\where table_schema = {s} and table_name = {s} and referenced_table_name is not null
+            \\order by constraint_name, ordinal_position
+        , .{ if (splitName(table).schema) |s| try quoteLiteral(a, kind, s) else "database()", try quoteLiteral(a, kind, splitName(table).name) }),
+        .sqlite => try std.fmt.allocPrint(a,
+            \\select cast(f.id as text), f."from", '', f."table",
+            \\  coalesce(nullif(f."to", ''), (select p.name from pragma_table_info(f."table") p where p.pk = f.seq + 1))
+            \\from pragma_foreign_key_list({s}) f
+            \\order by f.id, f.seq
+        , .{try quoteLiteral(a, kind, table)}),
+        .clickhouse => null,
+    };
+}
+
+/// Fetch the one row identified by all columns of a foreign key.
+pub fn foreignRowSql(a: Allocator, kind: Kind, target: []const u8, columns: []const []const u8, values: []const []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(a, "select * from {s} where ", .{try quoteName(a, kind, target)});
+    for (columns, values, 0..) |col, value, i| {
+        if (i > 0) try out.appendSlice(a, " and ");
+        try out.print(a, "{s} = {s}", .{ try quoteIdent(a, kind, col), try quoteLiteral(a, kind, value) });
+    }
+    try out.appendSlice(a, " limit 1");
+    return out.items;
+}
+
 /// `DELETE FROM table WHERE pk1 = v1 AND …` for one row. Values are passed as
 /// literals (the server casts them to the column types); NULL becomes IS NULL.
 pub fn deleteRowSql(
@@ -650,6 +693,19 @@ test "delete row sql" {
     );
 }
 
+test "foreign key catalog queries cover server dialects" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pg = (try foreignKeySql(a, .postgres, "sales.orders")).?;
+    try testing.expect(std.mem.indexOf(u8, pg, "c.conrelid = '\"sales\".\"orders\"'::regclass") != null);
+    try testing.expect(std.mem.indexOf(u8, pg, "unnest(c.conkey, c.confkey)") != null);
+    const mysql = (try foreignKeySql(a, .mysql, "shop.orders")).?;
+    try testing.expect(std.mem.indexOf(u8, mysql, "table_schema = 'shop'") != null);
+    try testing.expect(std.mem.indexOf(u8, mysql, "referenced_table_name is not null") != null);
+    try testing.expect((try foreignKeySql(a, .clickhouse, "orders")) == null);
+}
+
 test "quoting" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -685,4 +741,6 @@ test "selected definition filters object kind" {
     try testing.expect(std.mem.indexOf(u8, mysql, "lower(r.routine_type) = 'procedure'") != null);
     const clickhouse = try definitionSqlForObject(a, .clickhouse, .views, "report", "View");
     try testing.expect(std.mem.indexOf(u8, clickhouse, "engine in ('View', 'MaterializedView', 'LiveView')") != null);
+    const general_clickhouse = try definitionSql(a, .clickhouse, "report");
+    try testing.expect(std.mem.indexOf(u8, general_clickhouse, "engine in ('View', 'MaterializedView', 'LiveView')") != null);
 }

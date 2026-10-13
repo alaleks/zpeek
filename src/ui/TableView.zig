@@ -21,6 +21,14 @@ const TableView = @This();
 
 pub const BadgeColor = config.Color;
 
+const ForeignKey = struct {
+    id: []const u8,
+    source: []const u8,
+    target_schema: []const u8,
+    target_table: []const u8,
+    target_column: []const u8,
+};
+
 pub const Browse = struct {
     table: []const u8,
     database: []const u8 = "",
@@ -42,6 +50,7 @@ pub const Action = union(enum) {
     reload,
     /// Count rows matching the current browse filter on demand.
     count,
+    follow_fk: []const u8,
     copy: []const u8,
     /// Show a short message in the status bar.
     notice: []const u8,
@@ -76,6 +85,10 @@ left: usize = 0,
 
 /// Primary key columns of the browsed table (owned); empty when unknown.
 primary_key: std.ArrayList([]const u8) = .empty,
+foreign_keys: std.ArrayList(ForeignKey) = .empty,
+fk_result: ?*db.Result = null,
+fk_target: ?[]const u8 = null,
+fk_scroll: usize = 0,
 /// DELETE statement awaiting confirmation (owned).
 confirm_delete: ?[]const u8 = null,
 
@@ -171,6 +184,8 @@ pub fn deinit(tv: *TableView) void {
     tv.filter_editor.deinit();
     tv.completion.deinit(tv.gpa);
     tv.clearPrimaryKey();
+    tv.clearForeignKeys();
+    tv.clearForeignResult();
     if (tv.confirm_delete) |sql| tv.gpa.free(sql);
     tv.frame_arena.deinit();
     tv.gpa.destroy(tv);
@@ -178,6 +193,7 @@ pub fn deinit(tv: *TableView) void {
 
 /// Replaces the result after a browse reload.
 pub fn setResult(tv: *TableView, result: *db.Result) Allocator.Error!void {
+    tv.clearForeignResult();
     if (tv.owns_result) {
         tv.result.deinit();
         tv.gpa.destroy(tv.result);
@@ -218,7 +234,7 @@ fn rebuild(tv: *TableView) Allocator.Error!void {
     for (r.columns, 0..) |name, ci| {
         // Values are capped at 50 columns; the name (plus room for a sort
         // marker) always fits, so column names are never truncated.
-        const name_w = render.displayWidth(name) + 2;
+        const name_w = render.displayWidth(name) + 4;
         var data_w: usize = 4;
         for (r.rows) |row| {
             const v = row[ci] orelse render.null_text;
@@ -349,6 +365,18 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
         }
         return .none;
     }
+    if (tv.fk_result != null) {
+        if (key.matches('J', .{}) or key.matches('j', .{ .shift = true })) {
+            tv.fk_scroll += 1;
+            return .none;
+        }
+        if (key.matches('K', .{}) or key.matches('k', .{ .shift = true })) {
+            tv.fk_scroll -|= 1;
+            return .none;
+        }
+        tv.clearForeignResult();
+        if (key.matches('f', .{})) return .none;
+    }
 
     const nrows = tv.view.items.len;
     const ncols = tv.visible.items.len;
@@ -383,11 +411,13 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
             tv.detail = true;
             tv.detail_scroll = 0;
         }
-    } else if (key.matches('/', .{}) or key.matches('f', .{})) {
+    } else if (key.matches('/', .{}) or (tv.browse == null and key.matches('f', .{}))) {
         tv.editing_filter = true;
         const current = if (tv.browse) |b| b.filter else tv.local_filter.items;
         try tv.filter_editor.setText(current);
         tv.completion.clearRetainingCapacity();
+    } else if (key.matches('f', .{})) {
+        return tv.followForeignKey();
     } else if (key.matches('d', .{}) or key.matches(vaxis.Key.delete, .{})) {
         return tv.requestDelete();
     } else if (key.matches('s', .{})) {
@@ -644,6 +674,87 @@ fn clearPrimaryKey(tv: *TableView) void {
     tv.primary_key = .empty;
 }
 
+pub fn setForeignKeys(tv: *TableView, result: db.Result) Allocator.Error!void {
+    tv.clearForeignKeys();
+    errdefer tv.clearForeignKeys();
+    for (result.rows) |row| {
+        if (row.len < 5 or row[0] == null or row[1] == null or row[3] == null or row[4] == null) continue;
+        const fields = [_][]const u8{ row[0].?, row[1].?, row[2] orelse "", row[3].?, row[4].? };
+        var owned: [5][]const u8 = undefined;
+        var n: usize = 0;
+        errdefer for (owned[0..n]) |v| tv.gpa.free(v);
+        for (fields, 0..) |v, i| {
+            owned[i] = try tv.gpa.dupe(u8, v);
+            n += 1;
+        }
+        try tv.foreign_keys.append(tv.gpa, .{
+            .id = owned[0],
+            .source = owned[1],
+            .target_schema = owned[2],
+            .target_table = owned[3],
+            .target_column = owned[4],
+        });
+    }
+}
+
+fn clearForeignKeys(tv: *TableView) void {
+    for (tv.foreign_keys.items) |fk| {
+        tv.gpa.free(fk.id);
+        tv.gpa.free(fk.source);
+        tv.gpa.free(fk.target_schema);
+        tv.gpa.free(fk.target_table);
+        tv.gpa.free(fk.target_column);
+    }
+    tv.foreign_keys.deinit(tv.gpa);
+    tv.foreign_keys = .empty;
+}
+
+pub fn setForeignResult(tv: *TableView, result: *db.Result) void {
+    const target = tv.fk_target;
+    tv.clearForeignResult();
+    tv.fk_result = result;
+    tv.fk_target = target;
+}
+
+fn clearForeignResult(tv: *TableView) void {
+    if (tv.fk_result) |r| {
+        r.deinit();
+        tv.gpa.destroy(r);
+    }
+    tv.fk_result = null;
+    tv.fk_target = null;
+    tv.fk_scroll = 0;
+}
+
+fn followForeignKey(tv: *TableView) Allocator.Error!Action {
+    const b = tv.browse orelse return .{ .notice = "foreign keys work in /browse" };
+    if (tv.view.items.len == 0) return .{ .notice = "no row selected" };
+    const col_name = tv.result.columns[tv.curCol()];
+    const selected = for (tv.foreign_keys.items) |fk| {
+        if (std.mem.eql(u8, fk.source, col_name)) break fk;
+    } else return .{ .notice = "this column is not a foreign key" };
+    const a = tv.frame_arena.allocator();
+    const row = tv.result.rows[tv.view.items[tv.row]];
+    var cols: std.ArrayList([]const u8) = .empty;
+    var vals: std.ArrayList([]const u8) = .empty;
+    for (tv.foreign_keys.items) |fk| {
+        if (!std.mem.eql(u8, fk.id, selected.id)) continue;
+        const ci = for (tv.result.columns, 0..) |name, i| {
+            if (std.mem.eql(u8, name, fk.source)) break i;
+        } else return .{ .notice = "foreign key column is missing from the result" };
+        const value = row[ci] orelse return .{ .notice = "foreign key is NULL" };
+        try cols.append(a, fk.target_column);
+        try vals.append(a, value);
+    }
+    const target = if (selected.target_schema.len > 0)
+        try std.fmt.allocPrint(a, "{s}.{s}", .{ try schema.quoteIdent(a, b.kind, selected.target_schema), try schema.quoteIdent(a, b.kind, selected.target_table) })
+    else
+        try schema.quoteIdent(a, b.kind, selected.target_table);
+    const sql = try schema.foreignRowSql(a, b.kind, target, cols.items, vals.items);
+    tv.fk_target = selected.target_table;
+    return .{ .follow_fk = try tv.gpa.dupe(u8, sql) };
+}
+
 /// Prepares `DELETE … WHERE <primary key> = <values>` for the current row and
 /// asks for confirmation. Without a primary key nothing is offered, because
 /// the row could not be identified unambiguously.
@@ -717,6 +828,51 @@ test "browse controls reload pages and require confirmation to delete" {
 
     try tv.setPrimaryKey(&.{});
     try std.testing.expect((try tv.handleKey(.{ .codepoint = 'd' })) == .notice);
+}
+
+test "browse follows a composite foreign key and handles null values" {
+    const a = std.testing.allocator;
+    var rows = db.ResultBuilder.init(a);
+    try rows.setColumns(&.{ "tenant", "parent_id", "note" });
+    try rows.addRow(&.{ "b", "O'Brien", "linked" }, .{});
+    try rows.addRow(&.{ "b", null, "empty" }, .{});
+    const result = try a.create(db.Result);
+    result.* = rows.finish();
+    const tv = TableView.init(a, result, true, "child", .{ .table = "child", .kind = .sqlite }, "", null) catch |err| {
+        result.deinit();
+        a.destroy(result);
+        return err;
+    };
+    defer tv.deinit();
+
+    var keys = db.ResultBuilder.init(a);
+    try keys.setColumns(&.{ "id", "source", "schema", "table", "target" });
+    try keys.addRow(&.{ "0", "tenant", "", "parent", "tenant" }, .{});
+    try keys.addRow(&.{ "0", "parent_id", "", "parent", "id" }, .{});
+    var metadata = keys.finish();
+    defer metadata.deinit();
+    try tv.setForeignKeys(metadata);
+
+    const action = try tv.handleKey(.{ .codepoint = 'f' });
+    try std.testing.expect(action == .follow_fk);
+    defer a.free(action.follow_fk);
+    try std.testing.expectEqualStrings("select * from \"parent\" where \"tenant\" = 'b' and \"id\" = 'O''Brien' limit 1", action.follow_fk);
+    try std.testing.expectEqualStrings("parent", tv.fk_target.?);
+
+    var target = db.ResultBuilder.init(a);
+    try target.setColumns(&.{ "tenant", "id", "name" });
+    try target.addRow(&.{ "b", "O'Brien", "Bob" }, .{});
+    const linked = try a.create(db.Result);
+    linked.* = target.finish();
+    tv.setForeignResult(linked);
+    try std.testing.expectEqualStrings("Bob", tv.fk_result.?.rows[0][2].?);
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 'f' })) == .none);
+    try std.testing.expect(tv.fk_result == null);
+
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = vaxis.Key.down })) == .none);
+    const null_action = try tv.handleKey(.{ .codepoint = 'f' });
+    try std.testing.expect(null_action == .notice);
+    try std.testing.expectEqualStrings("foreign key is NULL", null_action.notice);
 }
 
 fn drawConfirmDelete(tv: *TableView, a: Allocator, win: vaxis.Window, sql: []const u8) Allocator.Error!void {
@@ -809,7 +965,8 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
 
     const r = tv.result;
     const footer_h: u16 = 2;
-    const grid_h = win.height - footer_h;
+    const fk_h: u16 = if (tv.fk_result != null and win.height >= 11) @min(10, @max(5, win.height / 3)) else 0;
+    const grid_h = win.height - footer_h - fk_h;
     // title line + blank line + header + rule
     const body_h: usize = grid_h -| 4;
     tv.page_rows = @max(body_h, 1);
@@ -885,6 +1042,12 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
                 if (tv.local_sort) |s| if (s.col == ci) break :blk if (s.desc) " ↓" else " ↑";
                 break :blk "";
             };
+            if (tv.browse != null) for (tv.foreign_keys.items) |fk| {
+                if (std.mem.eql(u8, fk.source, name)) {
+                    name = try std.mem.concat(a, u8, &.{ name, " ↗" });
+                    break;
+                }
+            };
             if (marker.len > 0) name = try std.mem.concat(a, u8, &.{ name, marker });
             const style: vaxis.Style = if (ci == cur_col) .{ .fg = theme.accent } else theme.header;
             drawCell(grid, col_x, 0, w, name, style);
@@ -913,6 +1076,12 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
             const v = row[ci];
             const text = try render.singleLine(a, v orelse render.null_text);
             var style: vaxis.Style = if (v == null) theme.null_value else .{};
+            if (v != null and tv.browse != null) for (tv.foreign_keys.items) |fk| {
+                if (std.mem.eql(u8, fk.source, r.columns[ci])) {
+                    style.fg = theme.accent;
+                    break;
+                }
+            };
             if (is_cur_row) style.bg = .{ .index = 8 };
             if (is_cur_row and ci == cur_col) style = theme.selected_cell;
             // fill the padding around the cell for the current row
@@ -927,6 +1096,7 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
         _ = grid.printSegment(.{ .text = "  (no rows)", .style = theme.dim }, .{ .row_offset = 2 });
     }
 
+    if (fk_h > 0) try tv.drawForeignPreview(a, win.child(.{ .y_off = grid_h, .height = fk_h }));
     try tv.drawFooter(a, win.child(.{ .y_off = @intCast(win.height - footer_h), .height = footer_h }), last_col);
     if (tv.editing_filter) try tv.drawCompletion(a, win, win.height - footer_h);
 
@@ -980,6 +1150,52 @@ fn fillRow(win: vaxis.Window, x: u16, y: u16, width: u16, style: vaxis.Style) vo
     while (i < width) : (i += 1) {
         win.writeCell(x + i, y, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = style.bg } });
     }
+}
+
+fn drawForeignPreview(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!void {
+    const result = tv.fk_result orelse return;
+    if (result.rows.len == 0) return;
+    const box = win.child(.{ .width = win.width, .height = win.height, .border = .{ .where = .all, .style = theme.border_focus } });
+    box.clear();
+    const title = try std.fmt.allocPrint(a, " FK → {s}  ·  J/K scroll  ·  f close", .{tv.fk_target orelse "row"});
+    _ = box.print(&.{.{ .text = title, .style = theme.accent_bold }}, .{ .row_offset = 0, .wrap = .none });
+    const field_w: u16 = @min(24, box.width / 3);
+    const value_w = box.width -| (field_w + 4);
+    drawCell(box, 0, 1, field_w, "Column", theme.header);
+    drawCell(box, field_w + 2, 1, value_w, "Value", theme.header);
+    const shown = box.height -| 2;
+    tv.fk_scroll = @min(tv.fk_scroll, result.columns.len -| shown);
+    for (result.columns[tv.fk_scroll..], 0..) |name, i| {
+        if (i >= shown) break;
+        const y: u16 = @intCast(i + 2);
+        drawCell(box, 0, y, field_w, name, theme.header);
+        const column = tv.fk_scroll + i;
+        const value = result.rows[0][column];
+        const label = try render.singleLine(a, foreignPreviewValue(result, column));
+        drawCell(box, field_w + 2, y, value_w, label, if (value == null) theme.null_value else .{});
+    }
+}
+
+fn foreignPreviewValue(result: *const db.Result, column: usize) []const u8 {
+    const value = result.rows[0][column] orelse return render.null_text;
+    if (column < result.boolean_columns.len and result.boolean_columns[column]) {
+        if (std.mem.eql(u8, value, "t")) return "true";
+        if (std.mem.eql(u8, value, "f")) return "false";
+    }
+    return value;
+}
+
+test "foreign key preview expands only typed boolean values" {
+    var result: db.Result = .{
+        .arena = .init(std.testing.allocator),
+        .boolean_columns = &.{ true, true, false, true },
+        .rows = &.{&.{ "t", "f", "f", null }},
+    };
+    defer result.deinit();
+    try std.testing.expectEqualStrings("true", foreignPreviewValue(&result, 0));
+    try std.testing.expectEqualStrings("false", foreignPreviewValue(&result, 1));
+    try std.testing.expectEqualStrings("f", foreignPreviewValue(&result, 2));
+    try std.testing.expectEqualStrings(render.null_text, foreignPreviewValue(&result, 3));
 }
 
 fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) Allocator.Error!void {
@@ -1038,7 +1254,7 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
     else if (tv.browse) |b| (if (b.kind == .clickhouse)
         " enter cell · / where · t count · s sort · c columns · x hide · n/p page · r/F5 refresh · q back"
     else
-        " enter cell · / where · t count · s sort · c columns · x hide · d delete · n/p page · r/F5 refresh · q back") else " enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
+        " enter cell · f follow FK · / where · t count · s sort · c columns · d delete · n/p page · q back") else " enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
     _ = win.print(&.{.{ .text = hint, .style = theme.dim }}, .{ .row_offset = 1, .wrap = .none });
 }
 

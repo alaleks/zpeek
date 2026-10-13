@@ -265,6 +265,15 @@ test "schema browsing and selected definitions run on SQLite" {
         try std.testing.expect(std.mem.indexOf(u8, definition.rows[0][2].?, case.source) != null);
     }
 
+    var table_definition = try conn.query(gpa, try schema.definitionSql(a, .sqlite, "people"));
+    defer table_definition.deinit();
+    try std.testing.expectEqual(@as(usize, 0), table_definition.rows.len);
+    for ([_][]const u8{ "named_people", "audit_delete" }) |name| {
+        var definition = try conn.query(gpa, try schema.definitionSql(a, .sqlite, name));
+        defer definition.deinit();
+        try std.testing.expectEqual(@as(usize, 1), definition.rows.len);
+    }
+
     var page = try conn.query(gpa, try schema.browseSql(a, .sqlite, "people", "id > 1", .{ .column = "id", .descending = true }, 1, 0));
     defer page.deinit();
     try std.testing.expectEqual(@as(usize, 1), page.rows.len);
@@ -279,4 +288,37 @@ test "schema browsing and selected definitions run on SQLite" {
     var audit = try conn.query(gpa, "select name from audit");
     defer audit.deinit();
     try std.testing.expectEqualStrings("Alice", audit.rows[0][0].?);
+}
+
+test "foreign key metadata and composite row lookup on SQLite" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var err: db.ErrorText = .{};
+    defer err.deinit(gpa);
+    const conn = try connect(gpa, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    defer conn.close();
+    var setup = try conn.query(gpa,
+        \\create table parent(tenant text, id text, label text, primary key(tenant, id));
+        \\insert into parent values ('a', 'O''Brien', 'Alice'), ('b', 'O''Brien', 'Bob');
+        \\create table child(tenant text, parent_id text, foreign key(tenant, parent_id) references parent(tenant, id));
+        \\create table single_parent(id integer primary key, label text);
+        \\create table single_child(parent_id integer references single_parent);
+    );
+    defer setup.deinit();
+    var keys = try conn.query(gpa, (try schema.foreignKeySql(a, .sqlite, "child")).?);
+    defer keys.deinit();
+    try std.testing.expectEqual(@as(usize, 2), keys.rows.len);
+    try std.testing.expectEqualStrings(keys.rows[0][0].?, keys.rows[1][0].?);
+    try std.testing.expectEqualStrings("tenant", keys.rows[0][1].?);
+    try std.testing.expectEqualStrings("id", keys.rows[1][4].?);
+    const sql = try schema.foreignRowSql(a, .sqlite, "parent", &.{ "tenant", "id" }, &.{ "b", "O'Brien" });
+    var target = try conn.query(gpa, sql);
+    defer target.deinit();
+    try std.testing.expectEqual(@as(usize, 1), target.rows.len);
+    try std.testing.expectEqualStrings("Bob", target.rows[0][2].?);
+    var implicit = try conn.query(gpa, (try schema.foreignKeySql(a, .sqlite, "single_child")).?);
+    defer implicit.deinit();
+    try std.testing.expectEqualStrings("id", implicit.rows[0][4].?);
 }

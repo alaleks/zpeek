@@ -272,12 +272,16 @@ const Pg = struct {
                     var r: Io.Reader = .fixed(m);
                     const n = try r.takeInt(u16, .big);
                     const names = try a.alloc([]const u8, n);
-                    for (names) |*name| {
+                    const booleans = try a.alloc(bool, n);
+                    for (names, booleans) |*name, *is_boolean| {
                         name.* = try a.dupe(u8, try r.takeDelimiterExclusive(0));
                         r.toss(1);
-                        try r.discardAll(18); // table oid, attnum, type oid, typlen, typmod, format
+                        try r.discardAll(6); // table oid, attnum
+                        is_boolean.* = (try r.takeInt(u32, .big)) == 16; // PostgreSQL bool OID
+                        try r.discardAll(8); // typlen, typmod, format
                     }
                     try b.setColumns(names);
+                    b.result.boolean_columns = booleans;
                     b.result.truncated = false;
                     b.result.affected_rows = null;
                 },
@@ -327,6 +331,7 @@ const Pg = struct {
                         const names = try a.alloc([]const u8, 1);
                         names[0] = "COPY";
                         try b.setColumns(names);
+                        b.result.boolean_columns = &.{};
                         copy_out = true;
                     }
                 },

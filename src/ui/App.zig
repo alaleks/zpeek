@@ -62,7 +62,7 @@ const commands = [_]complete.Command{
     .{ .name = "/triggers", .help = "pick a trigger to show its source" },
     .{ .name = "/describe", .args = "<table>", .help = "columns, indexes and constraints", .arg = .table, .aliases = &.{"/d"} },
     .{ .name = "/browse", .args = "<table> [where …]", .help = "open table data (no argument: pick a table)", .arg = .table, .aliases = &.{"/b"} },
-    .{ .name = "/def", .args = "<name>", .help = "source of a view, function, trigger or enum", .arg = .object },
+    .{ .name = "/def", .args = "<name>", .help = "source of a view, function, trigger or enum" },
     .{ .name = "/databases", .help = "list databases", .aliases = &.{"/dbs"} },
     .{ .name = "/refresh", .help = "reload table/column names for completion" },
     .{ .name = "/save", .args = "<name>", .help = "save the last SQL you ran under a name" },
@@ -83,6 +83,7 @@ const JobKind = union(enum) {
     browse_open: TableView.Browse,
     browse_reload,
     browse_count,
+    browse_fk,
     /// A confirmed single-row DELETE from the table viewer.
     browse_delete,
     cache,
@@ -715,6 +716,12 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
         },
         .reload => try app.startBrowseReload(),
         .count => try app.startBrowseCount(),
+        .follow_fk => |sql| {
+            defer app.gpa.free(sql);
+            const job = try app.newJob(.browse_fk);
+            job.sqls = try job.arena.allocator().dupe([]const u8, &.{try job.arena.allocator().dupe(u8, sql)});
+            try app.startJob(job);
+        },
         .copy => |text| {
             try app.vx.copyToSystemClipboard(app.tty.writer(), text, app.gpa);
             tv.notice = "copied to clipboard";
@@ -1400,6 +1407,10 @@ fn processJob(app: *App, job: *Job) !void {
                         },
                         else => {},
                     };
+                    if (job.outcomes.items.len > 2) switch (job.outcomes.items[2]) {
+                        .result => |fk| try tv.setForeignKeys(fk.result),
+                        else => {},
+                    };
                     app.mode = .table;
                     try app.transcript.addMessage(.dim, "{s}: {d} rows loaded in {d} ms", .{ b.table, r.result.rows.len, r.ms });
                 },
@@ -1425,6 +1436,28 @@ fn processJob(app: *App, job: *Job) !void {
                     tv.notice = app.notice.items;
                 },
                 .canceled => tv.notice = "canceled",
+            }
+        },
+        .browse_fk => {
+            const tv = app.table_view orelse return;
+            if (job.outcomes.items.len == 0) return;
+            switch (job.outcomes.items[0]) {
+                .result => |r| {
+                    if (r.result.rows.len == 0) {
+                        tv.notice = "referenced row not found";
+                        return;
+                    }
+                    const owned = try app.gpa.create(db.Result);
+                    owned.* = r.result;
+                    job.outcomes.items[0] = .canceled;
+                    tv.setForeignResult(owned);
+                },
+                .failed => |msg| {
+                    app.notice.clearRetainingCapacity();
+                    try app.notice.appendSlice(app.gpa, msg);
+                    tv.notice = app.notice.items;
+                },
+                .canceled => tv.notice = "foreign key lookup canceled",
             }
         },
         .browse_reload => {
@@ -1799,6 +1832,7 @@ fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
     job.sqls = try a.dupe([]const u8, &.{
         try schema.browseSql(a, kind, b.table, b.filter, null, b.page_size, 0),
         try schema.primaryKeySql(a, kind, b.table),
+        (try schema.foreignKeySql(a, kind, b.table)) orelse "select 1 where 0",
     });
     job.stop_on_error = false;
     try app.startJob(job);
@@ -2084,8 +2118,8 @@ fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16
         label_w = @max(label_w, render.displayWidth(c.text));
         detail_w = @max(detail_w, render.displayWidth(c.detail));
     }
-    label_w = @min(label_w, 40);
-    detail_w = @min(detail_w, 40);
+    label_w = @min(label_w, @min(40, win.width / 2));
+    detail_w = @min(detail_w, win.width -| @as(u16, @intCast(label_w + 7)));
     const inner: usize = 2 + 2 + label_w + (if (detail_w > 0) detail_w + 2 else 0) + 1;
     const w: u16 = @intCast(@min(inner, win.width));
     const x: u16 = @min(cursor_col -| @as(u16, @intCast(@min(p.completion.replace_len, cursor_col))), win.width -| w);
@@ -2113,13 +2147,18 @@ fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16
             .query => "q",
         };
         const fit = render.fitWidth(c.text, label_w);
+        const detail = render.fitWidth(c.detail, detail_w);
+        const shown_detail = if (detail.text.len == c.detail.len) c.detail else if (detail_w > 0)
+            try std.mem.concat(a, u8, &.{ render.fitWidth(c.detail, detail_w - 1).text, "…" })
+        else
+            "";
         _ = pop.print(&.{
             .{ .text = " ", .style = .{ .bg = bg } },
             .{ .text = icon, .style = .{ .fg = if (sel) fg else theme.muted_color, .bg = bg } },
             .{ .text = " ", .style = .{ .bg = bg } },
             .{ .text = fit.text, .style = .{ .fg = fg, .bg = bg, .bold = sel } },
             .{ .text = try Transcript.spaces(a, label_w - fit.width + 2), .style = .{ .bg = bg } },
-            .{ .text = render.fitWidth(c.detail, detail_w).text, .style = .{ .fg = if (sel) fg else theme.muted_color, .bg = bg } },
+            .{ .text = shown_detail, .style = .{ .fg = if (sel) fg else theme.muted_color, .bg = bg } },
         }, .{ .row_offset = @intCast(i), .wrap = .none });
     }
 }

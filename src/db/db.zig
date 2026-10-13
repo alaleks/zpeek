@@ -15,6 +15,8 @@ const clickhouse = @import("clickhouse.zig");
 pub const Result = struct {
     arena: std.heap.ArenaAllocator,
     columns: []const []const u8 = &.{},
+    /// PostgreSQL boolean columns; empty when the driver does not provide types.
+    boolean_columns: []const bool = &.{},
     rows: []const []const ?[]const u8 = &.{},
     /// Rows changed by INSERT/UPDATE/DELETE when the server reports it.
     affected_rows: ?u64 = null,

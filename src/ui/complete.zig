@@ -18,7 +18,7 @@ pub const Command = struct {
     args: []const u8 = "",
     help: []const u8,
     /// What the first argument completes to.
-    arg: enum { none, table, connection, object, query } = .none,
+    arg: enum { none, table, connection, query } = .none,
     aliases: []const []const u8 = &.{},
 };
 
@@ -231,7 +231,7 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
             .none => {},
             .connection => for (ctx.connections) |c| try list.addIfMatch(c, word, .connection, ""),
             .query => for (ctx.queries) |q| try list.addIfMatch(q, word, .query, ""),
-            .table, .object => if (ctx.cache) |cache| {
+            .table => if (ctx.cache) |cache| {
                 for (cache.tables) |t| try list.addIfMatch(t, word, .table, "");
             },
         }
@@ -350,26 +350,27 @@ fn lastSignificant(s: []const u8) ?lexer.Token {
 // ───────────── dialect keyword lists (most common first) ─────────────
 
 const statements_common = [_][]const u8{
-    "SELECT",       "WITH",        "INSERT INTO", "UPDATE",     "DELETE FROM", "CREATE TABLE",
-    "CREATE VIEW",  "CREATE INDEX", "ALTER TABLE", "DROP TABLE", "DROP VIEW",   "EXPLAIN",
-    "BEGIN",        "COMMIT",      "ROLLBACK",
+    "SELECT",      "WITH",         "INSERT INTO", "UPDATE",     "DELETE FROM", "CREATE TABLE",
+    "CREATE VIEW", "CREATE INDEX", "ALTER TABLE", "DROP TABLE", "DROP VIEW",   "EXPLAIN",
+    "BEGIN",       "COMMIT",       "ROLLBACK",
 };
 const statements_postgres = statements_common ++ [_][]const u8{
-    "TRUNCATE", "EXPLAIN ANALYZE", "CREATE FUNCTION", "CREATE TYPE", "CREATE MATERIALIZED VIEW",
-    "REFRESH MATERIALIZED VIEW", "VACUUM", "ANALYZE", "SET", "SHOW", "COPY",
+    "TRUNCATE",                  "EXPLAIN ANALYZE", "CREATE FUNCTION", "CREATE TYPE", "CREATE MATERIALIZED VIEW",
+    "REFRESH MATERIALIZED VIEW", "VACUUM",          "ANALYZE",         "SET",         "SHOW",
+    "COPY",
 };
 const statements_mysql = statements_common ++ [_][]const u8{
-    "TRUNCATE", "SHOW TABLES", "SHOW DATABASES", "SHOW CREATE TABLE", "SHOW PROCESSLIST", "DESCRIBE",
-    "REPLACE INTO", "USE", "CALL", "CREATE PROCEDURE", "SET",
+    "TRUNCATE",     "SHOW TABLES", "SHOW DATABASES", "SHOW CREATE TABLE", "SHOW PROCESSLIST", "DESCRIBE",
+    "REPLACE INTO", "USE",         "CALL",           "CREATE PROCEDURE",  "SET",
 };
 const statements_sqlite = statements_common ++ [_][]const u8{
     "PRAGMA", "REPLACE INTO", "CREATE TRIGGER", "VACUUM", "ANALYZE", "ATTACH DATABASE",
 };
 
 const statements_clickhouse = [_][]const u8{
-    "SELECT", "WITH", "INSERT INTO", "ALTER TABLE", "CREATE TABLE", "CREATE VIEW", "CREATE MATERIALIZED VIEW",
-    "CREATE DATABASE", "DROP TABLE", "TRUNCATE TABLE", "DELETE FROM", "SHOW TABLES", "SHOW DATABASES",
-    "SHOW CREATE TABLE", "DESCRIBE TABLE", "EXPLAIN", "OPTIMIZE TABLE", "EXISTS", "SYSTEM", "KILL QUERY",
+    "SELECT",          "WITH",       "INSERT INTO",    "ALTER TABLE", "CREATE TABLE", "CREATE VIEW",    "CREATE MATERIALIZED VIEW",
+    "CREATE DATABASE", "DROP TABLE", "TRUNCATE TABLE", "DELETE FROM", "SHOW TABLES",  "SHOW DATABASES", "SHOW CREATE TABLE",
+    "DESCRIBE TABLE",  "EXPLAIN",    "OPTIMIZE TABLE", "EXISTS",      "SYSTEM",       "KILL QUERY",
 };
 
 fn statementKeywords(kind: db.Kind) []const []const u8 {
@@ -382,9 +383,9 @@ fn statementKeywords(kind: db.Kind) []const []const u8 {
 }
 
 const clauses_common = [_][]const u8{
-    "FROM",      "WHERE",      "AND",        "OR",         "AS",       "ON",          "JOIN",
-    "LEFT JOIN", "INNER JOIN", "RIGHT JOIN", "CROSS JOIN", "ORDER BY", "GROUP BY",    "HAVING",
-    "LIMIT",     "OFFSET",     "UNION",      "UNION ALL",  "ASC",      "DESC",        "SET",
+    "FROM",      "WHERE",      "AND",        "OR",         "AS",          "ON",       "JOIN",
+    "LEFT JOIN", "INNER JOIN", "RIGHT JOIN", "CROSS JOIN", "ORDER BY",    "GROUP BY", "HAVING",
+    "LIMIT",     "OFFSET",     "UNION",      "UNION ALL",  "ASC",         "DESC",     "SET",
     "VALUES",    "IN",         "NOT",        "IS NULL",    "IS NOT NULL", "LIKE",     "BETWEEN",
     "USING",
 };
@@ -397,8 +398,8 @@ const clauses_mysql = clauses_common ++ [_][]const u8{
 const clauses_sqlite = clauses_common ++ [_][]const u8{ "GLOB", "RETURNING", "ON CONFLICT" };
 
 const clauses_clickhouse = clauses_common ++ [_][]const u8{
-    "PREWHERE", "FINAL", "SAMPLE", "ARRAY JOIN", "LEFT ARRAY JOIN", "LIMIT BY", "ILIKE", "GLOBAL IN",
-    "ANY JOIN", "ASOF JOIN", "SETTINGS", "FORMAT", "WITH TOTALS",
+    "PREWHERE", "FINAL",     "SAMPLE",   "ARRAY JOIN", "LEFT ARRAY JOIN", "LIMIT BY", "ILIKE", "GLOBAL IN",
+    "ANY JOIN", "ASOF JOIN", "SETTINGS", "FORMAT",     "WITH TOTALS",
 };
 
 fn clauseKeywords(kind: db.Kind) []const []const u8 {
@@ -443,9 +444,9 @@ fn followUps(prev: []const u8) []const []const u8 {
 fn keywordAllowed(kind: db.Kind, k: []const u8) bool {
     const Owner = enum { postgres, mysql, sqlite, not_sqlite };
     const only = std.StaticStringMap(Owner).initComptime(.{
-        .{ "ilike", .postgres },   .{ "lateral", .postgres },     .{ "materialized", .postgres },
-        .{ "pragma", .sqlite },    .{ "autoincrement", .sqlite }, .{ "auto_increment", .mysql },
-        .{ "engine", .mysql },     .{ "show", .not_sqlite },      .{ "truncate", .not_sqlite },
+        .{ "ilike", .postgres }, .{ "lateral", .postgres },     .{ "materialized", .postgres },
+        .{ "pragma", .sqlite },  .{ "autoincrement", .sqlite }, .{ "auto_increment", .mysql },
+        .{ "engine", .mysql },   .{ "show", .not_sqlite },      .{ "truncate", .not_sqlite },
     });
     const owner = only.get(k) orelse return true;
     return switch (owner) {
@@ -687,6 +688,21 @@ test "keywords keep case and commands" {
     const cmds = [_]Command{ .{ .name = "/tables", .help = "" }, .{ .name = "/types", .help = "" } };
     const c2 = try complete(arena.allocator(), .{ .text = "/ta", .cursor = 3, .cache = null, .connections = &.{}, .commands = &cmds });
     try testing.expectEqual(@as(usize, 1), c2.candidates.len);
+}
+
+test "/def does not suggest ordinary tables" {
+    var cache = try testCache(testing.allocator);
+    defer cache.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const commands = [_]Command{
+        .{ .name = "/def", .help = "definition" },
+        .{ .name = "/browse", .help = "browse", .arg = .table },
+    };
+    const def = try complete(arena.allocator(), .{ .text = "/def us", .cursor = 7, .cache = &cache, .connections = &.{}, .commands = &commands });
+    try testing.expectEqual(@as(usize, 0), def.candidates.len);
+    const browse = try complete(arena.allocator(), .{ .text = "/browse us", .cursor = 10, .cache = &cache, .connections = &.{}, .commands = &commands });
+    try testing.expectEqualStrings("users", browse.candidates[0].text);
 }
 
 test "operators depend on SQL dialect" {
