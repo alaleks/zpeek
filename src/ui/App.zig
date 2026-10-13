@@ -219,7 +219,10 @@ pub fn run(opts: Options) !void {
         try app.handleEvent(event);
         while (try app.loop.tryEvent()) |ev| try app.handleEvent(ev);
         if (!app.running) break;
-        if (app.table_view == null or app.table_view.?.owns_result) app.transcript.prune();
+        if (app.table_view == null or app.table_view.?.owns_result) {
+            app.transcript.compact() catch {}; // only frees memory; keeping rows is safe
+            app.transcript.prune();
+        }
         try app.draw();
         try app.vx.render(writer);
         try writer.flush();
@@ -607,7 +610,8 @@ fn openCompletion(app: *App, explicit: bool) Allocator.Error!void {
         .cursor = app.editor.cursor,
         .cache = if (app.cache) |*c| c else null,
         .connections = names.items,
-        .queries = try app.savedQueryNames(a),
+        // Only slash-command arguments complete saved queries; avoids disk reads per SQL keystroke.
+        .queries = if (std.mem.startsWith(u8, app.editor.text(), "/")) try app.savedQueryNames(a) else &.{},
         .commands = &commands,
         .kind = if (app.conn) |conn| conn.kind else null,
     });
@@ -707,7 +711,20 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
         }
         return;
     }
-    switch (try tv.handleKey(key)) {
+    const action = try tv.handleKey(key);
+    // After a failed reconnect the viewer stays open without a connection.
+    if (app.conn == null) switch (action) {
+        .reload, .count, .follow_fk, .delete_row => {
+            switch (action) {
+                .follow_fk, .delete_row => |sql| app.gpa.free(sql),
+                else => {},
+            }
+            tv.notice = "not connected — close with q and use /connect";
+            return;
+        },
+        else => {},
+    };
+    switch (action) {
         .none => {},
         .close => {
             tv.deinit();
@@ -1168,6 +1185,40 @@ fn jobTask(app: *App, job: *Job) void {
             job.outcomes.append(a, outcome) catch return;
             if (job.stop_on_error or outcome == .canceled) return;
         }
+    }
+}
+
+test "browse keys after a lost connection do not crash" {
+    const a = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+    };
+    defer app.deinit();
+    var builder = db.ResultBuilder.init(a);
+    try builder.setColumns(&.{"id"});
+    try builder.addRow(&.{"1"}, .{});
+    const result = try a.create(db.Result);
+    result.* = builder.finish();
+    app.table_view = TableView.init(a, result, true, "t", .{ .table = "t", .kind = .postgres }, "", null) catch |err| {
+        result.deinit();
+        a.destroy(result);
+        return err;
+    };
+    app.mode = .table;
+    for ("rt") |c| {
+        try app.handleTableKey(.{ .codepoint = c });
+        try std.testing.expect(app.job == null);
+        try std.testing.expectEqualStrings("not connected — close with q and use /connect", app.table_view.?.notice.?);
     }
 }
 

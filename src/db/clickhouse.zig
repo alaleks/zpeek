@@ -23,6 +23,12 @@ const Ch = struct {
     /// Query id of the running request, for cancellation.
     query_id: [32]u8 = undefined,
     query_id_len: std.atomic.Value(usize) = .init(0),
+    /// HTTP keep-alive connection reused by queries (job thread only; cancel
+    /// opens its own). Reused only while the server's Keep-Alive timeout says
+    /// it is open, so a request never needs a retry on a stale socket.
+    idle: ?*Transport = null,
+    idle_since: Io.Timestamp = .zero,
+    idle_limit_ms: i64 = 0,
 
     const vtable: db.Connection.VTable = .{
         .query = query,
@@ -53,7 +59,7 @@ const Ch = struct {
         var b: db.ResultBuilder = .init(gpa);
         errdefer b.deinit();
         const a = b.allocator();
-        const resp = self.request(a, sql, &id, opts.max_rows, opts.max_bytes, true) catch |err| switch (err) {
+        const resp = self.request(a, sql, &id, opts.max_rows, opts.max_bytes, true, true) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ConnectFailed => return error.ConnectionLost,
             error.ResponseTooLarge => {
@@ -149,7 +155,17 @@ const Ch = struct {
     };
 
     /// Sends one POST request with `sql` as the body and reads the full response.
-    fn request(self: *Ch, gpa: Allocator, sql: []const u8, query_id: []const u8, max_rows: usize, max_bytes: usize, record_error: bool) !Response {
+    /// The idle keep-alive connection if the server still keeps it open.
+    fn takeIdle(self: *Ch) ?*Transport {
+        const t = self.idle orelse return null;
+        self.idle = null;
+        // One second of margin against the server closing it right now.
+        if (self.idle_since.untilNow(self.io, .awake).toMilliseconds() < self.idle_limit_ms - 1000) return t;
+        t.close();
+        return null;
+    }
+
+    fn open(self: *Ch, record_error: bool) !*Transport {
         const p = self.params;
         const host = if (p.host.len > 0) p.host else "localhost";
         var diag: []const u8 = "";
@@ -157,14 +173,28 @@ const Ch = struct {
             if (record_error) self.err.set(self.gpa, "cannot connect to {s}:{d}: {s}", .{ host, port(p), diag });
             return err;
         };
-        defer t.close();
-        errdefer if (record_error and t.read_timed_out) self.err.set(self.gpa, "database response timed out after 300 s", .{});
+        errdefer t.close();
         if (useTls(p)) {
             t.startTls(host, if (p.ssl.requiresTls()) p.ssl else .require, &diag) catch |err| {
                 if (record_error) self.err.set(self.gpa, "TLS handshake failed: {s}", .{diag});
                 return err;
             };
         }
+        return t;
+    }
+
+    /// `reuse`: keep the connection open for the next query (job thread only).
+    fn request(self: *Ch, gpa: Allocator, sql: []const u8, query_id: []const u8, max_rows: usize, max_bytes: usize, record_error: bool, reuse: bool) !Response {
+        const p = self.params;
+        const host = if (p.host.len > 0) p.host else "localhost";
+        const t = (if (reuse) self.takeIdle() else null) orelse try self.open(record_error);
+        var keep_alive_ms: ?i64 = null;
+        defer if (keep_alive_ms) |ms| {
+            self.idle = t;
+            self.idle_since = .now(self.io, .awake);
+            self.idle_limit_ms = ms;
+        } else t.close();
+        errdefer if (record_error and t.read_timed_out) self.err.set(self.gpa, "database response timed out after 300 s", .{});
 
         // Query string: database, output format, id, and a row cap so huge
         // results stop on the server instead of streaming everything.
@@ -184,7 +214,7 @@ const Ch = struct {
         try w.print("POST {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: zpeek\r\n", .{ target.items, host });
         try w.print("X-ClickHouse-User: {s}\r\n", .{if (p.user.len > 0) p.user else "default"});
         if (p.password.len > 0) try w.print("X-ClickHouse-Key: {s}\r\n", .{p.password});
-        try w.print("Content-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{sql.len});
+        try w.print("Content-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n", .{ sql.len, if (reuse) "keep-alive" else "close" });
         try w.writeAll(sql);
         try t.flush();
 
@@ -199,6 +229,8 @@ const Ch = struct {
         resp.status = std.fmt.parseInt(u16, parts.next() orelse "0", 10) catch 0;
         var content_length: ?usize = null;
         var chunked = false;
+        var server_timeout_ms: ?i64 = null;
+        var server_closes = false;
         while (true) {
             const line = std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n");
             if (line.len == 0) break;
@@ -218,6 +250,10 @@ const Ch = struct {
                 const n = @min(value.len, resp.code_buf.len);
                 @memcpy(resp.code_buf[0..n], value[0..n]);
                 resp.code_len = n;
+            } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+                server_closes = std.ascii.findIgnoreCase(value, "close") != null;
+            } else if (std.ascii.eqlIgnoreCase(name, "keep-alive")) {
+                server_timeout_ms = keepAliveTimeoutMs(value);
             } else if (std.ascii.eqlIgnoreCase(name, "x-clickhouse-summary")) {
                 resp.written_rows = summaryNumber(value, "written_rows");
             }
@@ -228,7 +264,12 @@ const Ch = struct {
                 const size_line = std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n");
                 const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
                 const size = std.fmt.parseInt(usize, size_line[0..semi], 16) catch return error.ProtocolError;
-                if (size == 0) break;
+                if (size == 0) {
+                    // Trailers end with an empty line; it must be consumed or the
+                    // next response on a kept-alive connection starts misaligned.
+                    while (std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n").len != 0) {}
+                    break;
+                }
                 const start = resp.body.items.len;
                 if (size > max_bytes -| start) return error.ResponseTooLarge;
                 try resp.body.resize(gpa, start + size);
@@ -249,6 +290,8 @@ const Ch = struct {
                 try resp.body.appendSlice(gpa, buf[0..n]);
             }
         }
+        // A fully read, length-delimited response leaves the connection reusable.
+        if (reuse and !server_closes and (chunked or content_length != null)) keep_alive_ms = server_timeout_ms;
         return resp;
     }
 
@@ -261,7 +304,7 @@ const Ch = struct {
         var id_buf: [16]u8 = undefined;
         self.io.random(&id_buf);
         const id = std.fmt.bytesToHex(id_buf, .lower);
-        var resp = self.request(self.gpa, sql, &id, std.math.maxInt(usize), 16 * 1024 * 1024, false) catch return;
+        var resp = self.request(self.gpa, sql, &id, std.math.maxInt(usize), 16 * 1024 * 1024, false, false) catch return;
         resp.deinit(self.gpa);
     }
 
@@ -272,12 +315,25 @@ const Ch = struct {
 
     fn close(ptr: *anyopaque) void {
         const self: *Ch = @ptrCast(@alignCast(ptr));
+        if (self.idle) |t| t.close();
         self.err.deinit(self.gpa);
         if (self.server_version.len > 0) self.gpa.free(self.server_version);
         self.params_arena.deinit();
         self.gpa.destroy(self);
     }
 };
+
+/// `timeout=10, max=9999` -> 10000 ms; null when absent.
+fn keepAliveTimeoutMs(value: []const u8) ?i64 {
+    var it = std.mem.tokenizeAny(u8, value, ", ");
+    while (it.next()) |part| {
+        if (std.mem.startsWith(u8, part, "timeout=")) {
+            const seconds = std.fmt.parseInt(i64, part["timeout=".len..], 10) catch return null;
+            return seconds * 1000;
+        }
+    }
+    return null;
+}
 
 /// Reads a number from X-ClickHouse-Summary, e.g. {"written_rows":"3",...}.
 fn summaryNumber(summary: []const u8, key: []const u8) ?u64 {
@@ -366,6 +422,12 @@ test "tsv unescape" {
     try testing.expect((try unescape(a, "\\N")) == null);
     try testing.expectEqualStrings("a\tb\nc\\", (try unescape(a, "a\\tb\\nc\\\\")).?);
     try testing.expectEqualStrings("it's", (try unescape(a, "it\\'s")).?);
+}
+
+test "keep-alive timeout" {
+    try testing.expectEqual(@as(?i64, 10_000), keepAliveTimeoutMs("timeout=10, max=9999"));
+    try testing.expectEqual(@as(?i64, 3_000), keepAliveTimeoutMs("timeout=3"));
+    try testing.expectEqual(@as(?i64, null), keepAliveTimeoutMs("max=5"));
 }
 
 test "summary" {

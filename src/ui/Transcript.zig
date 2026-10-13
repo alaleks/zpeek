@@ -24,6 +24,8 @@ pub const Content = union(enum) {
         elapsed_ms: i64,
         /// Optional heading, e.g. "Tables" or the statement for multi-statement runs.
         title: ?[]const u8 = null,
+        /// Row count before `compact` dropped the rows the feed never shows.
+        total_rows: ?usize = null,
     },
     message: struct { kind: MessageKind, text: []const u8 },
     /// SQL source shown with highlighting (function/view definitions).
@@ -123,6 +125,99 @@ pub fn add(t: *Transcript, content: Content) Allocator.Error!void {
     t.retained_bytes +|= e.retained_bytes;
     t.scroll = 0;
     t.layout_dirty = true;
+}
+
+/// Older results keep only the rows the feed shows: ctrl+o opens just the
+/// newest one. Like `prune`, call only when no table view borrows a result.
+pub fn compact(t: *Transcript) Allocator.Error!void {
+    const newest = t.lastResult();
+    for (t.entries.items) |e| {
+        if (e.content != .result) continue;
+        const r = &e.content.result.result;
+        if (r == newest or r.rows.len <= inline_rows) continue;
+        try t.compactEntry(e);
+    }
+}
+
+fn compactEntry(t: *Transcript, e: *Entry) Allocator.Error!void {
+    const old = &e.content.result.result;
+    var arena: std.heap.ArenaAllocator = .init(t.gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    // Everything is copied before `arena` is moved into the new Result.
+    const columns = try a.alloc([]const u8, old.columns.len);
+    for (columns, old.columns) |*dst, src| dst.* = try a.dupe(u8, src);
+    const boolean_columns = try a.dupe(bool, old.boolean_columns);
+    const status = try a.dupe(u8, old.status);
+    var bytes: usize = 0;
+    const rows = try a.alloc([]const ?[]const u8, inline_rows);
+    for (rows, old.rows[0..inline_rows]) |*dst, row| {
+        const cells = try a.alloc(?[]const u8, row.len);
+        for (cells, row) |*cell, value| {
+            cell.* = if (value) |v| try a.dupe(u8, v) else null;
+            bytes += if (value) |v| v.len else 0;
+        }
+        bytes += cells.len * @sizeOf(?[]const u8);
+        dst.* = cells;
+    }
+    const total = old.rows.len;
+    var dropped = old.*;
+    old.* = .{
+        .arena = arena,
+        .columns = columns,
+        .boolean_columns = boolean_columns,
+        .rows = rows,
+        .affected_rows = dropped.affected_rows,
+        .status = status,
+        .truncated = dropped.truncated,
+        .retained_bytes = bytes,
+    };
+    dropped.deinit();
+    e.content.result.total_rows = total;
+    // The cached layout pointed into the dropped arena.
+    _ = e.layout_arena.reset(.retain_capacity);
+    e.layout = &.{};
+    e.layout_width = 0;
+    t.retained_bytes -|= e.retained_bytes;
+    e.retained_bytes = bytes;
+    t.retained_bytes +|= bytes;
+    t.layout_dirty = true;
+}
+
+test "compact keeps shown rows of older results only" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .init(gpa);
+    defer transcript.deinit();
+    for (0..2) |_| {
+        var b = db.ResultBuilder.init(gpa);
+        errdefer b.deinit();
+        try b.setColumns(try b.allocator().dupe([]const u8, &.{ "id", "name" }));
+        for (0..inline_rows + 30) |i| {
+            const row = try b.allocator().alloc(?[]const u8, 2);
+            row[0] = try std.fmt.allocPrint(b.allocator(), "{d}", .{i});
+            row[1] = if (i % 2 == 0) null else "x";
+            try b.addRow(row, .{});
+        }
+        b.result.status = "80 rows";
+        try transcript.add(.{ .result = .{ .result = b.finish(), .elapsed_ms = 1 } });
+    }
+    try transcript.compact();
+    const older = transcript.entries.items[0].content.result;
+    try std.testing.expectEqual(@as(usize, inline_rows), older.result.rows.len);
+    try std.testing.expectEqual(@as(?usize, inline_rows + 30), older.total_rows);
+    try std.testing.expectEqualStrings("49", older.result.rows[49][0].?);
+    try std.testing.expect(older.result.rows[0][1] == null);
+    try std.testing.expectEqualStrings("80 rows", older.result.status);
+    // The newest result stays complete for ctrl+o.
+    try std.testing.expectEqual(@as(usize, inline_rows + 30), transcript.lastResult().?.rows.len);
+    // Layout still renders "showing 50 of 80".
+    try ensureLayout(transcript.entries.items[0], 100);
+    const status_line = transcript.entries.items[0].layout[transcript.entries.items[0].layout.len - 1];
+    var found = false;
+    for (status_line) |seg| {
+        if (std.mem.indexOf(u8, seg.text, "showing 50 of 80 rows") != null) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 /// Drops old entries after the App has released any borrowed table result.
@@ -262,7 +357,7 @@ fn ensureLayout(e: *Entry, width: u16) Allocator.Error!void {
         .lines => |ls| {
             for (ls) |line| try lines.append(a, line);
         },
-        .result => |r| try layoutResult(a, &lines, r.result, r.elapsed_ms, r.title, width),
+        .result => |r| try layoutResult(a, &lines, r.result, r.total_rows orelse r.result.rows.len, r.elapsed_ms, r.title, width),
     }
     e.layout = lines.items;
     e.layout_width = width;
@@ -331,6 +426,7 @@ fn layoutResult(
     a: Allocator,
     out: *std.ArrayList(Line),
     r: db.Result,
+    total_rows: usize,
     elapsed_ms: i64,
     title: ?[]const u8,
     width: u16,
@@ -405,10 +501,10 @@ fn layoutResult(
     var status: std.ArrayList(u8) = .empty;
     try status.print(a, "{s} · {d} ms", .{ r.status, elapsed_ms });
     if (r.truncated) try status.appendSlice(a, " · row limit reached");
-    if (shown_rows < r.rows.len or hidden > 0) {
+    if (shown_rows < total_rows or hidden > 0) {
         try status.appendSlice(a, " · ");
-        if (shown_rows < r.rows.len) try status.print(a, "showing {d} of {d} rows", .{ shown_rows, r.rows.len });
-        if (shown_rows < r.rows.len and hidden > 0) try status.appendSlice(a, ", ");
+        if (shown_rows < total_rows) try status.print(a, "showing {d} of {d} rows", .{ shown_rows, total_rows });
+        if (shown_rows < total_rows and hidden > 0) try status.appendSlice(a, ", ");
         if (hidden > 0) try status.print(a, "{d} column{s} hidden", .{ hidden, if (hidden == 1) "" else "s" });
         try status.appendSlice(a, " — ctrl+o to open");
     }

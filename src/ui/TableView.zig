@@ -203,7 +203,8 @@ pub fn setResult(tv: *TableView, result: *db.Result) Allocator.Error!void {
     tv.row = 0;
     tv.top = 0;
     // A page reload keeps the same columns, so hidden columns stay hidden;
-    // rebuild() resets them only if the column count changed.
+    // computeWidths() resets them only if the column count changed.
+    try tv.computeWidths();
     try tv.rebuild();
     tv.col = @min(tv.col, tv.visible.items.len -| 1);
     if (tv.left > tv.col) tv.left = tv.col;
@@ -230,6 +231,15 @@ fn rebuild(tv: *TableView) Allocator.Error!void {
         std.sort.block(usize, tv.view.items, Ctx{ .rows = r.rows, .col = s.col, .desc = s.desc }, Ctx.lessThan);
     }
 
+    // Widths depend only on the data, not on filter/sort: computed in computeWidths.
+    if (tv.widths.items.len != r.columns.len) try tv.computeWidths();
+    try tv.rebuildVisible();
+    tv.row = @min(tv.row, tv.view.items.len -| 1);
+}
+
+/// Column widths for the current result; call when the result changes.
+fn computeWidths(tv: *TableView) Allocator.Error!void {
+    const r = tv.result;
     tv.widths.clearRetainingCapacity();
     for (r.columns, 0..) |name, ci| {
         // Values are capped at 50 columns; the name (plus room for a sort
@@ -248,8 +258,6 @@ fn rebuild(tv: *TableView) Allocator.Error!void {
         try tv.hidden.resize(tv.gpa, r.columns.len);
         @memset(tv.hidden.items, false);
     }
-    try tv.rebuildVisible();
-    tv.row = @min(tv.row, tv.view.items.len -| 1);
 }
 
 fn rebuildVisible(tv: *TableView) Allocator.Error!void {
