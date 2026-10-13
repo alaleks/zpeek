@@ -237,7 +237,7 @@ fn rebuild(tv: *TableView) Allocator.Error!void {
         const name_w = render.displayWidth(name) + 4;
         var data_w: usize = 4;
         for (r.rows) |row| {
-            const v = row[ci] orelse render.null_text;
+            const v = if (tv.browse != null) displayValue(r, ci, row[ci]) else row[ci] orelse render.null_text;
             data_w = @max(data_w, cellWidth(v));
             if (data_w >= 50) break;
         }
@@ -265,6 +265,14 @@ fn rebuildVisible(tv: *TableView) Allocator.Error!void {
 fn curCol(tv: *const TableView) usize {
     if (tv.visible.items.len == 0) return 0;
     return tv.visible.items[tv.col];
+}
+
+fn isForeignKeyColumn(tv: *const TableView, ci: usize) bool {
+    if (tv.browse == null) return false;
+    for (tv.foreign_keys.items) |fk| {
+        if (std.mem.eql(u8, fk.source, tv.result.columns[ci])) return true;
+    }
+    return false;
 }
 
 fn hiddenCount(tv: *const TableView) usize {
@@ -334,6 +342,53 @@ fn compareValues(a: ?[]const u8, b: ?[]const u8) std.math.Order {
     const fy = std.fmt.parseFloat(f64, y) catch null;
     if (fx != null and fy != null) return std.math.order(fx.?, fy.?);
     return std.mem.order(u8, x, y);
+}
+
+fn isNumberText(value: []const u8) bool {
+    // shortcut: values over 64 bytes stay plain, expand this if wide numeric values need coloring.
+    if (value.len == 0 or value.len > 64) return false;
+    var i: usize = 0;
+    if (value[i] == '+' or value[i] == '-') i += 1;
+    var digits: usize = 0;
+    while (i < value.len and std.ascii.isDigit(value[i])) : (i += 1) digits += 1;
+    if (i < value.len and value[i] == '.') {
+        i += 1;
+        while (i < value.len and std.ascii.isDigit(value[i])) : (i += 1) digits += 1;
+    }
+    if (digits == 0) return false;
+    if (i < value.len and (value[i] == 'e' or value[i] == 'E')) {
+        i += 1;
+        if (i < value.len and (value[i] == '+' or value[i] == '-')) i += 1;
+        const exponent_start = i;
+        while (i < value.len and std.ascii.isDigit(value[i])) : (i += 1) {}
+        if (i == exponent_start) return false;
+    }
+    return i == value.len;
+}
+
+fn browseCellStyle(value: ?[]const u8, typed_boolean: bool, foreign_key: bool, selected: bool) vaxis.Style {
+    if (selected) return theme.selected_cell;
+    const text = value orelse return theme.null_value;
+    if (foreign_key) return .{ .fg = theme.accent };
+    if ((typed_boolean and (std.mem.eql(u8, text, "t") or std.mem.eql(u8, text, "f"))) or
+        std.ascii.eqlIgnoreCase(text, "true") or std.ascii.eqlIgnoreCase(text, "false")) return theme.boolean_value;
+    if (isNumberText(text)) return theme.number_value;
+    return .{};
+}
+
+test "browse value colors are allocation-free and preserve selection contrast" {
+    const testing = std.testing;
+    try testing.expectEqual(theme.null_value, browseCellStyle(null, false, false, false));
+    try testing.expectEqual(theme.boolean_value, browseCellStyle("f", true, false, false));
+    try testing.expectEqual(theme.boolean_value, browseCellStyle("TRUE", false, false, false));
+    try testing.expectEqual(theme.number_value, browseCellStyle("-12.5e+3", false, false, false));
+    try testing.expectEqual(vaxis.Style{}, browseCellStyle("12abc", false, false, false));
+    try testing.expectEqual(vaxis.Style{}, browseCellStyle("f", false, false, false));
+    try testing.expectEqual(vaxis.Style{ .fg = theme.accent }, browseCellStyle("123", false, true, false));
+    try testing.expectEqual(theme.selected_cell, browseCellStyle("123", false, true, true));
+    try testing.expect(!isNumberText("1e"));
+    try testing.expect(!isNumberText("."));
+    try testing.expect(!isNumberText("12345678901234567890123456789012345678901234567890123456789012345"));
 }
 
 fn currentValue(tv: *const TableView) ?[]const u8 {
@@ -1042,12 +1097,7 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
                 if (tv.local_sort) |s| if (s.col == ci) break :blk if (s.desc) " ↓" else " ↑";
                 break :blk "";
             };
-            if (tv.browse != null) for (tv.foreign_keys.items) |fk| {
-                if (std.mem.eql(u8, fk.source, name)) {
-                    name = try std.mem.concat(a, u8, &.{ name, " ↗" });
-                    break;
-                }
-            };
+            if (tv.isForeignKeyColumn(ci)) name = try std.mem.concat(a, u8, &.{ name, " ↗" });
             if (marker.len > 0) name = try std.mem.concat(a, u8, &.{ name, marker });
             const style: vaxis.Style = if (ci == cur_col) .{ .fg = theme.accent } else theme.header;
             drawCell(grid, col_x, 0, w, name, style);
@@ -1074,16 +1124,13 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
         for (vis[tv.left..last_col], tv.left..) |ci, pos| {
             const w = tv.widths.items[ci];
             const v = row[ci];
-            const text = try render.singleLine(a, v orelse render.null_text);
-            var style: vaxis.Style = if (v == null) theme.null_value else .{};
-            if (v != null and tv.browse != null) for (tv.foreign_keys.items) |fk| {
-                if (std.mem.eql(u8, fk.source, r.columns[ci])) {
-                    style.fg = theme.accent;
-                    break;
-                }
-            };
-            if (is_cur_row) style.bg = .{ .index = 8 };
-            if (is_cur_row and ci == cur_col) style = theme.selected_cell;
+            const text = try render.singleLine(a, if (tv.browse != null) displayValue(r, ci, v) else v orelse render.null_text);
+            const selected = is_cur_row and ci == cur_col;
+            var style: vaxis.Style = if (tv.browse != null)
+                browseCellStyle(v, ci < r.boolean_columns.len and r.boolean_columns[ci], tv.isForeignKeyColumn(ci), selected)
+            else if (v == null) theme.null_value else .{};
+            if (is_cur_row and !selected) style.bg = .{ .index = 8 };
+            if (tv.browse == null and selected) style = theme.selected_cell;
             // fill the padding around the cell for the current row
             if (is_cur_row) fillRow(grid, col_x, y, w + 2, style);
             drawCell(grid, col_x, y, w, text, style);
@@ -1171,13 +1218,13 @@ fn drawForeignPreview(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator
         drawCell(box, 0, y, field_w, name, theme.header);
         const column = tv.fk_scroll + i;
         const value = result.rows[0][column];
-        const label = try render.singleLine(a, foreignPreviewValue(result, column));
+        const label = try render.singleLine(a, displayValue(result, column, value));
         drawCell(box, field_w + 2, y, value_w, label, if (value == null) theme.null_value else .{});
     }
 }
 
-fn foreignPreviewValue(result: *const db.Result, column: usize) []const u8 {
-    const value = result.rows[0][column] orelse return render.null_text;
+fn displayValue(result: *const db.Result, column: usize, raw: ?[]const u8) []const u8 {
+    const value = raw orelse return render.null_text;
     if (column < result.boolean_columns.len and result.boolean_columns[column]) {
         if (std.mem.eql(u8, value, "t")) return "true";
         if (std.mem.eql(u8, value, "f")) return "false";
@@ -1185,17 +1232,30 @@ fn foreignPreviewValue(result: *const db.Result, column: usize) []const u8 {
     return value;
 }
 
-test "foreign key preview expands only typed boolean values" {
+test "typed boolean values display fully in browse and FK preview" {
     var result: db.Result = .{
         .arena = .init(std.testing.allocator),
         .boolean_columns = &.{ true, true, false, true },
         .rows = &.{&.{ "t", "f", "f", null }},
     };
     defer result.deinit();
-    try std.testing.expectEqualStrings("true", foreignPreviewValue(&result, 0));
-    try std.testing.expectEqualStrings("false", foreignPreviewValue(&result, 1));
-    try std.testing.expectEqualStrings("f", foreignPreviewValue(&result, 2));
-    try std.testing.expectEqualStrings(render.null_text, foreignPreviewValue(&result, 3));
+    try std.testing.expectEqualStrings("true", displayValue(&result, 0, result.rows[0][0]));
+    try std.testing.expectEqualStrings("false", displayValue(&result, 1, result.rows[0][1]));
+    try std.testing.expectEqualStrings("f", displayValue(&result, 2, result.rows[0][2]));
+    try std.testing.expectEqualStrings(render.null_text, displayValue(&result, 3, result.rows[0][3]));
+}
+
+test "browse column fits full boolean value" {
+    var result: db.Result = .{
+        .arena = .init(std.testing.allocator),
+        .columns = &.{""},
+        .boolean_columns = &.{true},
+        .rows = &.{&.{"f"}},
+    };
+    defer result.deinit();
+    const tv = try TableView.init(std.testing.allocator, &result, false, "x", .{ .table = "x" }, "", null);
+    defer tv.deinit();
+    try std.testing.expect(tv.widths.items[0] >= "false".len);
 }
 
 fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) Allocator.Error!void {
@@ -1263,7 +1323,7 @@ fn drawDetail(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!v
     const w: u16 = @min(win.width -| 4, 100);
     var lines: std.ArrayList(Transcript.Line) = .empty;
     const segs: []const Segment = if (value) |v|
-        &.{.{ .text = v }}
+        &.{.{ .text = if (tv.browse != null) displayValue(tv.result, tv.curCol(), v) else v }}
     else
         &.{.{ .text = "NULL", .style = theme.null_value }};
     try Transcript.wrapWithPrefix(a, &lines, segs, w -| 2, .{ .text = "" }, "");

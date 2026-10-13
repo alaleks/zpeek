@@ -31,6 +31,8 @@ pub const info: Style = .{ .fg = info_color };
 pub const border: Style = .{ .fg = muted_color };
 pub const border_focus: Style = .{ .fg = accent };
 pub const null_value: Style = .{ .fg = muted_color, .italic = true };
+pub const boolean_value: Style = .{ .fg = .{ .index = 6 } };
+pub const number_value: Style = .{ .fg = number_color };
 /// Column names: regular weight, color only.
 pub const header: Style = .{ .fg = info_color };
 pub const selected: Style = .{ .reverse = true };

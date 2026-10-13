@@ -65,7 +65,7 @@ The [recording script](examples/demo.tape) shows `/tables`, a SQL query, and `/b
 
 In a picker, type to filter and press `enter` to open the selected item. SQL completion knows your database dialect and schema; `tab` accepts a suggestion. Use `ctrl+o` to open the last result as a table, `ctrl+c` to cancel a running query, and `ctrl+d` on an empty prompt to exit.
 
-**Inside `/browse`:** FK columns are marked `↗`; select a cell and press `f` to preview its referenced row below the table (`J`/`K` scroll its fields). `/` filters with a SQL `WHERE` condition, `t` counts matching rows, `s` sorts the selected column, `n`/`p` change pages, and `enter` shows a full cell value. Use `c` to choose columns, `y`/`Y` to copy a cell/row, and `q` or `esc` to return. `d` shows a row deletion for confirmation; it requires a primary key and is unavailable for ClickHouse. zpeek refuses `DELETE` without `WHERE`.
+**Inside `/browse`:** `NULL`, booleans, numbers, and FK values have distinct colors; the selected cell keeps a high-contrast style. FK columns are marked `↗`; select a cell and press `f` to preview its referenced row below the table (`J`/`K` scroll its fields). `/` filters with a SQL `WHERE` condition, `t` counts matching rows, `s` sorts the selected column, `n`/`p` change pages, and `enter` shows a full cell value. Use `c` to choose columns, `y`/`Y` to copy a cell/row, and `q` or `esc` to return. `d` shows a row deletion for confirmation; it requires a primary key and is unavailable for ClickHouse. zpeek refuses `DELETE` without `WHERE`.
 
 ## Connections and limits
 
