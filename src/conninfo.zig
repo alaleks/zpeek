@@ -92,6 +92,8 @@ pub const Params = struct {
     /// Database name, or the file path for SQLite.
     database: []const u8 = "",
     ssl: SslMode = .prefer,
+    /// Only reading statements run; the session is read-only on the server too.
+    read_only: bool = false,
 
     pub fn effectivePort(p: Params) u16 {
         return if (p.port != 0) p.port else p.kind.defaultPort();

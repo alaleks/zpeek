@@ -6,6 +6,7 @@
 //! [connections.local]
 //! url = "postgres://me@localhost/app"
 //! color = "#2F6B43"                # optional database badge color
+//! read_only = true                 # optional: only SELECT and other reads
 //!
 //! [connections.shop]
 //! driver = "mysql"                 # postgres | mysql | mariadb | sqlite | clickhouse
@@ -192,6 +193,10 @@ fn entryParams(arena: Allocator, env: *const std.process.Environ.Map, t: *const 
         if (env.get(name)) |pw| params.password = pw;
     }
     if (try getString(t, "database")) |v| params.database = v;
+    if (t.get("read_only")) |v| switch (v) {
+        .boolean => |b| params.read_only = b,
+        else => return error.InvalidField,
+    };
     if (try getString(t, "sslmode")) |v| {
         params.ssl = conninfo.SslMode.fromName(v) orelse return error.InvalidField;
     }
@@ -240,6 +245,7 @@ pub const example =
     \\# [connections.local]
     \\# url = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
     \\# color = "#2F6B43"          # connection name badge background
+    \\# read_only = true            # allow only SELECT and other reads
     \\
     \\# [connections.shop]
     \\# driver = "mysql"            # postgres | mysql | mariadb | sqlite | clickhouse
@@ -277,6 +283,7 @@ test "config entries" {
         \\database = "shop"
         \\[connections.lite]
         \\path = "~/x.db"
+        \\read_only = true
     ;
     var diag: Diagnostic = .{};
     const cfg = try parse(a, &env, "cfg.toml", src, &diag);
@@ -290,6 +297,8 @@ test "config entries" {
     try testing.expectEqualStrings("secret", my.password);
     const sqlite_path = if (@import("builtin").os.tag == .windows) "/home/me\\x.db" else "/home/me/x.db";
     try testing.expectEqualStrings(sqlite_path, cfg.find("lite").?.params.database);
+    try testing.expect(cfg.find("lite").?.params.read_only);
+    try testing.expect(!pg.read_only);
 }
 
 test "config errors" {
@@ -302,4 +311,5 @@ test "config errors" {
     try testing.expect(std.mem.indexOf(u8, diag.message, "connections.x") != null);
     try testing.expectError(error.InvalidConfig, parse(a, &env, "c", "default = \"nope\"\n", &diag));
     try testing.expectError(error.InvalidConfig, parse(a, &env, "c", "[connections.x]\nurl = \"postgres://h/db\"\ncolor = \"green\"\n", &diag));
+    try testing.expectError(error.InvalidConfig, parse(a, &env, "c", "[connections.x]\nurl = \"postgres://h/db\"\nread_only = \"yes\"\n", &diag));
 }

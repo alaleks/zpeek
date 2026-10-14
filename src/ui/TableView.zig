@@ -41,6 +41,8 @@ pub const Browse = struct {
     total: ?u64 = null,
     /// SQL dialect, used to quote completed column names.
     kind: Kind = .postgres,
+    /// The connection refuses writes: row delete is not offered.
+    read_only: bool = false,
 };
 
 pub const Action = union(enum) {
@@ -826,6 +828,7 @@ fn requestDelete(tv: *TableView) Allocator.Error!Action {
     // ClickHouse has no cheap point deletes (mutations rewrite data parts), so
     // deleting single rows from the viewer is not offered.
     if (b.kind == .clickhouse) return .{ .notice = "row delete is not available for ClickHouse" };
+    if (b.read_only) return .{ .notice = "read-only connection — row delete is disabled" };
     if (tv.view.items.len == 0) return .{ .notice = "no row to delete" };
     if (tv.primary_key.items.len == 0) return .{ .notice = "table has no primary key — delete with an SQL statement" };
     const row = tv.result.rows[tv.view.items[tv.row]];
@@ -1321,6 +1324,8 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
             " text · col:text · col=value · enter apply · esc cancel")
     else if (tv.browse) |b| (if (b.kind == .clickhouse)
         " enter cell · / where · t count · s sort · c columns · x hide · n/p page · r/F5 refresh · q back"
+    else if (b.read_only)
+        " enter cell · f follow FK · / where · t count · s sort · c columns · n/p page · q back"
     else
         " enter cell · f follow FK · / where · t count · s sort · c columns · d delete · n/p page · q back") else " enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
     _ = win.print(&.{.{ .text = hint, .style = theme.dim }}, .{ .row_offset = 1, .wrap = .none });

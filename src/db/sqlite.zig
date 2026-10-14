@@ -140,7 +140,7 @@ pub fn connect(gpa: Allocator, params: conninfo.Params, err_out: *db.ErrorText) 
 
     var handle: ?*c.sqlite3 = null;
     // No SQLITE_OPEN_CREATE: a typo in the path should not silently create an empty database.
-    const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_URI;
+    const flags = (if (params.read_only) c.SQLITE_OPEN_READONLY else c.SQLITE_OPEN_READWRITE) | c.SQLITE_OPEN_URI;
     const rc = c.sqlite3_open_v2(path.ptr, &handle, flags, null);
     if (rc != c.SQLITE_OK) {
         if (handle) |h| {
@@ -219,6 +219,18 @@ test "sqlite in-memory round trip" {
 
     try std.testing.expectError(error.QueryFailed, conn.query(gpa, "select * from missing"));
     try std.testing.expect(std.mem.indexOf(u8, conn.lastError(), "missing") != null);
+}
+
+test "read-only sqlite refuses writes" {
+    const gpa = std.testing.allocator;
+    var err: db.ErrorText = .{};
+    defer err.deinit(gpa);
+    const conn = try connect(gpa, .{ .kind = .sqlite, .database = ":memory:", .read_only = true }, &err);
+    defer conn.close();
+    try std.testing.expectError(error.QueryFailed, conn.query(gpa, "create table t(id integer)"));
+    try std.testing.expect(std.mem.indexOf(u8, conn.lastError(), "readonly") != null);
+    var r = try conn.query(gpa, "select 1");
+    r.deinit();
 }
 
 test "schema browsing and selected definitions run on SQLite" {

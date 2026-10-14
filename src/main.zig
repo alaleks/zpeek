@@ -168,10 +168,12 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_fw: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
+    // Streaming, not positional: `>>` and shared redirects must write at the
+    // file's current offset instead of overwriting it from byte 0.
+    var stdout_fw: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buf);
     const stdout = &stdout_fw.interface;
     var stderr_buf: [1024]u8 = undefined;
-    var stderr_fw: Io.File.Writer = .init(.stderr(), io, &stderr_buf);
+    var stderr_fw: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buf);
     const stderr = &stderr_fw.interface;
     defer stdout.flush() catch {};
     defer stderr.flush() catch {};
@@ -258,6 +260,10 @@ fn executeOnce(gpa: Allocator, io: Io, entry: config.Entry, sql: []const u8, std
         .sqlite => .sqlite,
         // Backslash escapes in strings, like MySQL.
         .clickhouse => .mysql,
+    };
+    if (entry.params.read_only) if (@import("sql/lexer.zig").readOnlyViolation(sql, dialect)) |word| {
+        try stderr.print("zpeek: " ++ App.read_only_message ++ "\n", .{word});
+        return 1;
     };
     if (@import("sql/lexer.zig").hasDeleteWithoutWhere(sql, dialect)) {
         try stderr.print("zpeek: {s}\n", .{App.delete_without_where_message});

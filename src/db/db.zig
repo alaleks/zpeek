@@ -193,12 +193,28 @@ fn closeLateConnection(result: anytype) void {
 }
 
 fn connectRaw(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *ErrorText) ConnectError!Connection {
-    return switch (params.kind) {
+    const conn = try switch (params.kind) {
         .sqlite => sqlite.connect(gpa, params, err_out),
         .postgres => postgres.connect(gpa, io, params, err_out),
         .mysql => mysql.connect(gpa, io, params, err_out),
         .clickhouse => clickhouse.connect(gpa, io, params, err_out),
     };
+    // SQLite opens the file read-only and ClickHouse sends readonly=2 with
+    // every request; the network servers get a read-only session.
+    const sql = switch (params.kind) {
+        .postgres => "SET default_transaction_read_only = on",
+        .mysql => "SET SESSION TRANSACTION READ ONLY",
+        .sqlite, .clickhouse => return conn,
+    };
+    if (!params.read_only) return conn;
+    var r = conn.query(gpa, sql) catch |err| {
+        // Fail closed: never hand out a writable session for a read-only entry.
+        err_out.set(gpa, "cannot make the session read-only: {s}", .{conn.lastError()});
+        conn.close();
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.ConnectFailed;
+    };
+    r.deinit();
+    return conn;
 }
 
 test {

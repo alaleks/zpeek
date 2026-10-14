@@ -746,6 +746,10 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
         .notice => |n| tv.notice = n,
         .delete_row => |sql| {
             defer app.gpa.free(sql);
+            if (app.readOnly()) {
+                tv.notice = "read-only connection — row delete is disabled";
+                return;
+            }
             const job = try app.newJob(.browse_delete);
             job.sqls = try job.arena.allocator().dupe([]const u8, &.{try job.arena.allocator().dupe(u8, sql)});
             try app.startJob(job);
@@ -781,6 +785,9 @@ fn submit(app: *App) !void {
         .sqlite => .sqlite,
         // Backslash escapes in strings, like MySQL.
         .clickhouse => .mysql,
+    };
+    if (app.readOnly()) if (lexer.readOnlyViolation(text, dialect)) |word| {
+        return app.transcript.addMessage(.err, read_only_message, .{word});
     };
     if (lexer.hasDeleteWithoutWhere(text, dialect)) {
         return app.transcript.addMessage(.err, "{s}", .{delete_without_where_message});
@@ -840,6 +847,23 @@ fn openQueriesPicker(app: *App) !void {
     for (entries) |e| try items.append(a, .{ .label = e.name, .detail = e.preview });
     app.picker = try Picker.init(app.gpa, .query, "Saved queries", items.items, false);
     app.mode = .picker;
+}
+
+pub const read_only_message = "read-only connection: only reading statements run ('{s}' was refused, nothing was run)";
+
+fn readOnly(app: *const App) bool {
+    return if (app.conn_params) |p| p.read_only else false;
+}
+
+/// A browse filter is user SQL inside `WHERE`; read-only connections refuse writes there too.
+fn filterViolation(app: *App, filter: []const u8) !?[]const u8 {
+    if (!app.readOnly() or filter.len == 0) return null;
+    const dialect: lexer.Dialect = switch (app.conn.?.kind) {
+        .postgres => .postgres,
+        .mysql, .clickhouse => .mysql,
+        .sqlite => .sqlite,
+    };
+    return lexer.readOnlyViolation(try app.tmpPrint("select 1 where {s}", .{filter}), dialect);
 }
 
 pub const delete_without_where_message = "DELETE without WHERE is blocked: nothing was run. Add a WHERE clause (WHERE true deletes every row) or use TRUNCATE.";
@@ -1220,6 +1244,45 @@ test "browse keys after a lost connection do not crash" {
         try std.testing.expect(app.job == null);
         try std.testing.expectEqualStrings("not connected — close with q and use /connect", app.table_view.?.notice.?);
     }
+}
+
+test "read-only connections refuse writes before running them" {
+    const a = std.testing.allocator;
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    // A writable SQLite session: only the client-side check stands in the way.
+    const conn = try @import("../db/sqlite.zig").connect(a, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = undefined,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+        .conn = conn,
+        .conn_name = "test",
+        .conn_params = .{ .kind = .sqlite, .database = ":memory:", .read_only = true },
+    };
+    defer app.deinit();
+    var setup = try conn.query(a, "create table people(id integer primary key); insert into people values (1);");
+    setup.deinit();
+
+    for ([_][]const u8{ "delete from people where id = 1", "select 1; insert into people values (2)", "with x as (select 1) update people set id = 3" }) |sql| {
+        try app.editor.setText(sql);
+        try app.submit();
+        try std.testing.expect(app.job == null);
+        const last = app.transcript.entries.items[app.transcript.entries.items.len - 1].content;
+        try std.testing.expect(last == .message and last.message.kind == .err);
+        try std.testing.expect(std.mem.startsWith(u8, last.message.text, "read-only connection"));
+    }
+    try app.startBrowse("people", "id = 1; delete from people");
+    try std.testing.expect(app.job == null);
+    var left = try conn.query(a, "select count(*) from people");
+    defer left.deinit();
+    try std.testing.expectEqualStrings("1", left.rows[0][0].?);
 }
 
 test "query jobs honor cancellation and stop after connection loss" {
@@ -1865,6 +1928,7 @@ test "choosing a table opens its SQLite browse view" {
 }
 
 fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
+    if (try app.filterViolation(filter)) |word| return app.transcript.addMessage(.err, read_only_message, .{word});
     const job = try app.newJob(.{ .browse_open = undefined });
     const a = job.arena.allocator();
     const kind = app.conn.?.kind;
@@ -1878,6 +1942,7 @@ fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
         .database_color = app.conn_color,
         .filter = try a.dupe(u8, filter),
         .kind = kind,
+        .read_only = params.read_only,
     };
     job.kind = .{ .browse_open = b };
     job.sqls = try a.dupe([]const u8, &.{
@@ -1907,6 +1972,10 @@ test "database label follows driver defaults" {
 fn startBrowseReload(app: *App) !void {
     const tv = app.table_view orelse return;
     const b = tv.browse orelse return;
+    if (try app.filterViolation(b.filter) != null) {
+        tv.notice = "read-only connection — the filter may only read";
+        return;
+    }
     const job = try app.newJob(.browse_reload);
     const a = job.arena.allocator();
     const kind = app.conn.?.kind;
@@ -1917,6 +1986,10 @@ fn startBrowseReload(app: *App) !void {
 fn startBrowseCount(app: *App) !void {
     const tv = app.table_view orelse return;
     const b = tv.browse orelse return;
+    if (try app.filterViolation(b.filter) != null) {
+        tv.notice = "read-only connection — the filter may only read";
+        return;
+    }
     const job = try app.newJob(.browse_count);
     const a = job.arena.allocator();
     job.sqls = try a.dupe([]const u8, &.{try schema.countSql(a, b.kind, b.table, b.filter)});
@@ -2139,6 +2212,7 @@ fn drawFooter(app: *App, a: Allocator, win: vaxis.Window) !void {
         }
         try left.append(a, .{ .text = try std.fmt.allocPrint(a, "  {s} {s}", .{ c.kind.label(), c.server_version }), .style = theme.dim });
         if (!std.mem.eql(u8, desc, app.conn_name)) try left.append(a, .{ .text = try std.fmt.allocPrint(a, " · {s}", .{desc}), .style = theme.dim });
+        if (app.readOnly()) try left.append(a, .{ .text = " · read-only", .style = theme.warn });
     } else {
         try left.append(a, .{ .text = "  ○ not connected", .style = theme.dim });
     }

@@ -202,6 +202,8 @@ const Ch = struct {
         defer target.deinit(gpa);
         try target.appendSlice(gpa, "/?default_format=TabSeparatedWithNames&wait_end_of_query=1&query_id=");
         try target.appendSlice(gpa, query_id);
+        // readonly=2 forbids writes but still lets zpeek set the row cap below.
+        if (p.read_only) try target.appendSlice(gpa, "&readonly=2");
         if (max_rows != std.math.maxInt(usize)) {
             try target.print(gpa, "&max_result_rows={d}&result_overflow_mode=break", .{max_rows + 1});
         }

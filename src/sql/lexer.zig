@@ -292,6 +292,77 @@ test "delete without where" {
     try std.testing.expect(!hasDeleteWithoutWhere("create trigger x after insert on t begin delete from y where 1; end", .sqlite));
 }
 
+/// Statements a read-only connection may start with.
+const read_statements = [_][]const u8{ "select", "with", "show", "explain", "describe", "desc", "values", "table", "pragma", "exists" };
+/// Words that write when nested: `WITH … DELETE`, `SELECT … INTO`, `EXPLAIN ANALYZE INSERT`,
+/// `SELECT … FOR UPDATE`; `set_config` could turn PostgreSQL's read-only session off.
+const write_words = [_][]const u8{ "insert", "update", "delete", "merge", "into", "create", "drop", "alter", "truncate", "grant", "revoke", "set_config" };
+
+/// For read-only connections: the first word that may change the database,
+/// or null when every statement only reads. The server enforces read-only
+/// too; this check gives a clear message before anything is sent.
+pub fn readOnlyViolation(src: []const u8, dialect: Dialect) ?[]const u8 {
+    var it: Iterator = .initDialect(src, dialect);
+    var depth: usize = 0;
+    var at_start = true;
+    while (it.next()) |t| {
+        switch (t.tag) {
+            .whitespace, .comment => {},
+            .punctuation => switch (src[t.start]) {
+                '(' => depth += 1,
+                ')' => depth -|= 1,
+                ';' => if (depth == 0) {
+                    at_start = true;
+                },
+                else => if (at_start) return t.text(src),
+            },
+            .keyword, .identifier, .builtin => {
+                const w = t.text(src);
+                if (at_start) {
+                    at_start = false;
+                    if (!inList(&read_statements, w)) return w;
+                } else if (inList(&write_words, w)) return w;
+            },
+            else => if (at_start) return t.text(src),
+        }
+    }
+    return null;
+}
+
+test "read-only violation" {
+    const ok = [_][]const u8{
+        "select * from users",
+        "SELECT 1; select 2;",
+        "(select 1) union (select 2)",
+        "with a as (select 1) select * from a",
+        "-- note\nselect replace(name, 'a', 'b') from t",
+        "select 'delete from t', \"update\" from t",
+        "show tables",
+        "explain select 1",
+        "pragma table_info(t)",
+        "  ",
+    };
+    for (ok) |sql| try std.testing.expectEqual(@as(?[]const u8, null), readOnlyViolation(sql, .postgres));
+    const bad = [_]struct { []const u8, []const u8 }{
+        .{ "delete from t where id = 1", "delete" },
+        .{ "INSERT INTO t values (1)", "INSERT" },
+        .{ "update t set a = 1", "update" },
+        .{ "select 1; drop table t", "drop" },
+        .{ "with d as (delete from t returning *) select * from d", "delete" },
+        .{ "select * into t2 from t", "into" },
+        .{ "explain analyze insert into t values (1)", "insert" },
+        .{ "select * from t for update", "update" },
+        .{ "select set_config('default_transaction_read_only', 'off', false)", "set_config" },
+        .{ "set default_transaction_read_only = off", "set" },
+        .{ "begin", "begin" },
+        .{ "replace into t values (1)", "replace" },
+        .{ "vacuum", "vacuum" },
+        .{ "copy t to '/tmp/x'", "copy" },
+        .{ "'x'", "'x'" },
+    };
+    for (bad) |c| try std.testing.expectEqualStrings(c[1], readOnlyViolation(c[0], .postgres).?);
+}
+
 /// Splits a script into statements at top-level semicolons (ignoring those in
 /// strings, comments and dollar quotes). Empty statements are skipped.
 pub fn splitStatements(src: []const u8, dialect: Dialect, out: *std.ArrayList([]const u8), gpa: std.mem.Allocator) !void {

@@ -65,7 +65,7 @@ The [recording script](examples/demo.tape) shows `/tables`, a SQL query, and `/b
 
 In a picker, type to filter and press `enter` to open the selected item. SQL completion knows your database dialect and schema; `tab` accepts a suggestion. Use `ctrl+o` to open the last result as a table, `ctrl+c` to cancel a running query, and `ctrl+d` on an empty prompt to exit.
 
-**Inside `/browse`:** `NULL`, booleans, numbers, and FK values have distinct colors; the selected cell keeps a high-contrast style. FK columns are marked `↗`; select a cell and press `f` to preview its referenced row below the table (`J`/`K` scroll its fields). `/` filters with a SQL `WHERE` condition, `t` counts matching rows, `s` sorts the selected column, `n`/`p` change pages, and `enter` shows a full cell value. Use `c` to choose columns, `y`/`Y` to copy a cell/row, and `q` or `esc` to return. `d` shows a row deletion for confirmation; it requires a primary key and is unavailable for ClickHouse. zpeek refuses `DELETE` without `WHERE`.
+**Inside `/browse`:** `NULL`, booleans, numbers, and FK values have distinct colors; the selected cell keeps a high-contrast style. FK columns are marked `↗`; select a cell and press `f` to preview its referenced row below the table (`J`/`K` scroll its fields). `/` filters with a SQL `WHERE` condition, `t` counts matching rows, `s` sorts the selected column, `n`/`p` change pages, and `enter` shows a full cell value. Use `c` to choose columns, `y`/`Y` to copy a cell/row, and `q` or `esc` to return. `d` shows a row deletion for confirmation; it requires a primary key and is unavailable for ClickHouse and read-only connections. zpeek refuses `DELETE` without `WHERE`.
 
 ## Connections and limits
 
@@ -86,7 +86,10 @@ host = "127.0.0.1"
 user = "root"
 password_env = "SHOP_DB_PASSWORD"
 database = "shop"
+read_only = true
 ```
+
+`read_only = true` allows only reading statements such as `SELECT`, `WITH`, `SHOW`, and `EXPLAIN`. zpeek refuses anything that changes data or schema before it reaches the server, and `/browse` does not offer row deletion. The session is read-only on the server too: PostgreSQL and MySQL get a read-only session, SQLite opens the file read-only, and ClickHouse runs every query with `readonly=2`. If the server rejects the read-only setting, the connection fails instead of opening writable. For hard guarantees, also use a database user without write privileges.
 
 Results in the console show 50 rows; `ctrl+o` opens the full result. Ad-hoc queries retain up to 10,000 rows and 16 MiB of row data.
 
