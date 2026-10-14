@@ -9,6 +9,7 @@ const Io = std.Io;
 const db = @import("db.zig");
 const conninfo = @import("../conninfo.zig");
 const Transport = @import("net.zig").Transport;
+const lexer = @import("../sql/lexer.zig");
 
 /// ClickHouse error code for a query stopped by KILL QUERY.
 const query_was_cancelled = "394";
@@ -59,8 +60,20 @@ const Ch = struct {
         var b: db.ResultBuilder = .init(gpa);
         errdefer b.deinit();
         const a = b.allocator();
-        const resp = self.request(a, sql, &id, opts.max_rows, opts.max_bytes, true, true) catch |err| switch (err) {
+        const resp = self.request(a, sql, &id, opts.max_rows, opts.max_bytes, true, true) catch |first| retry: {
+            // The server closed the kept-alive connection before answering (e.g.
+            // it restarted). Replay reads on a fresh connection; never writes,
+            // in case the server ran them before closing.
+            if (first == error.StaleConnection and lexer.readOnlyViolation(sql, .mysql) == null) {
+                break :retry self.request(a, sql, &id, opts.max_rows, opts.max_bytes, true, true);
+            }
+            break :retry first;
+        } catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.StaleConnection => {
+                self.err.set(self.gpa, "ClickHouse closed the idle connection; check whether the statement ran before repeating it", .{});
+                return error.ConnectionLost;
+            },
             error.ConnectFailed => return error.ConnectionLost,
             error.ResponseTooLarge => {
                 self.err.set(self.gpa, "ClickHouse response exceeds {d} bytes", .{opts.max_bytes});
@@ -183,11 +196,25 @@ const Ch = struct {
         return t;
     }
 
+    /// Writes the request and returns the response status line.
+    fn sendHead(self: *Ch, t: *Transport, target: []const u8, host: []const u8, sql: []const u8, reuse: bool) ![]u8 {
+        const p = self.params;
+        const w = t.writer();
+        try w.print("POST {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: zpeek\r\n", .{ target, host });
+        try w.print("X-ClickHouse-User: {s}\r\n", .{if (p.user.len > 0) p.user else "default"});
+        if (p.password.len > 0) try w.print("X-ClickHouse-Key: {s}\r\n", .{p.password});
+        try w.print("Content-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n", .{ sql.len, if (reuse) "keep-alive" else "close" });
+        try w.writeAll(sql);
+        try t.flush();
+        return t.reader().takeDelimiterInclusive('\n');
+    }
+
     /// `reuse`: keep the connection open for the next query (job thread only).
     fn request(self: *Ch, gpa: Allocator, sql: []const u8, query_id: []const u8, max_rows: usize, max_bytes: usize, record_error: bool, reuse: bool) !Response {
         const p = self.params;
         const host = if (p.host.len > 0) p.host else "localhost";
-        const t = (if (reuse) self.takeIdle() else null) orelse try self.open(record_error);
+        const reused = if (reuse) self.takeIdle() else null;
+        const t = reused orelse try self.open(record_error);
         var keep_alive_ms: ?i64 = null;
         defer if (keep_alive_ms) |ms| {
             self.idle = t;
@@ -212,20 +239,18 @@ const Ch = struct {
             try percentEncode(gpa, &target, p.database);
         }
 
-        const w = t.writer();
-        try w.print("POST {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: zpeek\r\n", .{ target.items, host });
-        try w.print("X-ClickHouse-User: {s}\r\n", .{if (p.user.len > 0) p.user else "default"});
-        if (p.password.len > 0) try w.print("X-ClickHouse-Key: {s}\r\n", .{p.password});
-        try w.print("Content-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n", .{ sql.len, if (reuse) "keep-alive" else "close" });
-        try w.writeAll(sql);
-        try t.flush();
+        // Until the first response line, a failure on a reused connection means
+        // the server had already closed it (a timed-out read is a slow query).
+        const status_line = self.sendHead(t, target.items, host, sql, reuse) catch |err| {
+            if (reused != null and !t.read_timed_out and err != error.OutOfMemory) return error.StaleConnection;
+            return err;
+        };
 
         var resp: Response = .{};
         errdefer resp.deinit(gpa);
         const r = t.reader();
 
         // Status line and headers.
-        const status_line = try r.takeDelimiterInclusive('\n');
         var parts = std.mem.splitScalar(u8, std.mem.trimEnd(u8, status_line, "\r\n"), ' ');
         _ = parts.next();
         resp.status = std.fmt.parseInt(u16, parts.next() orelse "0", 10) catch 0;
