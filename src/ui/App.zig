@@ -66,6 +66,7 @@ const commands = [_]complete.Command{
     .{ .name = "/databases", .help = "list databases", .aliases = &.{"/dbs"} },
     .{ .name = "/refresh", .help = "reload table/column names for completion" },
     .{ .name = "/save", .args = "<name>", .help = "save the last SQL you ran under a name" },
+    .{ .name = "/copy", .help = "copy the last SQL you ran to the clipboard" },
     .{ .name = "/queries", .args = "[name]", .help = "saved queries: pick one to put it in the input", .arg = .query, .aliases = &.{"/sq"} },
     .{ .name = "/unsave", .args = "<name>", .help = "delete a saved query", .arg = .query },
     .{ .name = "/clear", .help = "clear the screen" },
@@ -147,7 +148,7 @@ popup_arena: std.heap.ArenaAllocator,
 pasting: bool = false,
 exit_armed: bool = false,
 notice: std.ArrayList(u8) = .empty,
-/// The last SQL text sent to the server, for /save.
+/// The last SQL text sent to the server, for /save and /copy.
 last_sql: std.ArrayList(u8) = .empty,
 frame_arena: std.heap.ArenaAllocator,
 history_path: ?[]const u8 = null,
@@ -421,6 +422,9 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     if (key.matches('d', .{ .ctrl = true }) and app.editor.isEmpty()) {
         app.running = false;
         return;
+    }
+    if (key.matches('y', .{ .ctrl = true })) {
+        return app.copyQuery(if (app.editor.isEmpty()) app.last_sql.items else app.editor.text());
     }
 
     if (app.popup != null) {
@@ -819,6 +823,62 @@ fn savedQueryNames(app: *App, a: Allocator) ![]const []const u8 {
     return names;
 }
 
+fn copyQuery(app: *App, sql: []const u8) !void {
+    if (sql.len == 0) return app.transcript.addMessage(.warn, "nothing to copy — type or run an SQL query first", .{});
+    app.vx.copyToSystemClipboard(app.tty.writer(), sql, app.gpa) catch |err| {
+        return app.transcript.addMessage(.err, "cannot copy query: {t}", .{err});
+    };
+    try app.transcript.addMessage(.ok, "query copied to clipboard", .{});
+}
+
+test "copy command and shortcut preserve SQL and handle empty input" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+    };
+    defer app.deinit();
+    app.tty = try vaxis.Tty.init(app.io, &app.tty_buf);
+    defer app.tty.deinit();
+    var output: [1024]u8 = undefined;
+    const writer = app.tty.writer();
+    const original_writer = writer.*;
+    writer.* = .fixed(&output);
+    defer writer.* = original_writer;
+    app.vx = try vaxis.init(app.io, a, &env, .{});
+    defer app.vx.deinit(a, writer);
+
+    try app.runCommand("/copy");
+    try app.handleKey(.{ .codepoint = 'y', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
+    try std.testing.expectEqual(.warn, app.transcript.entries.items[0].content.message.kind);
+    try std.testing.expectEqual(.warn, app.transcript.entries.items[1].content.message.kind);
+
+    const sql = "select 'Привет';\nselect 2;";
+    try app.last_sql.appendSlice(a, "select 1;");
+    try app.editor.setText(sql);
+    try app.handleKey(.{ .codepoint = 'y', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqualStrings(sql, app.editor.text());
+    app.editor.clear();
+    try app.handleKey(.{ .codepoint = 'y', .mods = .{ .ctrl = true } });
+    try app.runCommand("/copy");
+    try std.testing.expectEqualStrings(
+        "\x1b]52;c;c2VsZWN0ICfQn9GA0LjQstC10YInOwpzZWxlY3QgMjs=\x1b\\" ++
+            "\x1b]52;c;c2VsZWN0IDE7\x1b\\" ++
+            "\x1b]52;c;c2VsZWN0IDE7\x1b\\",
+        writer.buffered(),
+    );
+}
+
 fn saveQuery(app: *App, name: []const u8) !void {
     if (!queries.validName(name)) return app.transcript.addMessage(.err, "usage: /save <name> — letters, digits, '_', '-', '.'", .{});
     if (app.last_sql.items.len == 0) return app.transcript.addMessage(.err, "nothing to save yet — run an SQL query first", .{});
@@ -900,9 +960,11 @@ fn runCommand(app: *App, text: []const u8) !void {
 
     const needs_conn = !(std.mem.eql(u8, cmd.name, "/help") or std.mem.eql(u8, cmd.name, "/connect") or
         std.mem.eql(u8, cmd.name, "/clear") or std.mem.eql(u8, cmd.name, "/quit") or
-        std.mem.eql(u8, cmd.name, "/queries") or std.mem.eql(u8, cmd.name, "/save") or std.mem.eql(u8, cmd.name, "/unsave"));
+        std.mem.eql(u8, cmd.name, "/queries") or std.mem.eql(u8, cmd.name, "/save") or std.mem.eql(u8, cmd.name, "/unsave") or
+        std.mem.eql(u8, cmd.name, "/copy"));
     if (needs_conn and app.conn == null) return app.transcript.addMessage(.err, "not connected — use /connect", .{});
-    const needs_idle = !(std.mem.eql(u8, cmd.name, "/help") or std.mem.eql(u8, cmd.name, "/clear") or std.mem.eql(u8, cmd.name, "/quit"));
+    const needs_idle = !(std.mem.eql(u8, cmd.name, "/help") or std.mem.eql(u8, cmd.name, "/clear") or std.mem.eql(u8, cmd.name, "/quit") or
+        std.mem.eql(u8, cmd.name, "/copy"));
     if (needs_idle and app.job != null) return app.transcript.addMessage(.warn, "busy — wait for the running query or press ctrl+c", .{});
 
     const eql = std.mem.eql;
@@ -950,6 +1012,7 @@ fn runCommand(app: *App, text: []const u8) !void {
     }
     if (eql(u8, cmd.name, "/refresh")) return app.startCacheLoad(true);
     if (eql(u8, cmd.name, "/save")) return app.saveQuery(arg);
+    if (eql(u8, cmd.name, "/copy")) return app.copyQuery(app.last_sql.items);
     if (eql(u8, cmd.name, "/queries")) {
         if (arg.len == 0) return app.openQueriesPicker();
         return app.loadSavedQuery(arg);
@@ -995,6 +1058,7 @@ fn showHelp(app: *App) !void {
         .{ "tab, enter (list open)", "insert the highlighted suggestion; esc closes the list" },
         .{ "↑ ↓", "history (or move between lines)" },
         .{ "ctrl+o", "open the last result in the table viewer" },
+        .{ "ctrl+y", "copy input (or the last SQL if input is empty)" },
         .{ "pgup pgdn, mouse wheel", "scroll" },
         .{ "ctrl+c", "cancel query / clear input / exit (twice)" },
         .{ "ctrl+d", "exit (on an empty input)" },
