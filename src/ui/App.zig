@@ -66,7 +66,7 @@ const commands = [_]complete.Command{
     .{ .name = "/databases", .help = "list databases", .aliases = &.{"/dbs"} },
     .{ .name = "/refresh", .help = "reload table/column names for completion" },
     .{ .name = "/save", .args = "<name>", .help = "save the last SQL you ran under a name" },
-    .{ .name = "/copy", .help = "copy the last SQL you ran to the clipboard" },
+    .{ .name = "/copy", .help = "copy the last SQL query or displayed definition to the clipboard" },
     .{ .name = "/queries", .args = "[name]", .help = "saved queries: pick one to put it in the input", .arg = .query, .aliases = &.{"/sq"} },
     .{ .name = "/unsave", .args = "<name>", .help = "delete a saved query", .arg = .query },
     .{ .name = "/clear", .help = "clear the screen" },
@@ -424,7 +424,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
     if (key.matches('y', .{ .ctrl = true })) {
-        return app.copyQuery(if (app.editor.isEmpty()) app.last_sql.items else app.editor.text());
+        return app.copyQuery(if (app.editor.isEmpty()) app.sqlToCopy() else app.editor.text());
     }
 
     if (app.popup != null) {
@@ -823,6 +823,19 @@ fn savedQueryNames(app: *App, a: Allocator) ![]const []const u8 {
     return names;
 }
 
+fn sqlToCopy(app: *const App) []const u8 {
+    var i = app.transcript.entries.items.len;
+    while (i > 0) {
+        i -= 1;
+        switch (app.transcript.entries.items[i].content) {
+            .code => |sql| return sql,
+            .input => |text| if (!std.mem.startsWith(u8, text, "/")) break,
+            else => {},
+        }
+    }
+    return app.last_sql.items;
+}
+
 fn copyQuery(app: *App, sql: []const u8) !void {
     if (sql.len == 0) return app.transcript.addMessage(.warn, "nothing to copy — type or run an SQL query first", .{});
     app.vx.copyToSystemClipboard(app.tty.writer(), sql, app.gpa) catch |err| {
@@ -877,6 +890,35 @@ test "copy command and shortcut preserve SQL and handle empty input" {
             "\x1b]52;c;c2VsZWN0IDE7\x1b\\",
         writer.buffered(),
     );
+
+    var db_error: db.ErrorText = .{};
+    defer db_error.deinit(a);
+    app.conn = try @import("../db/sqlite.zig").connect(a, .{ .kind = .sqlite, .database = ":memory:" }, &db_error);
+    const definition = "CREATE VIEW recent_orders AS SELECT 1";
+    var setup = try app.conn.?.query(a, definition);
+    defer setup.deinit();
+    var views = try app.conn.?.query(a, schema.listSql(.sqlite, .views).?);
+    defer views.deinit();
+    app.loop = .init(app.io, &app.tty, &app.vx);
+    try app.openObjectPicker(.views, views);
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    app.job.?.future.await(app.io);
+    app.finishJob();
+    try std.testing.expectEqualStrings(definition, app.sqlToCopy());
+    // /copy itself must not hide the displayed definition.
+    try app.transcript.add(.{ .input = "/copy" });
+    var encoded: [128]u8 = undefined;
+    const expected = try std.fmt.allocPrint(a, "\x1b]52;c;{s}\x1b\\", .{std.base64.standard.Encoder.encode(&encoded, definition)});
+    defer a.free(expected);
+    writer.end = 0;
+    try app.runCommand("/copy");
+    try std.testing.expectEqualStrings(expected, writer.buffered());
+    writer.end = 0;
+    try app.handleKey(.{ .codepoint = 'y', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqualStrings(expected, writer.buffered());
+    try std.testing.expectEqualStrings("select 1;", app.last_sql.items);
+    try app.transcript.add(.{ .input = "select 1;" });
+    try std.testing.expectEqualStrings("select 1;", app.sqlToCopy());
 }
 
 fn saveQuery(app: *App, name: []const u8) !void {
@@ -1012,7 +1054,7 @@ fn runCommand(app: *App, text: []const u8) !void {
     }
     if (eql(u8, cmd.name, "/refresh")) return app.startCacheLoad(true);
     if (eql(u8, cmd.name, "/save")) return app.saveQuery(arg);
-    if (eql(u8, cmd.name, "/copy")) return app.copyQuery(app.last_sql.items);
+    if (eql(u8, cmd.name, "/copy")) return app.copyQuery(app.sqlToCopy());
     if (eql(u8, cmd.name, "/queries")) {
         if (arg.len == 0) return app.openQueriesPicker();
         return app.loadSavedQuery(arg);
@@ -1058,7 +1100,7 @@ fn showHelp(app: *App) !void {
         .{ "tab, enter (list open)", "insert the highlighted suggestion; esc closes the list" },
         .{ "↑ ↓", "history (or move between lines)" },
         .{ "ctrl+o", "open the last result in the table viewer" },
-        .{ "ctrl+y", "copy input (or the last SQL if input is empty)" },
+        .{ "ctrl+y", "copy input (or the last SQL / definition if input is empty)" },
         .{ "pgup pgdn, mouse wheel", "scroll" },
         .{ "ctrl+c", "cancel query / clear input / exit (twice)" },
         .{ "ctrl+d", "exit (on an empty input)" },
