@@ -80,6 +80,8 @@ Install a zpeek binary built for the server's supported OS and architecture. The
 
 ## Why zpeek?
 
+My editor didn't have a database client, so checking data meant jumping between windows. I built zpeek as a lightweight database client I could run in my editor's terminal or on a server over SSH, keeping database work in the same place as everything else.
+
 - One binary with built-in drivers and SQLite; no database client libraries to install.
 - A shared keyboard workflow for browsing data, inspecting schema, and running SQL.
 - Connections and saved SQL live in ordinary files you can edit yourself.
