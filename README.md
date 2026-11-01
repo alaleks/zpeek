@@ -62,6 +62,7 @@ The [recording script](examples/demo.tape) shows `/tables`, a SQL query, and `/b
 | `/save <name>`, `/queries` | Save the last SQL query or bring a saved query into the prompt |
 | `/copy` | Copy the last SQL query or displayed object definition to the clipboard |
 | `/connect [name\|url]`, `/disconnect` | Switch or close a connection |
+| `/config`, `/config add <name> <#RRGGBB> <url\|path>`, `/config remove <name>` | List, save or remove configured connections |
 | `/help` | Show all commands and keys |
 
 In a picker, type to filter and press `enter` to open the selected item. SQL completion knows your database dialect and schema; `tab` accepts a suggestion. Use `ctrl+o` to open the last result as a table, `ctrl+y` to copy the input (or the last SQL query or displayed definition when the input is empty), `ctrl+c` to cancel a running query, and `ctrl+d` on an empty prompt to exit. After selecting a view in `/views`, use `/copy` or `ctrl+y` with an empty input to copy its definition. Clipboard copying requires a terminal that allows OSC 52 clipboard writes.
@@ -91,6 +92,8 @@ read_only = true
 ```
 
 `read_only = true` allows only reading statements such as `SELECT`, `WITH`, `SHOW`, and `EXPLAIN`. zpeek refuses anything that changes data or schema before it reaches the server, and `/browse` does not offer row deletion. The session is read-only on the server too: PostgreSQL and MySQL get a read-only session, SQLite opens the file read-only, and ClickHouse runs every query with `readonly=2`. If the server rejects the read-only setting, the connection fails instead of opening writable. For hard guarantees, also use a database user without write privileges.
+
+Save connections directly in the console with `/config add local #2F6B43 postgres://postgres@localhost:5432/app`, then use `/connect local`. The URL or path is the rest of the line, so SQLite paths may contain spaces; do not add quotes. Existing names are rejected; remove an entry before adding it again. `/config remove local` removes the saved entry and its `default` reference, without closing an open connection. Changes use the active config path (including `--config`) and update the connection picker immediately. The file is replaced atomically; settings and `password_env` references are retained, but comments and formatting are rewritten. URLs containing passwords are saved as plain text in the config; new/replaced files are private to the user on Unix. `/config add` arguments are redacted in the transcript and command history.
 
 Results in the console show 50 rows; `ctrl+o` opens the full result. Ad-hoc queries retain up to 10,000 rows and 16 MiB of row data.
 

@@ -55,6 +55,7 @@ const commands = [_]complete.Command{
     .{ .name = "/help", .help = "show commands and keys", .aliases = &.{"/?"} },
     .{ .name = "/connect", .args = "[name|url]", .help = "connect (no argument: pick from config)", .arg = .connection, .aliases = &.{"/c"} },
     .{ .name = "/disconnect", .help = "close the connection" },
+    .{ .name = "/config", .args = "[add <name> <#RRGGBB> <url|path> | remove <name>]", .help = "save or remove a connection; no argument: list saved connections" },
     .{ .name = "/tables", .help = "pick a table to browse", .aliases = &.{"/t"} },
     .{ .name = "/views", .help = "pick a view to show its SQL", .aliases = &.{"/v"} },
     .{ .name = "/types", .help = "pick a type to show its values", .aliases = &.{"/enums"} },
@@ -118,6 +119,7 @@ gpa: Allocator,
 io: Io,
 env: *std.process.Environ.Map,
 cfg: config.Config,
+config_arena: ?std.heap.ArenaAllocator = null,
 
 tty: vaxis.Tty = undefined,
 tty_buf: [4096]u8 = undefined,
@@ -246,6 +248,7 @@ fn deinit(app: *App) void {
     app.conn_arena.deinit();
     app.popup_arena.deinit();
     app.frame_arena.deinit();
+    if (app.config_arena) |*arena| arena.deinit();
     app.notice.deinit(app.gpa);
     app.last_sql.deinit(app.gpa);
 }
@@ -973,6 +976,12 @@ pub const delete_without_where_message = "DELETE without WHERE is blocked: nothi
 fn redactConnectionInput(text: []const u8) []const u8 {
     const name_end = std.mem.indexOfAny(u8, text, " \t\n") orelse return text;
     const name = text[0..name_end];
+    if (std.mem.eql(u8, name, "/config")) {
+        var words = std.mem.tokenizeAny(u8, text[name_end..], " \t\r\n");
+        if (words.next()) |action| {
+            if (std.mem.eql(u8, action, "add")) return "/config add <redacted>";
+        }
+    }
     if (!std.mem.eql(u8, name, "/connect") and !std.mem.eql(u8, name, "/c")) return text;
     const arg = std.mem.trim(u8, text[name_end..], " \t\r\n");
     if (arg.len == 0 or !conninfo.isConnectionString(arg)) return text;
@@ -983,6 +992,8 @@ test "connection URLs are redacted before display and history" {
     try std.testing.expectEqualStrings("/connect <redacted>", redactConnectionInput("/connect postgres://user:secret@localhost/db"));
     try std.testing.expectEqualStrings("/connect <redacted>", redactConnectionInput("/c ./private.sqlite"));
     try std.testing.expectEqualStrings("/connect production", redactConnectionInput("/connect production"));
+    try std.testing.expectEqualStrings("/config add <redacted>", redactConnectionInput("/config add prod #ff0000 postgres://user:secret@localhost/db"));
+    try std.testing.expectEqualStrings("/config remove prod", redactConnectionInput("/config remove prod"));
 }
 
 fn findCommand(name: []const u8) ?complete.Command {
@@ -1003,7 +1014,7 @@ fn runCommand(app: *App, text: []const u8) !void {
     const needs_conn = !(std.mem.eql(u8, cmd.name, "/help") or std.mem.eql(u8, cmd.name, "/connect") or
         std.mem.eql(u8, cmd.name, "/clear") or std.mem.eql(u8, cmd.name, "/quit") or
         std.mem.eql(u8, cmd.name, "/queries") or std.mem.eql(u8, cmd.name, "/save") or std.mem.eql(u8, cmd.name, "/unsave") or
-        std.mem.eql(u8, cmd.name, "/copy"));
+        std.mem.eql(u8, cmd.name, "/copy") or std.mem.eql(u8, cmd.name, "/config"));
     if (needs_conn and app.conn == null) return app.transcript.addMessage(.err, "not connected — use /connect", .{});
     const needs_idle = !(std.mem.eql(u8, cmd.name, "/help") or std.mem.eql(u8, cmd.name, "/clear") or std.mem.eql(u8, cmd.name, "/quit") or
         std.mem.eql(u8, cmd.name, "/copy"));
@@ -1011,6 +1022,7 @@ fn runCommand(app: *App, text: []const u8) !void {
 
     const eql = std.mem.eql;
     if (eql(u8, cmd.name, "/help")) return app.showHelp();
+    if (eql(u8, cmd.name, "/config")) return app.configure(arg);
     if (eql(u8, cmd.name, "/quit")) {
         app.running = false;
         return;
@@ -1064,6 +1076,74 @@ fn runCommand(app: *App, text: []const u8) !void {
         queries.remove(app.io, dir, arg) catch return app.transcript.addMessage(.err, "no saved query named '{s}'", .{arg});
         return app.transcript.addMessage(.dim, "deleted saved query '{s}'", .{arg});
     }
+}
+
+fn configure(app: *App, arg: []const u8) !void {
+    if (arg.len == 0) {
+        try app.transcript.addMessage(.dim, "config: {s}", .{app.cfg.path});
+        for (app.cfg.connections) |entry| try app.transcript.addMessage(.dim, "  {s}", .{entry.name});
+        return app.transcript.addMessage(.dim, "usage: /config add <name> <#RRGGBB> <url|path> | /config remove <name>", .{});
+    }
+    var words = std.mem.tokenizeAny(u8, arg, " \t\r\n");
+    const action = words.next().?;
+    const name = words.next() orelse return app.transcript.addMessage(.err, "missing connection name — use /config for help", .{});
+    const change: config.Change = if (std.mem.eql(u8, action, "add")) blk: {
+        const color = words.next() orelse return app.transcript.addMessage(.err, "missing color (#RRGGBB)", .{});
+        const url = std.mem.trim(u8, words.rest(), " \t\r\n");
+        if (url.len == 0) return app.transcript.addMessage(.err, "missing connection URL or path", .{});
+        break :blk .{ .add = .{ .name = name, .url = url, .color = color } };
+    } else if (std.mem.eql(u8, action, "remove") and words.next() == null)
+        .{ .remove = name }
+    else
+        return app.transcript.addMessage(.err, "usage: /config add <name> <#RRGGBB> <url|path> | /config remove <name>", .{});
+
+    var arena: std.heap.ArenaAllocator = .init(app.gpa);
+    var transferred = false;
+    defer if (!transferred) arena.deinit();
+    const cfg = config.update(arena.allocator(), app.io, app.env, app.cfg.path, change) catch |err| {
+        return app.transcript.addMessage(.err, "config was not changed: {t}", .{err});
+    };
+    if (app.config_arena) |*old| old.deinit();
+    app.config_arena = arena;
+    transferred = true;
+    app.cfg = cfg;
+    return app.transcript.addMessage(.dim, "{s} connection '{s}' in {s}", .{ if (change == .add) "saved" else "removed", name, cfg.path });
+}
+
+test "config commands work disconnected and refresh saved connections" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "config.toml" });
+    defer a.free(path);
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = path, .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+    };
+    defer app.deinit();
+    try app.runCommand("/config add local #2F6B43 ./my database.sqlite");
+    try std.testing.expect(app.cfg.found);
+    try std.testing.expectEqualStrings("./my database.sqlite", app.cfg.find("local").?.params.database);
+    try app.runCommand("/config add second #FF0000 ./second.sqlite");
+    try std.testing.expectEqual(@as(usize, 2), app.cfg.connections.len);
+    try app.runCommand("/config add invalid #bad ./bad.sqlite");
+    try std.testing.expectEqual(@as(usize, 2), app.cfg.connections.len);
+    try app.openConnectPicker();
+    try std.testing.expectEqual(Mode.picker, app.mode);
+    app.closePicker();
+    try app.runCommand("/config remove local");
+    try std.testing.expect(app.cfg.find("local") == null);
+    try std.testing.expect(app.cfg.find("second") != null);
+    try app.runCommand("/config");
 }
 
 /// `users where id > 3` -> table + filter. Also accepts a bare filter after the name.

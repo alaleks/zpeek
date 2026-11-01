@@ -218,13 +218,117 @@ fn entryColor(t: *const toml.Table) EntryError!?Color {
     return try parseColor(value);
 }
 
-fn parseColor(value: []const u8) error{InvalidColor}!Color {
+pub fn parseColor(value: []const u8) error{InvalidColor}!Color {
     if (value.len != 7 or value[0] != '#') return error.InvalidColor;
     return .{
         .r = std.fmt.parseInt(u8, value[1..3], 16) catch return error.InvalidColor,
         .g = std.fmt.parseInt(u8, value[3..5], 16) catch return error.InvalidColor,
         .b = std.fmt.parseInt(u8, value[5..7], 16) catch return error.InvalidColor,
     };
+}
+
+pub const Change = union(enum) {
+    add: struct { name: []const u8, url: []const u8, color: []const u8 },
+    remove: []const u8,
+};
+
+/// Reload before editing so changes made outside the app are retained.
+/// Returned strings belong to arena, including the config path.
+pub fn update(arena: Allocator, io: Io, env: *const std.process.Environ.Map, path: []const u8, change: Change) !Config {
+    if (path.len == 0) return error.MissingConfigPath;
+    const owned_path = try arena.dupe(u8, path);
+    const src = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => "",
+        else => return err,
+    };
+    var diag: Diagnostic = .{};
+    _ = try parse(arena, env, owned_path, src, &diag);
+    const root = try toml.parse(arena, src, null);
+    const conns = if (root.get("connections")) |v| v.table else blk: {
+        const t = try arena.create(toml.Table);
+        t.* = .empty;
+        try root.put(arena, "connections", .{ .table = t });
+        break :blk t;
+    };
+    switch (change) {
+        .add => |entry| {
+            if (entry.name.len == 0 or std.mem.indexOfAny(u8, entry.name, " \t\r\n") != null) return error.InvalidName;
+            if (conns.contains(entry.name)) return error.ConnectionExists;
+            _ = try conninfo.parse(arena, entry.url);
+            _ = try parseColor(entry.color);
+            const t = try arena.create(toml.Table);
+            t.* = .empty;
+            try t.put(arena, "url", .{ .string = entry.url });
+            try t.put(arena, "color", .{ .string = entry.color });
+            try conns.put(arena, entry.name, .{ .table = t });
+        },
+        .remove => |name| {
+            if (!conns.orderedRemove(name)) return error.UnknownConnection;
+            if (root.get("default")) |v| {
+                if (std.mem.eql(u8, v.string, name)) _ = root.orderedRemove("default");
+            }
+        },
+    }
+    var out: Io.Writer.Allocating = .init(arena);
+    try writeTable(arena, &out.writer, root, "");
+    const data = out.written();
+    if (data.len > 4 * 1024 * 1024) return error.ConfigTooLarge;
+    const cfg = try parse(arena, env, owned_path, data, &diag);
+    var file = try Io.Dir.cwd().createFileAtomic(io, path, .{
+        .make_path = true,
+        .replace = true,
+        .permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600),
+    });
+    defer file.deinit(io);
+    try file.file.writeStreamingAll(io, data);
+    try file.replace(io);
+    return cfg;
+}
+
+fn writeTable(arena: Allocator, w: *Io.Writer, table: *const toml.Table, path: []const u8) Io.Writer.Error!void {
+    for (table.keys(), table.values()) |key, value| {
+        if (value == .table) continue;
+        try std.json.Stringify.value(key, .{}, w);
+        try w.writeAll(" = ");
+        try writeValue(w, value);
+        try w.writeByte('\n');
+    }
+    for (table.keys(), table.values()) |key, value| {
+        if (value != .table) continue;
+        var header: Io.Writer.Allocating = .init(arena);
+        defer header.deinit();
+        if (path.len > 0) try header.writer.print("{s}.", .{path});
+        try std.json.Stringify.value(key, .{}, &header.writer);
+        try w.print("\n[{s}]\n", .{header.written()});
+        try writeTable(arena, w, value.table, header.written());
+    }
+}
+
+fn writeValue(w: *Io.Writer, value: toml.Value) Io.Writer.Error!void {
+    switch (value) {
+        .string => |v| try std.json.Stringify.value(v, .{}, w),
+        .integer => |v| try w.print("{d}", .{v}),
+        .float => |v| try w.print("{e}", .{v}),
+        .boolean => |v| try w.writeAll(if (v) "true" else "false"),
+        .array => |items| {
+            try w.writeByte('[');
+            for (items, 0..) |item, i| {
+                if (i > 0) try w.writeAll(", ");
+                try writeValue(w, item);
+            }
+            try w.writeByte(']');
+        },
+        .table => |t| {
+            try w.writeByte('{');
+            for (t.keys(), t.values(), 0..) |key, item, i| {
+                if (i > 0) try w.writeAll(", ");
+                try std.json.Stringify.value(key, .{}, w);
+                try w.writeAll(" = ");
+                try writeValue(w, item);
+            }
+            try w.writeByte('}');
+        },
+    }
 }
 
 pub fn expandHome(arena: Allocator, env: *const std.process.Environ.Map, path: []const u8) Allocator.Error![]const u8 {
@@ -261,6 +365,47 @@ pub const example =
 ;
 
 const testing = std.testing;
+
+test "edit config atomically and preserve unresolved passwords and other settings" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "nested", "config.toml" });
+    const io = testing.io;
+    const add: Change = .{ .add = .{ .name = "local.db", .url = "sqlite:///tmp/my database.db", .color = "#2F6B43" } };
+    var cfg = try update(a, io, &env, path, add);
+    try testing.expectEqualStrings("/tmp/my database.db", cfg.find("local.db").?.params.database);
+    try testing.expectEqual(Color{ .r = 47, .g = 107, .b = 67 }, cfg.find("local.db").?.color.?);
+    try testing.expectError(error.ConnectionExists, update(a, io, &env, path, add));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data =
+        \\default = "prod"
+        \\custom = [true, "a\\b\"c", { value = 12 }]
+        \\[connections.prod]
+        \\url = "postgres://user@localhost/app"
+        \\password_env = "SECRET_PASSWORD"
+        \\read_only = true
+    });
+    cfg = try update(a, io, &env, path, add);
+    try testing.expect(cfg.find("prod").?.params.read_only);
+    try testing.expectEqualStrings("prod", cfg.default.?);
+    const saved = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4096));
+    const root = try toml.parse(a, saved, null);
+    try testing.expectEqualStrings("SECRET_PASSWORD", root.get("connections").?.table.get("prod").?.table.get("password_env").?.string);
+    try testing.expectEqualStrings("a\\b\"c", root.get("custom").?.array[1].string);
+    try testing.expectError(error.InvalidColor, update(a, io, &env, path, .{ .add = .{ .name = "bad", .url = "./db.sqlite", .color = "red" } }));
+    try testing.expectError(error.UnknownConnection, update(a, io, &env, path, .{ .remove = "missing" }));
+    try testing.expectEqualStrings(saved, try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4096)));
+    cfg = try update(a, io, &env, path, .{ .remove = "prod" });
+    try testing.expect(cfg.default == null);
+    try testing.expect(cfg.find("prod") == null);
+    try testing.expect(cfg.find("local.db") != null);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[broken" });
+    try testing.expectError(error.InvalidConfig, update(a, io, &env, path, add));
+    try testing.expectEqualStrings("[broken", try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4096)));
+}
 
 test "config entries" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
