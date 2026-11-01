@@ -21,6 +21,8 @@ const TableView = @import("TableView.zig");
 const Picker = @import("Picker.zig");
 const complete = @import("complete.zig");
 const queries = @import("../queries.zig");
+const exporter = @import("../export.zig");
+const plan = @import("../plan.zig");
 
 const App = @This();
 
@@ -66,6 +68,9 @@ const commands = [_]complete.Command{
     .{ .name = "/def", .args = "<name>", .help = "source of a view, function, trigger or enum" },
     .{ .name = "/databases", .help = "list databases", .aliases = &.{"/dbs"} },
     .{ .name = "/refresh", .help = "reload table/column names for completion" },
+    .{ .name = "/history", .args = "[search]", .help = "search SQL history (alt+r) and load into editor" },
+    .{ .name = "/export", .args = "<csv|json> [path]", .help = "export the last retained result to a new file" },
+    .{ .name = "/explain", .args = "[SQL]", .help = "view a query plan without ANALYZE; default: last SQL" },
     .{ .name = "/save", .args = "[name]", .help = "save SQL (no name: open save dialog)" },
     .{ .name = "/copy", .help = "copy the last SQL query or displayed definition to the clipboard" },
     .{ .name = "/queries", .args = "[name]", .help = "saved queries: pick one to put it in the input", .arg = .query, .aliases = &.{"/sq"} },
@@ -113,6 +118,7 @@ const config_help = [_][]const u8{
 const JobKind = union(enum) {
     connect: struct { name: []const u8, params: conninfo.Params },
     console,
+    explain,
     list: schema.Object,
     describe: []const u8,
     definition: []const u8,
@@ -190,6 +196,7 @@ last_sql: std.ArrayList(u8) = .empty,
 pending_save: std.ArrayList(u8) = .empty,
 frame_arena: std.heap.ArenaAllocator,
 history_path: ?[]const u8 = null,
+export_table: bool = false,
 
 const Popup = struct {
     completion: complete.Completion,
@@ -406,6 +413,10 @@ fn handleEvent(app: *App, event: Event) !void {
         .paste => |text| {
             defer app.gpa.free(text);
             if (app.config_edit) |*edit| edit.discard_armed = false;
+            if (app.picker) |p| {
+                _ = try p.handleKey(.{ .codepoint = 0, .text = text });
+                return;
+            }
             if (app.mode == .console or app.mode == .config) try app.editor.insertPaste(text);
         },
         .focus_in => {},
@@ -431,6 +442,10 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
 
 fn handleKey(app: *App, key: vaxis.Key) !void {
     if (app.pasting) {
+        if (app.picker) |p| {
+            if (key.text) |text| _ = try p.handleKey(.{ .codepoint = 0, .text = text });
+            return;
+        }
         if (app.mode != .console and app.mode != .config) return;
         if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
             try app.editor.insert("\n");
@@ -490,6 +505,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             key.matches('r', .{ .ctrl = true }) or key.matches('o', .{ .ctrl = true }) or key.matches('l', .{ .ctrl = true }) or
             key.matches(vaxis.Key.page_up, .{}) or key.matches(vaxis.Key.page_down, .{}) or
             key.matches(vaxis.Key.up, .{ .shift = true }) or key.matches(vaxis.Key.down, .{ .shift = true })) return;
+        if (key.matches('r', .{ .alt = true })) return;
     }
 
     const exit_was_armed = app.exit_armed;
@@ -520,6 +536,10 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     if (key.matches('r', .{ .ctrl = true })) {
         app.closePopup();
         return app.openQueriesPicker();
+    }
+    if (key.matches('r', .{ .alt = true })) {
+        app.closePopup();
+        return app.openHistory("");
     }
 
     if (app.popup != null) {
@@ -798,6 +818,21 @@ fn handlePickerKey(app: *App, key: vaxis.Key) !void {
                     app.closePicker();
                     try app.loadSavedQuery(name);
                 },
+                .history => {
+                    try app.editor.setText(p.items[i].value);
+                    app.editor.history_pos = null;
+                    app.closePicker();
+                },
+                .confirm_sql => {
+                    if (i == 1) try app.executeSql(p.items[i].value, true);
+                    app.closePicker();
+                },
+                .export_format => {
+                    const format: exporter.Format = if (i == 0) .csv else .json;
+                    app.closePicker();
+                    try app.openExportPath(format);
+                },
+                .export_csv, .export_json => {},
                 .save_query, .overwrite_query => {
                     const name = try app.gpa.dupe(u8, if (purpose == .overwrite_query) p.items[i].value else label);
                     defer app.gpa.free(name);
@@ -811,15 +846,18 @@ fn handlePickerKey(app: *App, key: vaxis.Key) !void {
             const t = try app.gpa.dupe(u8, text);
             defer app.gpa.free(t);
             app.closePicker();
-            if (purpose == .save_query) try app.writeSavedQuery(t, false) else try app.connectTarget(t);
+            if (purpose == .export_csv or purpose == .export_json) {
+                try app.exportResult(if (purpose == .export_csv) .csv else .json, t);
+            } else if (purpose == .save_query) try app.writeSavedQuery(t, false) else try app.connectTarget(t);
         },
     }
 }
 
 fn closePicker(app: *App) void {
+    const returning_to_table = if (app.picker) |p| app.export_table and (p.purpose == .export_format or p.purpose == .export_csv or p.purpose == .export_json) else false;
     if (app.picker) |p| p.deinit();
     app.picker = null;
-    app.mode = .console;
+    app.mode = if (returning_to_table and app.table_view != null) .table else .console;
 }
 
 fn handleTableKey(app: *App, key: vaxis.Key) !void {
@@ -828,6 +866,12 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
         if (key.matches('c', .{ .ctrl = true })) {
             if (app.conn) |c| c.cancel();
         }
+        return;
+    }
+    if (key.matches('e', .{}) and !tv.editing_filter and tv.chooser == null and !tv.detail and tv.confirm_delete == null) {
+        app.export_table = true;
+        app.picker = try Picker.init(app.gpa, .export_format, "Export current view · retained rows and visible columns", &.{ .{ .label = "CSV" }, .{ .label = "JSON" } }, false);
+        app.mode = .picker;
         return;
     }
     const action = try tv.handleKey(key);
@@ -894,7 +938,12 @@ fn submit(app: *App) !void {
     try app.transcript.add(.{ .input = visible_text });
 
     if (text[0] == '/') return app.runCommand(text);
-    const conn = app.conn.?;
+    return app.executeSql(text, false);
+}
+
+fn executeSql(app: *App, text: []const u8, approved: bool) !void {
+    const conn = app.conn orelse return app.transcript.addMessage(.err, "not connected — use /connect", .{});
+    if (app.job != null) return app.transcript.addMessage(.warn, "busy — wait for the running query", .{});
 
     var stmts: std.ArrayList([]const u8) = .empty;
     defer stmts.deinit(app.gpa);
@@ -905,13 +954,22 @@ fn submit(app: *App) !void {
         // Backslash escapes in strings, like MySQL.
         .clickhouse => .mysql,
     };
-    if ((if (app.conn_params) |p| p.access else conninfo.Access.full).violation(text, dialect)) |word| {
+    if ((if (app.conn_params) |p| p.access else conn.access).violation(text, dialect)) |word| {
         if (app.readOnly()) return app.transcript.addMessage(.err, read_only_message, .{word});
         return app.transcript.addMessage(.err, read_delete_message, .{word});
     }
     if (lexer.hasDeleteWithoutWhere(text, dialect)) {
         return app.transcript.addMessage(.err, "{s}", .{delete_without_where_message});
     }
+    const access = if (app.conn_params) |p| p.access else conn.access;
+    if (!approved and access == .full) if (lexer.dangerousStatement(text, dialect)) |word| {
+        app.picker = try Picker.init(app.gpa, .confirm_sql, "Confirm full-access SQL · review before running", &.{
+            .{ .label = "Cancel", .detail = "keep the database unchanged" },
+            .{ .label = "Run SQL", .detail = word, .value = text },
+        }, false);
+        app.mode = .picker;
+        return;
+    };
     try lexer.splitStatements(text, dialect, &stmts, app.gpa);
     if (stmts.items.len == 0) return;
     const job = try app.newJob(.console);
@@ -926,6 +984,70 @@ fn submit(app: *App) !void {
 }
 
 // ───────────────────────────── saved queries ─────────────────────────────
+
+fn openHistory(app: *App, search: []const u8) !void {
+    const a = app.frame_arena.allocator();
+    var items: std.ArrayList(Picker.Item) = .empty;
+    var i = app.editor.history.items.len;
+    while (i > 0) {
+        i -= 1;
+        const sql = app.editor.history.items[i];
+        if (sql.len == 0 or sql[0] == '/') continue;
+        const first_line = sql[0 .. std.mem.indexOfScalar(u8, sql, '\n') orelse sql.len];
+        try items.append(a, .{ .label = try std.fmt.allocPrint(a, "#{d}", .{i + 1}), .detail = first_line, .value = sql });
+    }
+    if (items.items.len == 0) return app.transcript.addMessage(.dim, "no SQL history yet — type a query first", .{});
+    const p = try Picker.init(app.gpa, .history, "SQL history · newest first · type to search · enter loads", items.items, false);
+    errdefer p.deinit();
+    if (search.len > 0) _ = try p.handleKey(.{ .codepoint = 0, .text = search });
+    app.picker = p;
+    app.mode = .picker;
+}
+
+fn openExportPath(app: *App, format: exporter.Format) !void {
+    app.picker = try Picker.init(app.gpa, if (format == .csv) .export_csv else .export_json, "Export · type a new file path · existing files are never overwritten", &.{}, true);
+    app.mode = .picker;
+}
+
+fn exportResult(app: *App, format: exporter.Format, path: []const u8) !void {
+    const result = if (app.export_table and app.table_view != null) app.table_view.?.result else app.transcript.lastResult() orelse
+        return app.transcript.addMessage(.warn, "no result to export — run a query first", .{});
+    const selection: exporter.Selection = if (app.export_table and app.table_view != null)
+        .{ .rows = app.table_view.?.view.items, .columns = app.table_view.?.visible.items }
+    else
+        .{};
+    exporter.save(app.io, path, result.*, format, selection) catch |err| {
+        if (app.export_table) {
+            if (app.table_view) |tv| {
+                app.notice.clearRetainingCapacity();
+                try app.notice.print(app.gpa, "export failed: {t}", .{err});
+                tv.notice = app.notice.items;
+            }
+        }
+        return app.transcript.addMessage(.err, "cannot export: {t} — use a new path; JSON columns need unique names", .{err});
+    };
+    if (app.export_table) {
+        if (app.table_view) |tv| tv.notice = "exported current view (retained rows only)";
+    }
+    try app.transcript.addMessage(.ok, "exported {d} retained rows to {s}{s}", .{
+        if (selection.rows) |rows| rows.len else result.rows.len,
+        path,
+        if (result.truncated) " (source result was truncated)" else "",
+    });
+}
+
+fn startExplain(app: *App, query: []const u8) !void {
+    const source = if (query.len > 0) query else app.last_sql.items;
+    if (source.len == 0) return app.transcript.addMessage(.err, "usage: /explain <SQL> — or run a query first", .{});
+    const sql = plan.sql(app.frame_arena.allocator(), app.conn.?.kind, source) catch |err| {
+        return app.transcript.addMessage(.err, "cannot explain: {t} — supply one SELECT or DML statement; ANALYZE is not enabled", .{err});
+    };
+    const job = try app.newJob(.explain);
+    const a = job.arena.allocator();
+    job.sqls = try a.dupe([]const u8, &.{try a.dupe(u8, sql)});
+    job.max_rows = console_row_limit;
+    try app.startJob(job);
+}
 
 fn queriesDir(app: *App) !?[]const u8 {
     return queries.dirPath(app.frame_arena.allocator(), app.cfg.path);
@@ -1153,10 +1275,11 @@ fn readOnly(app: *const App) bool {
     return if (app.conn_params) |p| p.access == .read_only else false;
 }
 
-/// A browse filter is user SQL inside `WHERE`; read-only connections refuse writes there too.
+/// A browse filter is a reading expression, never a second channel for SQL writes.
 fn filterViolation(app: *App, filter: []const u8) !?[]const u8 {
-    if (filter.len == 0 or app.conn_params == null or app.conn_params.?.access == .full) return null;
-    const dialect: lexer.Dialect = switch (app.conn.?.kind) {
+    if (filter.len == 0) return null;
+    const conn = app.conn orelse return null;
+    const dialect: lexer.Dialect = switch (conn.kind) {
         .postgres => .postgres,
         .mysql, .clickhouse => .mysql,
         .sqlite => .sqlite,
@@ -1207,7 +1330,7 @@ fn runCommand(app: *App, text: []const u8) !void {
     const needs_conn = !(std.mem.eql(u8, cmd.name, "/help") or std.mem.eql(u8, cmd.name, "/connect") or
         std.mem.eql(u8, cmd.name, "/clear") or std.mem.eql(u8, cmd.name, "/quit") or
         std.mem.eql(u8, cmd.name, "/queries") or std.mem.eql(u8, cmd.name, "/save") or std.mem.eql(u8, cmd.name, "/unsave") or
-        std.mem.eql(u8, cmd.name, "/copy") or std.mem.eql(u8, cmd.name, "/config"));
+        std.mem.eql(u8, cmd.name, "/copy") or std.mem.eql(u8, cmd.name, "/config") or std.mem.eql(u8, cmd.name, "/history") or std.mem.eql(u8, cmd.name, "/export"));
     if (needs_conn and app.conn == null) return app.transcript.addMessage(.err, "not connected — use /connect", .{});
     const needs_idle = !(std.mem.eql(u8, cmd.name, "/help") or std.mem.eql(u8, cmd.name, "/clear") or std.mem.eql(u8, cmd.name, "/quit") or
         std.mem.eql(u8, cmd.name, "/copy"));
@@ -1216,6 +1339,17 @@ fn runCommand(app: *App, text: []const u8) !void {
     const eql = std.mem.eql;
     if (eql(u8, cmd.name, "/help")) return app.showHelp();
     if (eql(u8, cmd.name, "/config")) return app.configure(arg);
+    if (eql(u8, cmd.name, "/history")) return app.openHistory(arg);
+    if (eql(u8, cmd.name, "/explain")) return app.startExplain(arg);
+    if (eql(u8, cmd.name, "/export")) {
+        var args = std.mem.tokenizeAny(u8, arg, " \t");
+        const format = std.meta.stringToEnum(exporter.Format, args.next() orelse "") orelse
+            return app.transcript.addMessage(.err, "usage: /export <csv|json> [new-file-path]", .{});
+        app.export_table = false;
+        const path = std.mem.trim(u8, args.rest(), " \t");
+        if (path.len == 0) return app.openExportPath(format);
+        return app.exportResult(format, path);
+    }
     if (eql(u8, cmd.name, "/quit")) {
         app.running = false;
         return;
@@ -1708,6 +1842,7 @@ fn showHelp(app: *App) !void {
         .{ "ctrl+y", "copy input (or the last SQL / definition if input is empty)" },
         .{ "ctrl+s", "save input SQL (or the last query if input is empty)" },
         .{ "ctrl+r", "search saved queries and preview SQL" },
+        .{ "alt+r", "search SQL history and load a query for review" },
         .{ "pgup pgdn, mouse wheel", "scroll" },
         .{ "ctrl+c", "cancel query / clear input / exit (twice)" },
         .{ "ctrl+d", "exit (on an empty input)" },
@@ -1906,7 +2041,9 @@ fn jobTask(app: *App, job: *Job) void {
         const result = conn.queryOpts(app.gpa, sql, .{ .max_rows = job.max_rows });
         const ms = t0.untilNow(app.io, .awake).toMilliseconds();
         if (result) |r| {
-            job.outcomes.append(a, .{ .result = .{ .result = r, .ms = ms } }) catch {
+            var timed_result = r;
+            timed_result.elapsed_ms = ms;
+            job.outcomes.append(a, .{ .result = .{ .result = timed_result, .ms = ms } }) catch {
                 var rr = r;
                 rr.deinit();
                 return;
@@ -1960,6 +2097,111 @@ test "browse keys after a lost connection do not crash" {
         try std.testing.expect(app.job == null);
         try std.testing.expectEqualStrings("not connected — close with q and use /connect", app.table_view.?.notice.?);
     }
+}
+
+test "SQL tools confirm writes, search history, export views and show plans" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const csv_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "rows.csv" });
+    defer a.free(csv_path);
+    const json_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "view.json" });
+    defer a.free(json_path);
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try db.connect(a, std.testing.io, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+        .conn = conn,
+        .conn_params = .{ .kind = .sqlite, .database = ":memory:" },
+    };
+    defer app.deinit();
+    app.loop = .init(app.io, &app.tty, &app.vx);
+    defer while (app.job) |job| {
+        job.future.await(app.io);
+        app.finishJob();
+    };
+    var setup = try conn.query(a, "create table people(id integer primary key, name text); insert into people values (1,'Ada'),(2,'Grace'),(3,'Linus');");
+    setup.deinit();
+    const update = "update people set name = 'changed' where true";
+    try app.editor.setText(update);
+    try app.submit();
+    try std.testing.expect(app.job == null);
+    try std.testing.expectEqual(Picker.Purpose.confirm_sql, app.picker.?.purpose);
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    var unchanged = try conn.query(a, "select name from people where id=1");
+    defer unchanged.deinit();
+    try std.testing.expectEqualStrings("Ada", unchanged.rows[0][0].?);
+    try app.editor.setText(update);
+    try app.submit();
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.down });
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    app.job.?.future.await(app.io);
+    app.finishJob();
+    const changed = app.transcript.entries.items[app.transcript.entries.items.len - 1].content.result.result;
+    try std.testing.expectEqual(@as(?u64, 3), changed.affected_rows);
+    try std.testing.expect(changed.elapsed_ms != null);
+    try app.editor.setText("select id, name from people order by id");
+    try app.submit();
+    app.job.?.future.await(app.io);
+    app.finishJob();
+    try app.runCommand(try app.tmpPrint("/export csv {s}", .{csv_path}));
+    const csv = try Io.Dir.cwd().readFileAlloc(app.io, csv_path, a, .limited(4096));
+    defer a.free(csv);
+    try std.testing.expect(std.mem.indexOf(u8, csv, "\"1\",\"changed\"") != null);
+    try app.runCommand("/history changed");
+    try std.testing.expectEqual(@as(usize, 1), app.picker.?.matches.items.len);
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings(update, app.editor.text());
+    try std.testing.expect(app.job == null);
+    try app.openLastResult();
+    const tv = app.table_view.?;
+    tv.col = 1;
+    _ = try tv.handleKey(.{ .codepoint = 'x' });
+    _ = try tv.handleKey(.{ .codepoint = 's' });
+    _ = try tv.handleKey(.{ .codepoint = 's' });
+    try app.handleTableKey(.{ .codepoint = 'e' });
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.down });
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    try app.handlePickerKey(.{ .codepoint = 0, .text = json_path });
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqual(Mode.table, app.mode);
+    const json = try Io.Dir.cwd().readFileAlloc(app.io, json_path, a, .limited(4096));
+    defer a.free(json);
+    try std.testing.expectEqualStrings("[\n  {\"id\": \"3\"},\n  {\"id\": \"2\"},\n  {\"id\": \"1\"}\n]\n", json);
+    try app.handleTableKey(.{ .codepoint = 'q' });
+    try app.runCommand("/explain select * from people where id=2");
+    app.job.?.future.await(app.io);
+    app.finishJob();
+    try std.testing.expectEqual(Mode.table, app.mode);
+    try std.testing.expect(std.mem.indexOf(u8, app.table_view.?.result.rows[0][3].?, "SEARCH") != null);
+    try std.testing.expect(app.table_view.?.result.elapsed_ms != null);
+    try app.handleTableKey(.{ .codepoint = 'q' });
+    try app.runCommand("/explain update people set name='should not execute' where id=2");
+    app.job.?.future.await(app.io);
+    app.finishJob();
+    try std.testing.expectEqual(Mode.table, app.mode);
+    try app.handleTableKey(.{ .codepoint = 'q' });
+    try app.runCommand("/explain select 1; drop table people");
+    try std.testing.expect(app.job == null);
+    try app.startBrowse("people", "true; drop table people");
+    try std.testing.expect(app.job == null);
+    var rows = try conn.query(a, "select count(*) from people");
+    defer rows.deinit();
+    try std.testing.expectEqualStrings("3", rows.rows[0][0].?);
+    var name = try conn.query(a, "select name from people where id=2");
+    defer name.deinit();
+    try std.testing.expectEqualStrings("changed", name.rows[0][0].?);
 }
 
 test "read-only connections refuse writes before running them" {
@@ -2172,6 +2414,24 @@ fn processJob(app: *App, job: *Job) !void {
                 try app.startCacheLoad(false);
             } else {
                 try app.transcript.addMessage(.err, "{s}", .{job.connect_error orelse "connection failed"});
+            }
+        },
+        .explain => {
+            if (job.outcomes.items.len == 0) return;
+            const outcome = &job.outcomes.items[0];
+            switch (outcome.*) {
+                .result => |r| {
+                    const result = try app.gpa.create(db.Result);
+                    errdefer app.gpa.destroy(result);
+                    result.* = r.result;
+                    const tv = try TableView.init(app.gpa, result, true, "Query plan · enter expands a step · e exports", null, app.conn_name, app.conn_color);
+                    outcome.* = .canceled;
+                    if (app.table_view) |old| old.deinit();
+                    app.table_view = tv;
+                    app.mode = .table;
+                },
+                .failed => |msg| try app.transcript.addMessage(.err, "{s}", .{msg}),
+                .canceled => try app.transcript.addMessage(.warn, "plan canceled", .{}),
             }
         },
         .console => {
@@ -2652,7 +2912,7 @@ test "choosing a table opens its SQLite browse view" {
 }
 
 fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
-    if (try app.filterViolation(filter)) |word| return app.transcript.addMessage(.err, "restricted connection: browse filters may only read ('{s}' was refused)", .{word});
+    if (try app.filterViolation(filter)) |word| return app.transcript.addMessage(.err, "browse filters may only read ('{s}' was refused)", .{word});
     const job = try app.newJob(.{ .browse_open = undefined });
     const a = job.arena.allocator();
     const kind = app.conn.?.kind;
@@ -2697,7 +2957,7 @@ fn startBrowseReload(app: *App) !void {
     const tv = app.table_view orelse return;
     const b = tv.browse orelse return;
     if (try app.filterViolation(b.filter) != null) {
-        tv.notice = "restricted connection — the filter may only read";
+        tv.notice = "browse filters may only read";
         return;
     }
     const job = try app.newJob(.browse_reload);
@@ -2711,7 +2971,7 @@ fn startBrowseCount(app: *App) !void {
     const tv = app.table_view orelse return;
     const b = tv.browse orelse return;
     if (try app.filterViolation(b.filter) != null) {
-        tv.notice = "restricted connection — the filter may only read";
+        tv.notice = "browse filters may only read";
         return;
     }
     const job = try app.newJob(.browse_count);

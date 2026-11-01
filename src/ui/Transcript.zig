@@ -168,6 +168,7 @@ fn compactEntry(t: *Transcript, e: *Entry) Allocator.Error!void {
         .boolean_columns = boolean_columns,
         .rows = rows,
         .affected_rows = dropped.affected_rows,
+        .elapsed_ms = dropped.elapsed_ms,
         .status = status,
         .truncated = dropped.truncated,
         .retained_bytes = bytes,
@@ -437,10 +438,11 @@ fn layoutResult(
     }));
 
     if (!r.hasRows()) {
-        const status = try std.fmt.allocPrint(a, "{s} · {d} ms", .{ if (r.status.len > 0) r.status else "OK", elapsed_ms });
+        var status: std.Io.Writer.Allocating = .init(a);
+        render.writeStatus(&status.writer, r, elapsed_ms) catch return error.OutOfMemory;
         try out.append(a, try a.dupe(Segment, &.{
             .{ .text = "  └ ", .style = theme.dim },
-            .{ .text = status, .style = theme.ok },
+            .{ .text = status.written(), .style = theme.ok },
         }));
         return;
     }
@@ -500,6 +502,7 @@ fn layoutResult(
 
     var status: std.ArrayList(u8) = .empty;
     try status.print(a, "{s} · {d} ms", .{ r.status, elapsed_ms });
+    if (r.affected_rows) |n| try status.print(a, " · {d} row{s} affected", .{ n, if (n == 1) "" else "s" });
     if (r.truncated) try status.appendSlice(a, " · row limit reached");
     if (shown_rows < total_rows or hidden > 0) {
         try status.appendSlice(a, " · ");

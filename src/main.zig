@@ -3,6 +3,8 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const config = @import("config.zig");
+const exporter = @import("export.zig");
+const OutputFormat = enum { table, csv, json };
 const conninfo = @import("conninfo.zig");
 const db = @import("db/db.zig");
 const render = @import("render.zig");
@@ -29,6 +31,8 @@ const usage =
     \\
     \\Options:
     \\  -e, --execute SQL   run SQL, print the result and exit
+    \\      --format FORMAT table (default), csv or json; requires --execute
+    \\      --allow-dangerous  confirm DROP/TRUNCATE/UPDATE/DELETE in full mode
     \\  -c, --config PATH   use this config file
     \\      --driver NAME   postgres | mysql | mariadb | sqlite | clickhouse
     \\      --host HOST     server host (or a Unix socket directory/path)
@@ -56,6 +60,8 @@ const Cli = struct {
     password: ?[]const u8 = null,
     database: ?[]const u8 = null,
     execute: ?[]const u8 = null,
+    output_format: ?[]const u8 = null,
+    allow_dangerous: bool = false,
     config_path: ?[]const u8 = null,
     list: bool = false,
     init_config: bool = false,
@@ -76,6 +82,8 @@ fn parseArgs(args: []const [:0]const u8, stderr: *Io.Writer) !Cli {
             cli.list = true;
         } else if (std.mem.eql(u8, arg, "--init-config")) {
             cli.init_config = true;
+        } else if (std.mem.eql(u8, arg, "--allow-dangerous")) {
+            cli.allow_dangerous = true;
         } else if (valueOption(&cli, arg)) |field| {
             i += 1;
             if (i >= args.len) {
@@ -99,6 +107,7 @@ fn parseArgs(args: []const [:0]const u8, stderr: *Io.Writer) !Cli {
 /// Options that take a value; returns the field to store it in.
 fn valueOption(cli: *Cli, arg: []const u8) ?*?[]const u8 {
     if (eqlAny(arg, &.{ "-e", "--execute" })) return &cli.execute;
+    if (std.mem.eql(u8, arg, "--format")) return &cli.output_format;
     if (eqlAny(arg, &.{ "-c", "--config" })) return &cli.config_path;
     if (eqlAny(arg, &.{"--driver"})) return &cli.driver;
     if (eqlAny(arg, &.{"--host"})) return &cli.host;
@@ -228,7 +237,15 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr.writeAll("zpeek: --execute needs a connection\n");
             return 2;
         };
-        return executeOnce(gpa, io, e, sql, stdout, stderr);
+        const format = std.meta.stringToEnum(OutputFormat, cli.output_format orelse "table") orelse {
+            try stderr.writeAll("zpeek: --format must be table, csv or json\n");
+            return 2;
+        };
+        return executeOnce(gpa, io, e, sql, stdout, stderr, format, cli.allow_dangerous);
+    }
+    if (cli.output_format != null or cli.allow_dangerous) {
+        try stderr.writeAll("zpeek: --format and --allow-dangerous require --execute\n");
+        return 2;
     }
 
     try stdout.flush();
@@ -242,7 +259,7 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
-fn executeOnce(gpa: Allocator, io: Io, entry: config.Entry, sql: []const u8, stdout: *Io.Writer, stderr: *Io.Writer) !u8 {
+fn executeOnce(gpa: Allocator, io: Io, entry: config.Entry, sql: []const u8, stdout: *Io.Writer, stderr: *Io.Writer, format: OutputFormat, allow_dangerous: bool) !u8 {
     var err: db.ErrorText = .{};
     defer err.deinit(gpa);
     const conn = db.connect(gpa, io, entry.params, &err) catch |e| switch (e) {
@@ -273,7 +290,12 @@ fn executeOnce(gpa: Allocator, io: Io, entry: config.Entry, sql: []const u8, std
         try stderr.print("zpeek: {s}\n", .{App.delete_without_where_message});
         return 1;
     }
+    if (entry.params.access == .full and !allow_dangerous) if (@import("sql/lexer.zig").dangerousStatement(sql, dialect)) |word| {
+        try stderr.print("zpeek: '{s}' requires confirmation; review the SQL and rerun with --allow-dangerous\n", .{word});
+        return 1;
+    };
 
+    const started: Io.Timestamp = .now(io, .awake);
     var result = conn.query(gpa, sql) catch |e| switch (e) {
         error.AccessDenied => {
             try stderr.writeAll("zpeek: connection access policy blocked this statement; nothing was run\n");
@@ -286,8 +308,64 @@ fn executeOnce(gpa: Allocator, io: Io, entry: config.Entry, sql: []const u8, std
         else => |x| return x,
     };
     defer result.deinit();
-    try render.writeResult(gpa, stdout, result, .{});
+    result.elapsed_ms = started.untilNow(io, .awake).toMilliseconds();
+    switch (format) {
+        .table => try render.writeResult(gpa, stdout, result, .{}),
+        .csv, .json => {
+            exporter.write(stdout, result, if (format == .csv) .csv else .json, .{}) catch |e| {
+                try stderr.print("zpeek: cannot export: {t}; JSON columns need unique names\n", .{e});
+                return 1;
+            };
+            try render.writeStatus(stderr, result, result.elapsed_ms);
+            try stderr.writeByte('\n');
+            if (result.truncated) try stderr.writeAll("zpeek: exported result was truncated by the row/byte limit\n");
+        },
+    }
     return 0;
+}
+
+test "CLI export and dangerous confirmation preserve database data" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.sqlite", .data = "" });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "test.sqlite" });
+    defer a.free(path);
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try db.connect(a, io, .{ .kind = .sqlite, .database = path }, &err);
+    defer conn.close();
+    var setup = try conn.query(a, "create table people(id integer primary key, name text); insert into people values (1,'Ada');");
+    setup.deinit();
+    var entry: config.Entry = .{ .name = "test", .params = .{ .kind = .sqlite, .database = path } };
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var stdout: Io.Writer = .fixed(&out_buf);
+    var stderr: Io.Writer = .fixed(&err_buf);
+    try std.testing.expectEqual(@as(u8, 1), try executeOnce(a, io, entry, "select 1; drop table people", &stdout, &stderr, .table, false));
+    try std.testing.expectEqual(@as(usize, 0), stdout.buffered().len);
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "--allow-dangerous") != null);
+    stdout.end = 0;
+    stderr.end = 0;
+    try std.testing.expectEqual(@as(u8, 0), try executeOnce(a, io, entry, "select id,name from people", &stdout, &stderr, .csv, false));
+    try std.testing.expectEqualStrings("\"id\",\"name\"\r\n\"1\",\"Ada\"\r\n", stdout.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), " ms") != null);
+    stdout.end = 0;
+    stderr.end = 0;
+    try std.testing.expectEqual(@as(u8, 0), try executeOnce(a, io, entry, "select id,name from people", &stdout, &stderr, .json, false));
+    try std.testing.expectEqualStrings("[\n  {\"id\": \"1\", \"name\": \"Ada\"}\n]\n", stdout.buffered());
+    stdout.end = 0;
+    stderr.end = 0;
+    try std.testing.expectEqual(@as(u8, 0), try executeOnce(a, io, entry, "update people set name='Grace' returning id", &stdout, &stderr, .table, true));
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "1 row affected") != null);
+    entry.params.access = .read_delete;
+    stdout.end = 0;
+    stderr.end = 0;
+    try std.testing.expectEqual(@as(u8, 1), try executeOnce(a, io, entry, "drop table people", &stdout, &stderr, .table, true));
+    var rows = try conn.query(a, "select name from people");
+    defer rows.deinit();
+    try std.testing.expectEqualStrings("Grace", rows.rows[0][0].?);
 }
 
 fn listConnections(cfg: config.Config, w: *Io.Writer) !void {

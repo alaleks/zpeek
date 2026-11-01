@@ -9,7 +9,7 @@ const render = @import("../render.zig");
 
 const Picker = @This();
 
-pub const Purpose = enum { connect, browse, describe, query, save_query, overwrite_query, definition, type_value };
+pub const Purpose = enum { connect, browse, describe, query, history, confirm_sql, export_format, export_csv, export_json, save_query, overwrite_query, definition, type_value };
 
 pub const Item = struct {
     label: []const u8,
@@ -69,7 +69,7 @@ fn refilter(p: *Picker) Allocator.Error!void {
         for (p.items, 0..) |it, i| {
             if (!std.ascii.startsWithIgnoreCase(it.label, q) and
                 (std.ascii.findIgnoreCase(it.label, q) != null or std.ascii.findIgnoreCase(it.detail, q) != null or
-                    (p.purpose == .query and std.ascii.findIgnoreCase(it.value, q) != null)))
+                    ((p.purpose == .query or p.purpose == .history) and std.ascii.findIgnoreCase(it.value, q) != null)))
                 try p.matches.append(p.gpa, i);
         }
     }
@@ -115,7 +115,7 @@ pub fn handleKey(p: *Picker, key: vaxis.Key) Allocator.Error!Action {
 
 pub fn draw(p: *Picker, win: vaxis.Window, a: Allocator) Allocator.Error!void {
     const w: u16 = @min(win.width -| 4, 90);
-    const preview_rows: u16 = if (p.purpose == .query) @min(6, win.height -| 12) else 0;
+    const preview_rows: u16 = if (p.purpose == .query or p.purpose == .history or p.purpose == .confirm_sql) @min(6, win.height -| 12) else 0;
     const visible: usize = @min(@max(p.matches.items.len, 1), @as(usize, win.height -| (8 + preview_rows)), 15);
     // borders (2) + title + query + blank line
     const h: u16 = @intCast(visible + 5 + preview_rows);
@@ -140,13 +140,14 @@ pub fn draw(p: *Picker, win: vaxis.Window, a: Allocator) Allocator.Error!void {
     if (p.selected >= p.top + visible) p.top = p.selected + 1 - visible;
 
     if (p.matches.items.len == 0) {
-        const msg: []const u8 = if (p.purpose == .save_query) "type a name · enter saves · esc cancels" else if (p.allow_raw and p.query.items.len > 0) "no match — enter connects to this URL / path" else "no matches";
+        const msg: []const u8 = if (p.purpose == .export_csv or p.purpose == .export_json) "type a new file path · enter exports · esc cancels" else if (p.purpose == .save_query) "type a name · enter saves · esc cancels" else if (p.allow_raw and p.query.items.len > 0) "no match — enter connects to this URL / path" else "no matches";
         _ = box.print(&.{.{ .text = msg, .style = theme.dim }}, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
         return;
     }
     if (preview_rows > 0) {
-        _ = box.print(&.{.{ .text = "enter: load into editor · esc: cancel", .style = theme.dim }}, .{ .row_offset = @intCast(visible + 3), .col_offset = 1, .wrap = .none });
-        var lines = std.mem.splitScalar(u8, p.items[p.matches.items[p.selected]].value, '\n');
+        _ = box.print(&.{.{ .text = if (p.purpose == .confirm_sql) "enter: choose · esc: cancel · nothing has run" else "enter: load into editor · esc: cancel", .style = theme.dim }}, .{ .row_offset = @intCast(visible + 3), .col_offset = 1, .wrap = .none });
+        const preview = if (p.purpose == .confirm_sql) p.items[1].value else p.items[p.matches.items[p.selected]].value;
+        var lines = std.mem.splitScalar(u8, preview, '\n');
         var row: u16 = @intCast(visible + 4);
         while (lines.next()) |line| {
             if (row >= box.height) break;

@@ -1306,6 +1306,8 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
         try info.print(a, " · col {d}/{d} {s}", .{ tv.col + 1, tv.visible.items.len, col_name });
         if (last_col < tv.visible.items.len) try info.print(a, " · {d} more →", .{tv.visible.items.len - last_col});
         if (tv.hiddenCount() > 0) try info.print(a, " · {d} hidden", .{tv.hiddenCount()});
+        if (r.elapsed_ms) |ms| try info.print(a, " · {d} ms", .{ms});
+        if (r.affected_rows) |n| try info.print(a, " · {d} affected", .{n});
         var segs: std.ArrayList(Segment) = .empty;
         try segs.append(a, .{ .text = info.items, .style = theme.bold });
         if (tv.notice) |n| try segs.append(a, .{ .text = try std.fmt.allocPrint(a, "  {s}", .{n}), .style = theme.warn });
@@ -1323,11 +1325,11 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
         else
             " text · col:text · col=value · enter apply · esc cancel")
     else if (tv.browse) |b| (if (b.kind == .clickhouse)
-        " enter cell · / where · t count · s sort · c columns · x hide · n/p page · r/F5 refresh · q back"
+        " enter cell · e export · / where · t count · s sort · c columns · x hide · n/p page · r/F5 refresh · q back"
     else if (b.read_only)
-        " enter cell · f follow FK · / where · t count · s sort · c columns · n/p page · q back"
+        " enter cell · e export · f follow FK · / where · t count · s sort · c columns · n/p page · q back"
     else
-        " enter cell · f follow FK · / where · t count · s sort · c columns · d delete · n/p page · q back") else " enter cell · / filter · s sort · c columns · x hide · y/Y copy · q back";
+        " enter cell · e export · f follow FK · / where · t count · s sort · c columns · d delete · n/p page · q back") else " enter cell · e export · / filter · s sort · c columns · x hide · y/Y copy · q back";
     _ = win.print(&.{.{ .text = hint, .style = theme.dim }}, .{ .row_offset = 1, .wrap = .none });
 }
 

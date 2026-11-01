@@ -5,6 +5,8 @@ const Allocator = std.mem.Allocator;
 const lexer = @import("../sql/lexer.zig");
 
 const Editor = @This();
+pub const max_history = 1000;
+pub const max_history_bytes = 16 * 1024 * 1024;
 
 gpa: Allocator,
 buf: std.ArrayList(u8) = .empty,
@@ -14,6 +16,7 @@ cursor: usize = 0,
 goal_col: ?usize = null,
 
 history: std.ArrayList([]const u8) = .empty,
+history_bytes: usize = 0,
 /// Index into `history` while browsing it; null when editing a fresh line.
 history_pos: ?usize = null,
 /// The unsent text saved when history browsing started.
@@ -256,9 +259,17 @@ pub fn commitHistory(e: *Editor) Allocator.Error!void {
 pub fn commitHistoryText(e: *Editor, text_value: []const u8) Allocator.Error!void {
     const t = std.mem.trim(u8, text_value, " \t\r\n");
     if (t.len == 0) return;
+    if (t.len >= max_history_bytes) return;
     if (e.history.items.len > 0 and std.mem.eql(u8, e.history.items[e.history.items.len - 1], t)) return;
     try e.history.ensureUnusedCapacity(e.gpa, 1);
     e.history.appendAssumeCapacity(try e.gpa.dupe(u8, t));
+    e.history_bytes += t.len + 1;
+    while (e.history.items.len > max_history or e.history_bytes > max_history_bytes) {
+        const old = e.history.orderedRemove(0);
+        e.history_bytes -= old.len + 1;
+        e.gpa.free(old);
+        e.history_pos = null;
+    }
 }
 
 pub fn historyPrev(e: *Editor) Allocator.Error!void {
@@ -288,8 +299,7 @@ pub fn loadHistory(e: *Editor, data: []const u8) Allocator.Error!void {
     var it = std.mem.splitScalar(u8, data, 0);
     while (it.next()) |entry| {
         if (entry.len == 0) continue;
-        try e.history.ensureUnusedCapacity(e.gpa, 1);
-        e.history.appendAssumeCapacity(try e.gpa.dupe(u8, entry));
+        try e.commitHistoryText(entry);
     }
 }
 
@@ -321,6 +331,20 @@ test "history allocation failures release all owned strings" {
             try e.loadHistory("select 2;\x00select 3;\x00");
         }
     }.run, .{});
+}
+
+test "history keeps the newest entries within its count limit" {
+    var e: Editor = .init(testing.allocator);
+    defer e.deinit();
+    for (0..max_history + 3) |i| {
+        var buffer: [32]u8 = undefined;
+        try e.commitHistoryText(try std.fmt.bufPrint(&buffer, "select {d}", .{i}));
+    }
+    try testing.expectEqual(max_history, e.history.items.len);
+    try testing.expectEqualStrings("select 3", e.history.items[0]);
+    var bytes: usize = 0;
+    for (e.history.items) |entry| bytes += entry.len + 1;
+    try testing.expectEqual(bytes, e.history_bytes);
 }
 
 test "editing and cursor movement" {

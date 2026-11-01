@@ -51,6 +51,8 @@ const Sqlite = struct {
     fn runStatement(self: *Sqlite, s: *c.sqlite3_stmt, b: *db.ResultBuilder, opts: db.QueryOptions) db.QueryError!void {
         const a = b.allocator();
         const ncols: usize = @intCast(c.sqlite3_column_count(s));
+        const word = firstWord(std.mem.span(c.sqlite3_sql(s)));
+        const dml = isDml(word) or (std.ascii.eqlIgnoreCase(word, "with") and c.sqlite3_stmt_readonly(s) == 0);
         if (ncols > 0) {
             const names = try a.alloc([]const u8, ncols);
             for (names, 0..) |*n, i| {
@@ -69,8 +71,9 @@ const Sqlite = struct {
                 return if (rc == c.SQLITE_INTERRUPT) error.Canceled else error.QueryFailed;
             }
             if (b.full(opts)) {
-                // SQLite computes rows lazily, so stopping here is cheap.
                 b.result.truncated = true;
+                // Finish RETURNING writes to commit them and obtain the real affected count.
+                if (dml) continue;
                 break;
             }
             const row = try a.alloc(?[]const u8, ncols);
@@ -79,14 +82,15 @@ const Sqlite = struct {
         }
 
         if (ncols > 0) {
+            b.result.affected_rows = if (dml) @intCast(c.sqlite3_changes64(self.handle)) else null;
             b.result.status = try std.fmt.allocPrint(a, "{d}{s} row{s}", .{
                 b.rows.items.len, if (b.result.truncated) "+" else "", plural(b.rows.items.len),
             });
         } else {
             b.result.columns = &.{};
             b.rows.clearRetainingCapacity();
-            const verb = try std.ascii.allocUpperString(a, firstWord(std.mem.span(c.sqlite3_sql(s))));
-            if (isDml(verb)) {
+            const verb = try std.ascii.allocUpperString(a, word);
+            if (dml) {
                 const changes: u64 = @intCast(c.sqlite3_changes64(self.handle));
                 b.result.affected_rows = changes;
                 b.result.status = try std.fmt.allocPrint(a, "{s} {d}", .{ verb, changes });
@@ -194,10 +198,11 @@ fn hexBlob(a: Allocator, bytes: []const u8) Allocator.Error![]const u8 {
 }
 
 fn firstWord(sql: []const u8) []const u8 {
-    const t = std.mem.trimStart(u8, sql, " \t\r\n(");
-    var end: usize = 0;
-    while (end < t.len and std.ascii.isAlphabetic(t[end])) end += 1;
-    return t[0..end];
+    var tokens: lexer.Iterator = .initDialect(sql, .sqlite);
+    while (tokens.next()) |token| {
+        if (token.tag != .whitespace and token.tag != .comment) return token.text(sql);
+    }
+    return "";
 }
 
 fn isDml(word: []const u8) bool {
@@ -237,6 +242,24 @@ test "sqlite in-memory round trip" {
 
     try std.testing.expectError(error.QueryFailed, conn.query(gpa, "select * from missing"));
     try std.testing.expect(std.mem.indexOf(u8, conn.lastError(), "missing") != null);
+}
+
+test "RETURNING keeps the actual affected count when returned rows are limited" {
+    const a = std.testing.allocator;
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try connect(a, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    defer conn.close();
+    var setup = try conn.query(a, "create table t(id integer); insert into t values(1),(2),(3);");
+    setup.deinit();
+    var result = try conn.queryOpts(a, "-- comment\nwith input as (select 1) update t set id=id+1 returning id", .{ .max_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expect(result.truncated);
+    try std.testing.expectEqual(@as(?u64, 3), result.affected_rows);
+    var empty = try conn.query(a, "update t set id=4 where false returning id");
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(?u64, 0), empty.affected_rows);
 }
 
 test "read-only sqlite refuses writes" {

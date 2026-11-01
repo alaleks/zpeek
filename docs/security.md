@@ -31,7 +31,21 @@ DROP SCHEMA IF EXISTS public CASCADE;
 CREATE SCHEMA IF NOT EXISTS public;
 ```
 
-zpeek checks an entire SQL script before executing it. A forbidden statement prevents the whole script from running. Browse filters may only read in either restricted mode. Restricted modes accept only known metadata-reading PRAGMAs, and reject executable MySQL comments and deletes nested in CTEs.
+zpeek checks an entire SQL script before executing it. A forbidden statement prevents the whole script from running. Browse filters may only read in every mode; use the SQL prompt for writes. Restricted modes accept only known metadata-reading PRAGMAs, and reject executable MySQL comments and deletes nested in CTEs.
+
+## Confirmation in full mode
+
+Interactive SQL containing `DROP`, `TRUNCATE`, `UPDATE`, or `DELETE` opens a review dialog before anything runs. Cancel is selected by default; select **Run SQL** and press `enter` to approve the exact script. A canceled batch executes no statements. All UPDATE/DELETE statements require confirmation because a WHERE clause alone does not guarantee a small change. `DO`, `CALL`, `EXECUTE`, and executable MySQL comments also request confirmation because they can hide other actions.
+
+For CLI execution, approval is explicit:
+
+```sh
+zpeek prod -e 'update users set active = false where last_seen < current_date - 365' --allow-dangerous
+```
+
+Without `--allow-dangerous`, these scripts are refused. The flag does not bypass `read_only`/`read_delete` restrictions or the DELETE-without-WHERE safeguard. Selected-row deletion in `/browse` retains its own confirmation. `/explain` generates a plan without ANALYZE; it does not use confirmation to execute the underlying write.
+
+These safeguards do not discover arbitrary side effects in database functions; the [security boundary](#security-boundary) still applies.
 
 The older `read_only = true` remains equivalent to `access = "read_only"`; `false` means `"full"`. Top-level access settings and conflicting `access`/`read_only` values are rejected.
 

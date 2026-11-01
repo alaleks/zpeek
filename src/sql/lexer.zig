@@ -277,6 +277,23 @@ pub fn hasDeleteWithoutWhere(src: []const u8, dialect: Dialect) bool {
     return in_delete and !has_where;
 }
 
+/// Confirm all UPDATE/DELETE statements: a WHERE clause does not bound their impact.
+pub fn dangerousStatement(src: []const u8, dialect: Dialect) ?[]const u8 {
+    var it: Iterator = .initDialect(src, dialect);
+    while (it.next()) |t| switch (t.tag) {
+        .keyword, .identifier => if (inList(&.{ "drop", "truncate", "update", "delete", "do", "call", "execute" }, t.text(src))) return t.text(src),
+        .comment => if (dialect == .mysql and (std.mem.startsWith(u8, t.text(src), "/*!") or std.mem.startsWith(u8, t.text(src), "/*M!"))) return "executable comment",
+        else => {},
+    };
+    return null;
+}
+
+test "dangerous actions include batches and CTEs but exclude quoted text" {
+    for ([_][]const u8{ "DROP SCHEMA public CASCADE", "TRUNCATE t", "update t set x = 1", "delete from t where true", "select 1; drop table t", "with d as (delete from t where id = 1 returning *) select * from d", "DO $$ BEGIN EXECUTE 'DROP TABLE t'; END $$", "CALL cleanup()" }) |sql|
+        try std.testing.expect(dangerousStatement(sql, .postgres) != null);
+    try std.testing.expect(dangerousStatement("select 'drop table t', \"update\" -- delete\n", .postgres) == null);
+}
+
 test "delete without where" {
     try std.testing.expect(hasDeleteWithoutWhere("DELETE FROM users", .postgres));
     try std.testing.expect(hasDeleteWithoutWhere("delete from users;", .mysql));

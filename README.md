@@ -10,10 +10,12 @@
 
 - **Browse data:** filter, sort, page through rows, choose columns, and inspect full cell values.
 - **Follow foreign keys:** select an FK cell and preview its related record with `f`.
-- **Write SQL:** dialect-aware completion, saved queries, and a searchable query picker with previews.
+- **Write SQL:** dialect-aware completion, searchable SQL history, and saved queries with previews.
+- **Export results:** CSV or JSON from a query or the current table view.
+- **Inspect queries:** an EXPLAIN viewer, execution duration, and affected-row counts.
 - **Inspect schema:** columns, indexes, and constraints; definitions of views, functions, triggers, and custom types.
 - **Keep connections handy:** named profiles, color badges, and a built-in TOML editor with completion.
-- **Choose access per connection:** read-only, read + row deletion, or full access. See the [security limits](docs/security.md).
+- **Choose access per connection:** read-only, read + row deletion, or full access with confirmation for dangerous SQL. See the [security limits](docs/security.md).
 
 ## Quick start
 

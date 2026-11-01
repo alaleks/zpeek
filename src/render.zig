@@ -47,10 +47,17 @@ pub const TableOptions = struct {
     max_cell_width: usize = 60,
 };
 
+pub fn writeStatus(w: *std.Io.Writer, r: db.Result, elapsed_ms: ?i64) std.Io.Writer.Error!void {
+    try w.writeAll(if (r.status.len > 0) r.status else "OK");
+    if (r.affected_rows) |n| try w.print(" · {d} row{s} affected", .{ n, if (n == 1) "" else "s" });
+    if (elapsed_ms) |ms| try w.print(" · {d} ms", .{ms});
+}
+
 /// Writes a box-drawn table followed by the status line.
 pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableOptions) !void {
     if (!r.hasRows()) {
-        try w.print("{s}\n", .{if (r.status.len > 0) r.status else "OK"});
+        try writeStatus(w, r, r.elapsed_ms);
+        try w.writeByte('\n');
         return;
     }
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -77,7 +84,8 @@ pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableO
     try rule(w, widths, "├", "┼", "┤");
     for (1..r.rows.len + 1) |ri| try line(w, widths, cells[ri * ncols ..][0..ncols]);
     try rule(w, widths, "└", "┴", "┘");
-    try w.print("{s}\n", .{r.status});
+    try writeStatus(w, r, r.elapsed_ms);
+    try w.writeByte('\n');
 }
 
 fn cellText(a: Allocator, v: []const u8, max: usize) Allocator.Error![]const u8 {
@@ -116,4 +124,13 @@ test "fitWidth and singleLine" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectEqualStrings("a¶b", try singleLine(arena.allocator(), "a\r\nb"));
+}
+
+test "status explicitly shows zero affected rows and duration" {
+    var r: db.Result = .{ .arena = .init(std.testing.allocator), .status = "UPDATE", .affected_rows = 0 };
+    defer r.deinit();
+    var buffer: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeStatus(&writer, r, 12);
+    try std.testing.expectEqualStrings("UPDATE · 0 rows affected · 12 ms", writer.buffered());
 }

@@ -21,6 +21,7 @@ pub const Result = struct {
     rows: []const []const ?[]const u8 = &.{},
     /// Rows changed by INSERT/UPDATE/DELETE when the server reports it.
     affected_rows: ?u64 = null,
+    elapsed_ms: ?i64 = null,
     /// Short status line, e.g. "SELECT 3" or "CREATE TABLE".
     status: []const u8 = "",
     /// True when more rows were returned than `QueryOptions.max_rows`; the

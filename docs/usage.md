@@ -18,6 +18,9 @@ Type SQL or a `/command` at the prompt. SQL completion uses the connected databa
 | `/refresh` | Reload table and column names for completion |
 | `/save [name]`, `/queries [name]` | Save SQL or find a saved query; omit the name to open a dialog |
 | `/unsave <name>` | Delete a saved query |
+| `/history [search]` | Search SQL history and load an input for review |
+| `/export <csv\|json> [path]` | Export the last retained result; omit the path for a dialog |
+| `/explain [SQL]` | Open a query plan without `ANALYZE`; omit SQL to explain the last query |
 | `/copy` | Copy the last SQL query or displayed object definition |
 | `/connect [name\|url]`, `/disconnect` | Switch or close a connection |
 | `/config`, `/config edit`, `/config add …`, `/config remove …` | [Manage configuration](configuration.md) |
@@ -38,6 +41,7 @@ In a picker, type to filter and press `enter` to open the selected item.
 | `ctrl+o` | Open the last result in the full-screen table viewer |
 | `ctrl+s` | Save current SQL, or the last executed query if input is empty |
 | `ctrl+r` | Search saved queries and preview their SQL |
+| `alt+r` | Search SQL history, newest first |
 | `ctrl+y` | Copy input, or the last SQL / displayed definition if input is empty |
 | `ctrl+c` | Cancel a running query, dismiss completion, or clear input; press twice on empty input to exit |
 | `ctrl+d` | Exit on an empty prompt |
@@ -63,6 +67,7 @@ After selecting a view in `/views`, use `/copy` or `ctrl+y` with empty input to 
 | `c` | Choose visible columns |
 | `y` / `Y` | Copy a cell / row |
 | `d` | Prepare selected-row deletion for confirmation |
+| `e` | Export retained rows in the current sort/filter order and visible columns |
 | `q` / `esc` | Return to the console |
 
 Row deletion requires a primary key and is unavailable for ClickHouse or read-only connections. See [deletion safeguards](security.md#deleting-rows).
@@ -74,6 +79,51 @@ Press `ctrl+s` to save SQL from the editor without executing it. With empty inpu
 Press `ctrl+r` or run `/queries` to search by name or SQL text and preview the selected query. `enter` loads it into the editor for review. Loading replaces current input and **does not execute SQL**. `/queries <name>` loads a query directly; `/save <name>` saves without the naming dialog.
 
 Queries are ordinary `<name>.sql` files in the `queries` directory beside the active config. Names use letters, digits, `_`, `-`, and `.`; queries can also be edited outside zpeek.
+
+## SQL history
+
+Press `alt+r` or run `/history [search]` to search SQL inputs, including multiline SQL. The list shows newest inputs first with a SQL preview. `enter` loads the selection into the editor without executing it; `esc` preserves your draft. Slash commands are excluded from this picker. Canceled or refused SQL inputs may still appear: history records input, not proof of execution.
+
+History retains at most 1,000 console entries and 16 MiB. It is saved on exit to `$XDG_STATE_HOME/zpeek/history`, otherwise `$HOME/.local/state/zpeek/history`, or `%LOCALAPPDATA%\zpeek\history` on Windows without `HOME`. Connection commands remain redacted.
+
+## CSV and JSON export
+
+Export the last retained query result:
+
+```text
+/export csv ./result.csv
+/export json ./result.json
+```
+
+Omit the path to enter it in a dialog. In a table or plan viewer, press `e`, choose CSV or JSON, and enter a new file path. Table export includes the current visible columns and retained rows in their displayed sort/filter order. In `/browse`, that means the current page, not the entire database table.
+
+Export writes through a fixed-size buffer to an atomic file and refuses to overwrite an existing path. Files created this way are private to the user on Unix. CSV includes headers, quotes text fields, preserves embedded newlines and quotes, and represents SQL NULL as an empty field. JSON is an array of objects: non-NULL database values remain strings, preserving numeric precision, and SQL NULL becomes JSON `null`. JSON requires unique column names; use SQL aliases for duplicate names.
+
+For scripts, CSV/JSON go to stdout while timing and status go to stderr:
+
+```sh
+zpeek prod -e 'select id, name from users' --format csv > users.csv
+zpeek prod -e 'select id, name from users' --format json > users.json
+```
+
+Shell redirection controls these files and can overwrite them. Export uses retained results, with the limits below; it does not rerun SQL. Truncated source results are reported explicitly.
+
+## Timing and affected rows
+
+Interactive statement results show elapsed milliseconds and the affected-row count when the driver reports it, including zero affected rows. Table and plan viewers also show the query duration in their footer. CLI table output shows these metrics; `--format csv`/`json` sends them to stderr so exported data stays parseable.
+
+Duration measures the client-observed query call, including transfer and decoding, rather than server-only CPU time. Each interactive statement gets its own metrics. For a CLI script with multiple statements, the displayed result and affected count describe the driver's final result. SQLite `RETURNING` writes are finished even when retained rows are capped, so their affected count remains accurate.
+
+## Query plans
+
+```text
+/explain select * from users where id = 42
+/explain
+```
+
+The second form uses the last submitted query. One SELECT or DML statement is accepted; multiple statements, PRAGMAs, and nested EXPLAIN commands are refused. Connection access checks still apply, and individual databases determine which statement types they can explain.
+
+Plans open in the full-screen table viewer. Move between steps and columns, use `enter` to read a full step, `y` to copy a cell, `e` to export, and `q` to return. zpeek uses `EXPLAIN QUERY PLAN` for SQLite, `EXPLAIN PLAN` for ClickHouse, and `EXPLAIN` for PostgreSQL/MySQL. It never adds `ANALYZE`; normal EXPLAIN plans a statement rather than executing it. See the official [SQLite](https://www.sqlite.org/eqp.html), [PostgreSQL](https://www.postgresql.org/docs/18/sql-explain.html), [MySQL](https://dev.mysql.com/doc/refman/8.4/en/explain.html), and [ClickHouse](https://clickhouse.com/docs/reference/statements/explain) references.
 
 ## Result limits
 
