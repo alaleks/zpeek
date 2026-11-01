@@ -6,6 +6,7 @@ const c = @import("sqlite_c");
 const db = @import("db.zig");
 const conninfo = @import("../conninfo.zig");
 const schema = @import("schema.zig");
+const lexer = @import("../sql/lexer.zig");
 
 const Sqlite = struct {
     gpa: Allocator,
@@ -140,7 +141,7 @@ pub fn connect(gpa: Allocator, params: conninfo.Params, err_out: *db.ErrorText) 
 
     var handle: ?*c.sqlite3 = null;
     // No SQLITE_OPEN_CREATE: a typo in the path should not silently create an empty database.
-    const flags = (if (params.read_only) c.SQLITE_OPEN_READONLY else c.SQLITE_OPEN_READWRITE) | c.SQLITE_OPEN_URI;
+    const flags = (if (params.access == .read_only) c.SQLITE_OPEN_READONLY else c.SQLITE_OPEN_READWRITE) | c.SQLITE_OPEN_URI;
     const rc = c.sqlite3_open_v2(path.ptr, &handle, flags, null);
     if (rc != c.SQLITE_OK) {
         if (handle) |h| {
@@ -153,6 +154,11 @@ pub fn connect(gpa: Allocator, params: conninfo.Params, err_out: *db.ErrorText) 
     }
     errdefer _ = c.sqlite3_close_v2(handle.?);
 
+    if (params.access == .read_delete and c.sqlite3_set_authorizer(handle.?, authorizeReadDelete, null) != c.SQLITE_OK) {
+        err_out.set(gpa, "cannot restrict SQLite to reading and row deletion", .{});
+        return error.ConnectFailed;
+    }
+
     const self = try gpa.create(Sqlite);
     self.* = .{ .gpa = gpa, .handle = handle.? };
     _ = c.sqlite3_extended_result_codes(self.handle, 1);
@@ -162,6 +168,18 @@ pub fn connect(gpa: Allocator, params: conninfo.Params, err_out: *db.ErrorText) 
         .vtable = &Sqlite.vtable,
         .kind = .sqlite,
         .server_version = std.mem.span(c.sqlite3_libversion()),
+    };
+}
+
+fn authorizeReadDelete(_: ?*anyopaque, action: c_int, first: [*c]const u8, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+    return switch (action) {
+        c.SQLITE_SELECT, c.SQLITE_READ, c.SQLITE_FUNCTION, c.SQLITE_RECURSIVE => c.SQLITE_OK,
+        c.SQLITE_DELETE => if (first != null and !std.ascii.eqlIgnoreCase(std.mem.span(first), "sqlite_master") and
+            !std.ascii.eqlIgnoreCase(std.mem.span(first), "sqlite_schema") and
+            !std.ascii.eqlIgnoreCase(std.mem.span(first), "sqlite_temp_master") and
+            !std.ascii.eqlIgnoreCase(std.mem.span(first), "sqlite_temp_schema")) c.SQLITE_OK else c.SQLITE_DENY,
+        c.SQLITE_PRAGMA => if (first != null and lexer.isReadPragma(std.mem.span(first))) c.SQLITE_OK else c.SQLITE_DENY,
+        else => c.SQLITE_DENY,
     };
 }
 
@@ -225,7 +243,7 @@ test "read-only sqlite refuses writes" {
     const gpa = std.testing.allocator;
     var err: db.ErrorText = .{};
     defer err.deinit(gpa);
-    const conn = try connect(gpa, .{ .kind = .sqlite, .database = ":memory:", .read_only = true }, &err);
+    const conn = try connect(gpa, .{ .kind = .sqlite, .database = ":memory:", .access = .read_only }, &err);
     defer conn.close();
     try std.testing.expectError(error.QueryFailed, conn.query(gpa, "create table t(id integer)"));
     try std.testing.expect(std.mem.indexOf(u8, conn.lastError(), "readonly") != null);

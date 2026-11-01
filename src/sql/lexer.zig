@@ -302,17 +302,37 @@ const write_words = [_][]const u8{ "insert", "update", "delete", "merge", "into"
 /// or null when every statement only reads. The server enforces read-only
 /// too; this check gives a clear message before anything is sent.
 pub fn readOnlyViolation(src: []const u8, dialect: Dialect) ?[]const u8 {
+    return restrictedViolation(src, dialect, false);
+}
+
+pub fn readDeleteViolation(src: []const u8, dialect: Dialect) ?[]const u8 {
+    return restrictedViolation(src, dialect, true);
+}
+
+pub fn isReadPragma(name: []const u8) bool {
+    return inList(&.{ "table_info", "table_xinfo", "index_info", "index_xinfo", "index_list", "foreign_key_list", "database_list", "compile_options" }, name);
+}
+
+fn restrictedViolation(src: []const u8, dialect: Dialect, allow_delete: bool) ?[]const u8 {
     var it: Iterator = .initDialect(src, dialect);
     var depth: usize = 0;
     var at_start = true;
+    var in_pragma = false;
+    var pragma_name = false;
     while (it.next()) |t| {
         switch (t.tag) {
-            .whitespace, .comment => {},
+            .whitespace => {},
+            .comment => {
+                const text = t.text(src);
+                if (dialect == .mysql and (std.mem.startsWith(u8, text, "/*!") or std.mem.startsWith(u8, text, "/*M!"))) return "executable comment";
+            },
             .punctuation => switch (src[t.start]) {
                 '(' => depth += 1,
                 ')' => depth -|= 1,
                 ';' => if (depth == 0) {
                     at_start = true;
+                    in_pragma = false;
+                    pragma_name = false;
                 },
                 else => if (at_start) return t.text(src),
             },
@@ -320,13 +340,70 @@ pub fn readOnlyViolation(src: []const u8, dialect: Dialect) ?[]const u8 {
                 const w = t.text(src);
                 if (at_start) {
                     at_start = false;
-                    if (!inList(&read_statements, w)) return w;
-                } else if (inList(&write_words, w)) return w;
+                    if (!inList(&read_statements, w) and !(allow_delete and std.ascii.eqlIgnoreCase(w, "delete"))) return w;
+                    in_pragma = std.ascii.eqlIgnoreCase(w, "pragma");
+                    pragma_name = in_pragma;
+                } else if (pragma_name) {
+                    pragma_name = false;
+                    if (!isReadPragma(w)) return w;
+                } else if (inList(&write_words, w) and !(allow_delete and std.ascii.eqlIgnoreCase(w, "delete"))) return w;
+                if (allow_delete and depth > 0 and std.ascii.eqlIgnoreCase(w, "delete")) return w;
+                if (inList(&.{ "load_extension", "set_config" }, w)) return w;
+                if (std.ascii.eqlIgnoreCase(w, "replace")) {
+                    // REPLACE writes rows; replace(...) is a string function.
+                    var lookahead = it;
+                    while (lookahead.next()) |next| {
+                        if (next.tag == .whitespace or next.tag == .comment) continue;
+                        if (next.tag != .punctuation or src[next.start] != '(') return w;
+                        break;
+                    } else return w;
+                }
+                if (allow_delete and std.ascii.eqlIgnoreCase(w, "settings")) return w;
             },
+            .quoted_identifier => {
+                const word = t.text(src);
+                if (word.len >= 2 and inList(&.{ "set_config", "load_extension" }, word[1 .. word.len - 1])) return word;
+                if (at_start or pragma_name) return word;
+            },
+            .operator => if (at_start or in_pragma) return t.text(src),
             else => if (at_start) return t.text(src),
         }
     }
     return null;
+}
+
+test "read-delete allows row deletes but refuses schema changes and other writes" {
+    for ([_][]const u8{
+        "select * from people",
+        "delete from people where id = 1",
+        "with ids as (select id from people) delete from people where id in (select id from ids)",
+        "select 'drop table people'; delete from people where id = 2 returning *",
+        "pragma table_info(people)",
+        "select replace(name, 'old', 'new') from people",
+    }) |sql| try std.testing.expect(readDeleteViolation(sql, .sqlite) == null);
+    for ([_][]const u8{
+        "create table other(id integer)",
+        "create view other as select * from people",
+        "create index idx on people(id)",
+        "alter table people add column other text",
+        "drop schema public cascade",
+        "drop table people",
+        "truncate people",
+        "insert into people values (1)",
+        "update people set id = 1",
+        "with ids as (select 1) replace people values (1)",
+        "delete from people where id = 1; drop table people",
+        "with x as (delete from people returning *) select * from x",
+        "explain analyze update people set id = 2",
+        "pragma writable_schema = 1",
+        "pragma foreign_keys(off)",
+        "select load_extension('evil')",
+        "select \"set_config\"('transaction_read_only', 'off', false)",
+        "select 1; /*!50000 DROP TABLE people */",
+        "select 1; /*M! DROP TABLE people */",
+        "select 1 settings readonly = 0",
+        "call change_schema()",
+    }) |sql| try std.testing.expect(readDeleteViolation(sql, .mysql) != null);
 }
 
 test "read-only violation" {

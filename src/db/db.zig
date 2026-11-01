@@ -4,6 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const conninfo = @import("../conninfo.zig");
+const lexer = @import("../sql/lexer.zig");
 pub const Kind = conninfo.Kind;
 
 const sqlite = @import("sqlite.zig");
@@ -96,6 +97,7 @@ pub const QueryError = error{
     /// The connection is unusable; the caller should reconnect.
     ConnectionLost,
     Canceled,
+    AccessDenied,
 } || Allocator.Error;
 
 pub const ConnectError = error{ConnectFailed} || Allocator.Error;
@@ -122,6 +124,7 @@ pub const Connection = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     kind: Kind,
+    access: conninfo.Access = .full,
     /// Server version string, e.g. "16.2" or "11.4.2-MariaDB".
     server_version: []const u8 = "",
 
@@ -135,10 +138,17 @@ pub const Connection = struct {
     };
 
     pub fn query(c: Connection, gpa: Allocator, sql: []const u8) QueryError!Result {
-        return c.vtable.query(c.ptr, gpa, sql, .{});
+        return c.queryOpts(gpa, sql, .{});
     }
 
     pub fn queryOpts(c: Connection, gpa: Allocator, sql: []const u8, opts: QueryOptions) QueryError!Result {
+        const dialect: lexer.Dialect = switch (c.kind) {
+            .postgres => .postgres,
+            .mysql, .clickhouse => .mysql,
+            .sqlite => .sqlite,
+        };
+        if (c.access.violation(sql, dialect) != null) return error.AccessDenied;
+        if (c.access != .full and lexer.hasDeleteWithoutWhere(sql, dialect)) return error.AccessDenied;
         return c.vtable.query(c.ptr, gpa, sql, opts);
     }
 
@@ -193,7 +203,7 @@ fn closeLateConnection(result: anytype) void {
 }
 
 fn connectRaw(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *ErrorText) ConnectError!Connection {
-    const conn = try switch (params.kind) {
+    var conn = try switch (params.kind) {
         .sqlite => sqlite.connect(gpa, params, err_out),
         .postgres => postgres.connect(gpa, io, params, err_out),
         .mysql => mysql.connect(gpa, io, params, err_out),
@@ -201,12 +211,18 @@ fn connectRaw(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *ErrorTe
     };
     // SQLite opens the file read-only and ClickHouse sends readonly=2 with
     // every request; the network servers get a read-only session.
+    if (params.access != .read_only) {
+        conn.access = params.access;
+        return conn;
+    }
     const sql = switch (params.kind) {
         .postgres => "SET default_transaction_read_only = on",
         .mysql => "SET SESSION TRANSACTION READ ONLY",
-        .sqlite, .clickhouse => return conn,
+        .sqlite, .clickhouse => {
+            conn.access = params.access;
+            return conn;
+        },
     };
-    if (!params.read_only) return conn;
     var r = conn.query(gpa, sql) catch |err| {
         // Fail closed: never hand out a writable session for a read-only entry.
         err_out.set(gpa, "cannot make the session read-only: {s}", .{conn.lastError()});
@@ -214,6 +230,7 @@ fn connectRaw(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *ErrorTe
         return if (err == error.OutOfMemory) error.OutOfMemory else error.ConnectFailed;
     };
     r.deinit();
+    conn.access = params.access;
     return conn;
 }
 
@@ -222,6 +239,53 @@ test {
     _ = postgres;
     _ = mysql;
     _ = clickhouse;
+}
+
+test "read-delete connection refuses schema writes and only deletes matching rows" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app.sqlite", .data = "" });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "app.sqlite" });
+    var err: ErrorText = .{};
+    defer err.deinit(gpa);
+    const full = try connect(gpa, std.testing.io, .{ .kind = .sqlite, .database = path }, &err);
+    defer full.close();
+    var setup = try full.query(gpa, "create table people(id integer primary key); insert into people values (1), (2), (3);");
+    setup.deinit();
+    const limited = try connect(gpa, std.testing.io, .{ .kind = .sqlite, .database = path, .access = .read_delete }, &err);
+    defer limited.close();
+    var columns = try limited.query(gpa, "select * from pragma_table_info('people')");
+    columns.deinit();
+    var removed = try limited.query(gpa, "delete from people where id = 1");
+    removed.deinit();
+    for ([_][]const u8{
+        "create table other(id integer)",
+        "create view other as select * from people",
+        "create index idx on people(id)",
+        "alter table people add column name text",
+        "drop table people",
+        "insert into people values (4)",
+        "update people set id = 4",
+        "delete from people",
+        "delete from people where id = 2; drop table people",
+        "pragma writable_schema = on",
+    }) |sql| try std.testing.expectError(error.AccessDenied, limited.query(gpa, sql));
+    var rows = try limited.query(gpa, "select id from people order by id");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+    try std.testing.expectEqualStrings("2", rows.rows[0][0].?);
+    var trigger = try full.query(gpa, "create table audit(id integer); create trigger audit_delete after delete on people begin insert into audit values (old.id); end;");
+    trigger.deinit();
+    // SQLite's authorizer also rejects writes hidden in an existing trigger.
+    try std.testing.expectError(error.QueryFailed, limited.query(gpa, "delete from people where id = 2"));
+    try std.testing.expectError(error.QueryFailed, limited.vtable.query(limited.ptr, gpa, "drop table people", .{}));
+    var remaining = try limited.query(gpa, "select count(*) from people");
+    defer remaining.deinit();
+    try std.testing.expectEqualStrings("2", remaining.rows[0][0].?);
 }
 
 test "result byte limit stops storing rows" {

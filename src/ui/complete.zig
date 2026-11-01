@@ -4,8 +4,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lexer = @import("../sql/lexer.zig");
 const db = @import("../db/db.zig");
+const toml = @import("../toml.zig");
 
-pub const Kind = enum { command, table, column, operator, keyword, function, connection, query };
+pub const Kind = enum { command, table, column, operator, keyword, function, connection, query, config_key, config_value };
 
 pub const Candidate = struct {
     text: []const u8,
@@ -81,6 +82,7 @@ pub const SchemaCache = struct {
 pub const Completion = struct {
     /// Number of bytes before the cursor that the chosen candidate replaces.
     replace_len: usize,
+    replace_after: usize = 0,
     candidates: []const Candidate,
     /// False for long generic lists (e.g. all clause keywords after a space)
     /// that should only appear on Tab, not while typing.
@@ -209,6 +211,163 @@ pub fn operatorSnippet(operator: []const u8) OperatorSnippet {
 }
 
 const max_candidates = 200;
+
+const config_fields = [_]Candidate{
+    .{ .text = "url", .kind = .config_key, .detail = "connection URL" },
+    .{ .text = "path", .kind = .config_key, .detail = "SQLite file path" },
+    .{ .text = "driver", .kind = .config_key, .detail = "database driver (without url/path)" },
+    .{ .text = "host", .kind = .config_key, .detail = "host or socket path" },
+    .{ .text = "port", .kind = .config_key, .detail = "port number" },
+    .{ .text = "user", .kind = .config_key, .detail = "database user" },
+    .{ .text = "password", .kind = .config_key, .detail = "plain text password" },
+    .{ .text = "password_env", .kind = .config_key, .detail = "password environment variable" },
+    .{ .text = "database", .kind = .config_key, .detail = "database name" },
+    .{ .text = "color", .kind = .config_key, .detail = "badge color: #RRGGBB" },
+    .{ .text = "access", .kind = .config_key, .detail = "full / read_only / read_delete" },
+    .{ .text = "sslmode", .kind = .config_key, .detail = "TLS mode" },
+    .{ .text = "read_only", .kind = .config_key, .detail = "legacy boolean; prefer access" },
+};
+
+/// Completes ordinary TOML fields; inline tables and multiline values are left alone.
+// shortcut: completion follows line-based fields, extend when inline-table editing needs it.
+pub fn configComplete(a: Allocator, text: []const u8, cursor: usize, connections: []const []const u8) Allocator.Error!Completion {
+    const empty: Completion = .{ .replace_len = 0, .candidates = &.{} };
+    const start = if (std.mem.lastIndexOfScalar(u8, text[0..cursor], '\n')) |i| i + 1 else 0;
+    const end = if (std.mem.indexOfScalar(u8, text[cursor..], '\n')) |i| cursor + i else text.len;
+    // An incomplete multiline value must not suggest setting names inside its text.
+    _ = toml.parse(a, text[0..start], null) catch |err| switch (err) {
+        error.SyntaxError => return empty,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    var fields: []const Candidate = &.{
+        .{ .text = "default", .kind = .config_key, .detail = "default connection name" },
+        .{ .text = "[connections.local]", .kind = .config_key, .detail = "new connection section" },
+    };
+    var lines = std.mem.splitScalar(u8, text[0..start], '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] != '[') continue;
+        const root = toml.parse(a, trimmed, null) catch |err| switch (err) {
+            error.SyntaxError => continue,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        fields = &.{};
+        if (root.get("connections")) |v| {
+            if (v == .table and v.table.count() > 0) fields = &config_fields;
+        }
+    }
+    var field_start = start;
+    while (field_start < cursor and std.ascii.isWhitespace(text[field_start])) field_start += 1;
+    if (field_start < end and text[field_start] == '#') return empty;
+    const equal = if (std.mem.indexOfScalar(u8, text[start..end], '=')) |i| start + i else end;
+    var candidates: std.ArrayList(Candidate) = .empty;
+    if (cursor <= equal) {
+        const prefix = std.mem.trim(u8, text[field_start..cursor], " \t\"'");
+        const key_end = @max(cursor, start + std.mem.trimEnd(u8, text[start..equal], " \t").len);
+        for (fields) |field| {
+            if (!std.mem.startsWith(u8, field.text, prefix)) continue;
+            try candidates.append(a, .{
+                .text = if (equal == end and field.text[0] != '[') try std.mem.concat(a, u8, &.{ field.text, " = " }) else field.text,
+                .kind = .config_key,
+                .detail = field.detail,
+            });
+        }
+        return .{ .replace_len = cursor - field_start, .replace_after = key_end - cursor, .candidates = candidates.items, .auto = prefix.len > 0 };
+    }
+    const key = std.mem.trim(u8, text[field_start..equal], " \t\"'");
+    const supported = for (fields) |field| {
+        if (std.mem.eql(u8, field.text, key)) break true;
+    } else false;
+    if (!supported) return empty;
+    const boolean = std.mem.eql(u8, key, "read_only");
+    const values: []const []const u8 = if (std.mem.eql(u8, key, "access"))
+        &.{ "full", "read_only", "read_delete" }
+    else if (std.mem.eql(u8, key, "driver"))
+        &.{ "postgres", "mysql", "mariadb", "sqlite", "clickhouse" }
+    else if (std.mem.eql(u8, key, "sslmode"))
+        &.{ "disable", "prefer", "require", "verify-ca", "verify-full" }
+    else if (boolean)
+        &.{ "true", "false" }
+    else if (std.mem.eql(u8, key, "default") and fields.len == 2)
+        connections
+    else
+        return empty;
+    var value_start = equal + 1;
+    while (value_start < end and std.ascii.isWhitespace(text[value_start])) value_start += 1;
+    if (cursor < value_start) return empty;
+    const quote: ?u8 = if (value_start < end and (text[value_start] == '"' or text[value_start] == '\'')) text[value_start] else null;
+    var value_end = value_start;
+    if (quote) |q| {
+        value_end += 1;
+        while (value_end < end) : (value_end += 1) {
+            if (text[value_end] == '\\' and q == '"' and value_end + 1 < end) {
+                value_end += 1;
+            } else if (text[value_end] == q) {
+                value_end += 1;
+                break;
+            }
+        }
+    } else {
+        while (value_end < end and !std.ascii.isWhitespace(text[value_end]) and text[value_end] != '#') value_end += 1;
+    }
+    if (cursor > value_end) return empty;
+    const prefix = std.mem.trim(u8, text[value_start..cursor], "\"'");
+    var exact = false;
+    for (values) |value| {
+        if (!std.mem.startsWith(u8, value, prefix)) continue;
+        const insertion = if (boolean) value else if (quote == '\'' and std.mem.indexOfScalar(u8, value, '\'') == null)
+            try std.fmt.allocPrint(a, "'{s}'", .{value})
+        else
+            try std.json.Stringify.valueAlloc(a, value, .{});
+        if (cursor == value_end and std.mem.eql(u8, text[value_start..cursor], insertion)) exact = true;
+        const detail: []const u8 = if (std.mem.eql(u8, key, "access")) blk: {
+            if (std.mem.eql(u8, value, "read_only")) break :blk "reading only";
+            if (std.mem.eql(u8, value, "read_delete")) break :blk "reading + DELETE with WHERE";
+            break :blk "all operations (default)";
+        } else "";
+        try candidates.append(a, .{ .text = insertion, .kind = .config_value, .detail = detail });
+    }
+    return .{ .replace_len = cursor - value_start, .replace_after = value_end - cursor, .candidates = candidates.items, .exact_match = exact };
+}
+
+test "config completion replaces fields and values without duplicating quotes or suffixes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_][3][]const u8{
+        .{ "[connections.local]\nacc|", "access = ", "[connections.local]\naccess = " },
+        .{ "[connections.local]\ndriver = p|", "\"postgres\"", "[connections.local]\ndriver = \"postgres\"" },
+        .{ "[connections.local]\naccess = \"read_o|nly\" # keep", "\"read_only\"", "[connections.local]\naccess = \"read_only\" # keep" },
+        .{ "[connections.local]\nsslmode = 'verify-f|ull'", "'verify-full'", "[connections.local]\nsslmode = 'verify-full'" },
+        .{ "[connections.local]\nread_only = t|rue # keep", "true", "[connections.local]\nread_only = true # keep" },
+        .{ "default = lo|", "\"local\"", "default = \"local\"" },
+        .{ "['connections'.'local']\n'co|lor' = '#FF0000'", "color", "['connections'.'local']\ncolor = '#FF0000'" },
+    };
+    for (cases) |case| {
+        const cursor = std.mem.indexOfScalar(u8, case[0], '|').?;
+        const text = try std.mem.concat(a, u8, &.{ case[0][0..cursor], case[0][cursor + 1 ..] });
+        const result = try configComplete(a, text, cursor, &.{"local"});
+        var found = false;
+        for (result.candidates) |candidate| {
+            if (!std.mem.eql(u8, candidate.text, case[1])) continue;
+            found = true;
+            const edited = try std.mem.concat(a, u8, &.{ text[0 .. cursor - result.replace_len], candidate.text, text[cursor + result.replace_after ..] });
+            try std.testing.expectEqualStrings(case[2], edited);
+        }
+        try std.testing.expect(found);
+    }
+    for ([_][]const u8{
+        "[connections.local]\ncolor = \"#FF",
+        "[connections.local]\nurl = \"postgres://",
+        "[connections.local]\npassword = \"secret",
+        "[connections.local]\n# access",
+        "[connections.local]\nurl = \"\"\"\naccess = ",
+        "[other]\naccess = ",
+        "access = ",
+    }) |text| try std.testing.expectEqual(@as(usize, 0), (try configComplete(a, text, text.len, &.{})).candidates.len);
+    const finished = "[connections.local]\naccess = \"read_only\"";
+    try std.testing.expect((try configComplete(a, finished, finished.len, &.{})).exact_match);
+}
 
 pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
     const before = ctx.text[0..ctx.cursor];

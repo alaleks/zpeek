@@ -55,7 +55,7 @@ const commands = [_]complete.Command{
     .{ .name = "/help", .help = "show commands and keys", .aliases = &.{"/?"} },
     .{ .name = "/connect", .args = "[name|url]", .help = "connect (no argument: pick from config)", .arg = .connection, .aliases = &.{"/c"} },
     .{ .name = "/disconnect", .help = "close the connection" },
-    .{ .name = "/config", .args = "[add <name> <#RRGGBB> <url|path> | remove <name>]", .help = "save or remove a connection; no argument: list saved connections" },
+    .{ .name = "/config", .args = "[edit | add <name> <#RRGGBB> <url|path> | remove <name>]", .help = "edit config, save/remove connections; no argument: list and help" },
     .{ .name = "/tables", .help = "pick a table to browse", .aliases = &.{"/t"} },
     .{ .name = "/views", .help = "pick a view to show its SQL", .aliases = &.{"/v"} },
     .{ .name = "/types", .help = "pick a type to show its values", .aliases = &.{"/enums"} },
@@ -66,7 +66,7 @@ const commands = [_]complete.Command{
     .{ .name = "/def", .args = "<name>", .help = "source of a view, function, trigger or enum" },
     .{ .name = "/databases", .help = "list databases", .aliases = &.{"/dbs"} },
     .{ .name = "/refresh", .help = "reload table/column names for completion" },
-    .{ .name = "/save", .args = "<name>", .help = "save the last SQL you ran under a name" },
+    .{ .name = "/save", .args = "[name]", .help = "save SQL (no name: open save dialog)" },
     .{ .name = "/copy", .help = "copy the last SQL query or displayed definition to the clipboard" },
     .{ .name = "/queries", .args = "[name]", .help = "saved queries: pick one to put it in the input", .arg = .query, .aliases = &.{"/sq"} },
     .{ .name = "/unsave", .args = "<name>", .help = "delete a saved query", .arg = .query },
@@ -74,7 +74,41 @@ const commands = [_]complete.Command{
     .{ .name = "/quit", .help = "exit", .aliases = &.{ "/q", "/exit" } },
 };
 
-const Mode = enum { console, table, picker };
+const Mode = enum { console, table, picker, config };
+
+const ConfigEdit = struct {
+    previous: Editor,
+    original: ?[]const u8,
+    message: ?[]const u8 = null,
+    discard_armed: bool = false,
+    show_help: bool = true,
+    help_top: usize = 0,
+    help_page_size: usize = 5,
+};
+
+const config_help = [_][]const u8{
+    "default = \"local\"  (before connection sections)",
+    "[connections.local]  (one section per connection)",
+    "access = \"full\" | \"read_only\" | \"read_delete\"",
+    "  full: all; read_only: read; read_delete: read + DELETE",
+    "  default: full; DELETE requires WHERE",
+    "url = \"postgres://user@localhost/app\"",
+    "path = \"~/app.sqlite\"  (SQLite, instead of url)",
+    "driver = \"postgres\"  (when url/path is absent)",
+    "  postgres | mysql | mariadb | sqlite | clickhouse",
+    "host = \"localhost\"",
+    "port = 5432  (number; driver default if omitted)",
+    "user = \"user\"",
+    "database = \"app\"",
+    "password_env = \"DB_PASSWORD\"  (environment variable)",
+    "password = \"...\"  (plain text; prefer password_env)",
+    "color = \"#2F6B43\"  (#RRGGBB)",
+    "sslmode = \"prefer\"",
+    "  disable | prefer | require | verify-ca | verify-full",
+    "read_only = true | false  (legacy; prefer access)",
+    "Do not combine conflicting access and read_only values.",
+    "Explicit connection fields override values from the URL.",
+};
 
 const JobKind = union(enum) {
     connect: struct { name: []const u8, params: conninfo.Params },
@@ -120,6 +154,7 @@ io: Io,
 env: *std.process.Environ.Map,
 cfg: config.Config,
 config_arena: ?std.heap.ArenaAllocator = null,
+config_edit: ?ConfigEdit = null,
 
 tty: vaxis.Tty = undefined,
 tty_buf: [4096]u8 = undefined,
@@ -152,6 +187,7 @@ exit_armed: bool = false,
 notice: std.ArrayList(u8) = .empty,
 /// The last SQL text sent to the server, for /save and /copy.
 last_sql: std.ArrayList(u8) = .empty,
+pending_save: std.ArrayList(u8) = .empty,
 frame_arena: std.heap.ArenaAllocator,
 history_path: ?[]const u8 = null,
 
@@ -244,6 +280,11 @@ fn deinit(app: *App) void {
     if (app.conn) |c| c.close();
     if (app.cache) |*c| c.deinit();
     app.editor.deinit();
+    if (app.config_edit) |*edit| {
+        edit.previous.deinit();
+        if (edit.original) |text| app.gpa.free(text);
+        if (edit.message) |message| app.gpa.free(message);
+    }
     app.transcript.deinit();
     app.conn_arena.deinit();
     app.popup_arena.deinit();
@@ -251,6 +292,7 @@ fn deinit(app: *App) void {
     if (app.config_arena) |*arena| arena.deinit();
     app.notice.deinit(app.gpa);
     app.last_sql.deinit(app.gpa);
+    app.pending_save.deinit(app.gpa);
 }
 
 fn tickerTask(app: *App) void {
@@ -291,7 +333,7 @@ fn loadHistory(app: *App) !void {
 fn saveHistory(app: *App) void {
     const path = app.history_path orelse return;
     defer app.gpa.free(path);
-    const items = app.editor.history.items;
+    const items = if (app.config_edit) |edit| edit.previous.history.items else app.editor.history.items;
     const start = items.len -| history_limit;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(app.gpa);
@@ -363,7 +405,8 @@ fn handleEvent(app: *App, event: Event) !void {
         },
         .paste => |text| {
             defer app.gpa.free(text);
-            if (app.mode == .console) try app.editor.insertPaste(text);
+            if (app.config_edit) |*edit| edit.discard_armed = false;
+            if (app.mode == .console or app.mode == .config) try app.editor.insertPaste(text);
         },
         .focus_in => {},
         .mouse => |m| app.handleMouse(m),
@@ -382,13 +425,13 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
         .table => if (app.table_view) |tv| {
             if (delta < 0) tv.row -|= 3 else tv.row = @min(tv.row + 3, tv.view.items.len -| 1);
         },
-        .picker => {},
+        .picker, .config => {},
     }
 }
 
 fn handleKey(app: *App, key: vaxis.Key) !void {
     if (app.pasting) {
-        if (app.mode != .console) return;
+        if (app.mode != .console and app.mode != .config) return;
         if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
             try app.editor.insert("\n");
         } else if (key.matches(vaxis.Key.tab, .{})) {
@@ -402,7 +445,51 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     switch (app.mode) {
         .picker => return app.handlePickerKey(key),
         .table => return app.handleTableKey(key),
-        .console => {},
+        .console, .config => {},
+    }
+
+    const editing_config = app.mode == .config;
+    if (editing_config) {
+        if (app.popup != null and try app.handlePopupKey(key)) return;
+        if (key.matches(vaxis.Key.f1, .{})) {
+            app.config_edit.?.show_help = !app.config_edit.?.show_help;
+            return;
+        }
+        if (app.config_edit.?.show_help) {
+            if (key.matches(vaxis.Key.page_down, .{})) {
+                app.config_edit.?.help_top = @min(app.config_edit.?.help_top + app.config_edit.?.help_page_size, config_help.len - 1);
+                return;
+            }
+            if (key.matches(vaxis.Key.page_up, .{})) {
+                app.config_edit.?.help_top -|= app.config_edit.?.help_page_size;
+                return;
+            }
+        }
+        if (key.matches('s', .{ .ctrl = true })) return app.saveConfigEditor();
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
+            const edit = &app.config_edit.?;
+            if (!edit.discard_armed and !std.mem.eql(u8, app.editor.text(), edit.original orelse config.example)) {
+                edit.discard_armed = true;
+                return app.configNotice("Unsaved changes — press esc again to discard, or ctrl+s to save");
+            }
+            app.closeConfigEditor();
+            return;
+        }
+        app.config_edit.?.discard_armed = false;
+        if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) return app.editor.insert("\n");
+        if (key.matches(vaxis.Key.tab, .{})) return app.openCompletion(true);
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true })) {
+            app.editor.up();
+            return;
+        }
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
+            app.editor.down();
+            return;
+        }
+        if (key.matches('d', .{ .ctrl = true }) or key.matches('y', .{ .ctrl = true }) or
+            key.matches('r', .{ .ctrl = true }) or key.matches('o', .{ .ctrl = true }) or key.matches('l', .{ .ctrl = true }) or
+            key.matches(vaxis.Key.page_up, .{}) or key.matches(vaxis.Key.page_down, .{}) or
+            key.matches(vaxis.Key.up, .{ .shift = true }) or key.matches(vaxis.Key.down, .{ .shift = true })) return;
     }
 
     const exit_was_armed = app.exit_armed;
@@ -428,6 +515,11 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     }
     if (key.matches('y', .{ .ctrl = true })) {
         return app.copyQuery(if (app.editor.isEmpty()) app.sqlToCopy() else app.editor.text());
+    }
+    if (key.matches('s', .{ .ctrl = true })) return app.saveQuery("");
+    if (key.matches('r', .{ .ctrl = true })) {
+        app.closePopup();
+        return app.openQueriesPicker();
     }
 
     if (app.popup != null) {
@@ -493,6 +585,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     } else if (key.text) |t| {
         if (!key.mods.ctrl and !(key.mods.alt and t.len == 1)) {
             try e.insert(t);
+            if (editing_config) return app.openCompletion(false);
             if (std.mem.startsWith(u8, e.text(), "/")) {
                 try app.openCompletion(false);
             } else if (app.conn != null) {
@@ -532,7 +625,7 @@ fn handlePopupKey(app: *App, key: vaxis.Key) !bool {
         // While the list is open, Enter inserts the selected suggestion (like
         // Tab). The list closes on space or punctuation, and it does not open
         // for an already complete word, so Enter then runs the query.
-        try app.acceptCandidate(cand, p.completion.replace_len);
+        try app.acceptCandidate(cand, p.completion.replace_len, p.completion.replace_after);
         return true;
     }
     if (key.matches(vaxis.Key.escape, .{})) {
@@ -547,6 +640,10 @@ fn handlePopupKey(app: *App, key: vaxis.Key) !bool {
     if (key.text) |t| {
         if (!key.mods.ctrl and !key.mods.alt) {
             try app.editor.insert(t);
+            if (app.mode == .config) {
+                try app.openCompletion(false);
+                return true;
+            }
             // keep filtering while typing identifier characters
             if (t.len == 1 and !lexer.isIdentChar(t[0]) and t[0] != '/' and t[0] != '.') {
                 app.closePopup();
@@ -564,7 +661,7 @@ fn handlePopupKey(app: *App, key: vaxis.Key) !bool {
     return false;
 }
 
-fn acceptCandidate(app: *App, cand: complete.Candidate, replace_len: usize) Allocator.Error!void {
+fn acceptCandidate(app: *App, cand: complete.Candidate, replace_len: usize, replace_after: usize) Allocator.Error!void {
     var text = cand.text;
     var cursor_back: usize = 0;
     const a = app.popup_arena.allocator();
@@ -579,8 +676,10 @@ fn acceptCandidate(app: *App, cand: complete.Candidate, replace_len: usize) Allo
         cursor_back = snippet.cursor_back;
     }
     if (cand.kind == .keyword) text = try std.mem.concat(a, u8, &.{ text, " " });
+    if (replace_after > 0) try app.editor.buf.replaceRange(app.gpa, app.editor.cursor, replace_after, "");
     try app.editor.replaceBeforeCursorAndMove(replace_len, text, cursor_back);
     app.closePopup();
+    if (cand.kind == .config_key and std.mem.endsWith(u8, text, " = ")) return app.openCompletion(false);
     // Show what can follow right away: tables after FROM, columns after WHERE…
     if ((cand.kind == .command or cand.kind == .keyword) and std.mem.endsWith(u8, text, " ")) {
         try app.openCompletion(false);
@@ -612,7 +711,7 @@ fn openCompletion(app: *App, explicit: bool) Allocator.Error!void {
     const a = app.popup_arena.allocator();
     var names: std.ArrayList([]const u8) = .empty;
     for (app.cfg.connections) |c| try names.append(a, c.name);
-    const result = try complete.complete(a, .{
+    const result = if (app.mode == .config) try complete.configComplete(a, app.editor.text(), app.editor.cursor, names.items) else try complete.complete(a, .{
         .text = app.editor.text(),
         .cursor = app.editor.cursor,
         .cache = if (app.cache) |*c| c else null,
@@ -622,15 +721,15 @@ fn openCompletion(app: *App, explicit: bool) Allocator.Error!void {
         .commands = &commands,
         .kind = if (app.conn) |conn| conn.kind else null,
     });
-    if (result.candidates.len == 0) {
+    if (result.candidates.len == 0 or (app.mode == .config and !explicit and (!result.auto or result.exact_match))) {
         app.popup = null;
         return;
     }
     if (explicit and result.candidates.len == 1) {
-        try app.acceptCandidate(result.candidates[0], result.replace_len);
+        try app.acceptCandidate(result.candidates[0], result.replace_len, result.replace_after);
         return;
     }
-    if (explicit) {
+    if (explicit and app.mode != .config) {
         // Insert the longest common prefix right away.
         const lcp = commonPrefix(result.candidates);
         if (lcp.len > result.replace_len) {
@@ -693,13 +792,20 @@ fn handlePickerKey(app: *App, key: vaxis.Key) !void {
                     app.closePicker();
                     try app.loadSavedQuery(name);
                 },
+                .save_query, .overwrite_query => {
+                    const name = try app.gpa.dupe(u8, if (purpose == .overwrite_query) p.items[i].value else label);
+                    defer app.gpa.free(name);
+                    app.closePicker();
+                    if (name.len > 0) try app.writeSavedQuery(name, purpose == .overwrite_query);
+                },
             }
         },
         .raw => |text| {
+            const purpose = p.purpose;
             const t = try app.gpa.dupe(u8, text);
             defer app.gpa.free(t);
             app.closePicker();
-            try app.connectTarget(t);
+            if (purpose == .save_query) try app.writeSavedQuery(t, false) else try app.connectTarget(t);
         },
     }
 }
@@ -793,9 +899,10 @@ fn submit(app: *App) !void {
         // Backslash escapes in strings, like MySQL.
         .clickhouse => .mysql,
     };
-    if (app.readOnly()) if (lexer.readOnlyViolation(text, dialect)) |word| {
-        return app.transcript.addMessage(.err, read_only_message, .{word});
-    };
+    if ((if (app.conn_params) |p| p.access else conninfo.Access.full).violation(text, dialect)) |word| {
+        if (app.readOnly()) return app.transcript.addMessage(.err, read_only_message, .{word});
+        return app.transcript.addMessage(.err, read_delete_message, .{word});
+    }
     if (lexer.hasDeleteWithoutWhere(text, dialect)) {
         return app.transcript.addMessage(.err, "{s}", .{delete_without_where_message});
     }
@@ -924,11 +1031,90 @@ test "copy command and shortcut preserve SQL and handle empty input" {
     try std.testing.expectEqualStrings("select 1;", app.sqlToCopy());
 }
 
+test "saved query shortcuts preserve drafts and confirm replacement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "config.toml" });
+    defer a.free(path);
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = path, .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+    };
+    defer app.deinit();
+    const sql = "select *\nfrom people;";
+    try app.editor.setText(sql);
+    try app.handleKey(.{ .codepoint = 's', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqual(Picker.Purpose.save_query, app.picker.?.purpose);
+    try app.handlePickerKey(.{ .codepoint = 'r', .text = "recent" });
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings(sql, app.editor.text());
+    const dir = (try app.queriesDir()).?;
+    try std.testing.expectEqualStrings(sql, try queries.load(app.frame_arena.allocator(), app.io, dir, "recent"));
+    try app.editor.setText("select 2;");
+    try app.saveQuery("recent");
+    try std.testing.expectEqual(Picker.Purpose.overwrite_query, app.picker.?.purpose);
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings(sql, try queries.load(app.frame_arena.allocator(), app.io, dir, "recent"));
+    try app.handleKey(.{ .codepoint = 'r', .mods = .{ .ctrl = true } });
+    try app.handlePickerKey(.{ .codepoint = 'p', .text = "people" });
+    try std.testing.expectEqual(@as(usize, 1), app.picker.?.matches.items.len);
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqualStrings("select 2;", app.editor.text());
+    try app.handleKey(.{ .codepoint = 'r', .mods = .{ .ctrl = true } });
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings(sql, app.editor.text());
+    try std.testing.expect(app.conn == null);
+    try app.editor.setText("select 2;");
+    try app.saveQuery("recent");
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.down });
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings("select 2;", try queries.load(app.frame_arena.allocator(), app.io, dir, "recent"));
+    try app.editor.setText("select 3;");
+    try app.runCommand("/save");
+    try app.handlePickerKey(.{ .codepoint = 'r', .text = "rec" });
+    try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings("select 3;", try queries.load(app.frame_arena.allocator(), app.io, dir, "rec"));
+}
+
 fn saveQuery(app: *App, name: []const u8) !void {
-    if (!queries.validName(name)) return app.transcript.addMessage(.err, "usage: /save <name> — letters, digits, '_', '-', '.'", .{});
-    if (app.last_sql.items.len == 0) return app.transcript.addMessage(.err, "nothing to save yet — run an SQL query first", .{});
+    const input = std.mem.trim(u8, app.editor.text(), " \t\r\n");
+    const sql = if (input.len > 0 and input[0] != '/') input else app.last_sql.items;
+    if (sql.len == 0) return app.transcript.addMessage(.warn, "nothing to save — type SQL first, then press ctrl+s", .{});
+    app.pending_save.clearRetainingCapacity();
+    try app.pending_save.appendSlice(app.gpa, sql);
+    app.closePopup();
+    if (name.len > 0) return app.writeSavedQuery(name, false);
     const dir = (try app.queriesDir()) orelse return app.transcript.addMessage(.err, "cannot determine the config directory", .{});
-    queries.save(app.gpa, app.io, dir, name, app.last_sql.items) catch |err| {
+    const a = app.frame_arena.allocator();
+    const entries = queries.list(a, app.io, dir) catch |err| return app.transcript.addMessage(.err, "cannot read saved queries: {t}", .{err});
+    var items: std.ArrayList(Picker.Item) = .empty;
+    for (entries) |entry| try items.append(a, .{ .label = entry.name, .detail = entry.preview });
+    app.picker = try Picker.init(app.gpa, .save_query, "Save query · type a name · enter saves · tab selects · esc cancels", items.items, true);
+    app.mode = .picker;
+}
+
+fn writeSavedQuery(app: *App, name: []const u8, overwrite: bool) !void {
+    if (!queries.validName(name)) return app.transcript.addMessage(.err, "invalid query name — use letters, digits, '_', '-', '.' (up to 64 characters)", .{});
+    const dir = (try app.queriesDir()) orelse return app.transcript.addMessage(.err, "cannot determine the config directory", .{});
+    queries.save(app.gpa, app.io, dir, name, app.pending_save.items, overwrite) catch |err| {
+        if (err == error.PathAlreadyExists and !overwrite) {
+            app.picker = try Picker.init(app.gpa, .overwrite_query, "Query already exists · overwrite?", &.{
+                .{ .label = "Cancel" },
+                .{ .label = "Overwrite", .detail = name, .value = name },
+            }, false);
+            app.mode = .picker;
+            return;
+        }
         return app.transcript.addMessage(.err, "cannot save query: {t}", .{err});
     };
     try app.transcript.addMessage(.ok, "saved as '{s}' ({s}) — /queries to use it", .{ name, dir });
@@ -947,22 +1133,23 @@ fn openQueriesPicker(app: *App) !void {
     const dir = (try app.queriesDir()) orelse return app.transcript.addMessage(.err, "cannot determine the config directory", .{});
     const a = app.frame_arena.allocator();
     const entries = queries.list(a, app.io, dir) catch |err| return app.transcript.addMessage(.err, "cannot read {s}: {t}", .{ dir, err });
-    if (entries.len == 0) return app.transcript.addMessage(.dim, "no saved queries yet — run SQL, then /save <name>", .{});
+    if (entries.len == 0) return app.transcript.addMessage(.dim, "no saved queries yet — type SQL and press ctrl+s to save it", .{});
     var items: std.ArrayList(Picker.Item) = .empty;
-    for (entries) |e| try items.append(a, .{ .label = e.name, .detail = e.preview });
+    for (entries) |e| try items.append(a, .{ .label = e.name, .detail = e.preview, .value = e.sql });
     app.picker = try Picker.init(app.gpa, .query, "Saved queries", items.items, false);
     app.mode = .picker;
 }
 
 pub const read_only_message = "read-only connection: only reading statements run ('{s}' was refused, nothing was run)";
+pub const read_delete_message = "read-delete connection: only reading statements and DELETE with WHERE are allowed ('{s}' was refused, nothing was run)";
 
 fn readOnly(app: *const App) bool {
-    return if (app.conn_params) |p| p.read_only else false;
+    return if (app.conn_params) |p| p.access == .read_only else false;
 }
 
 /// A browse filter is user SQL inside `WHERE`; read-only connections refuse writes there too.
 fn filterViolation(app: *App, filter: []const u8) !?[]const u8 {
-    if (!app.readOnly() or filter.len == 0) return null;
+    if (filter.len == 0 or app.conn_params == null or app.conn_params.?.access == .full) return null;
     const dialect: lexer.Dialect = switch (app.conn.?.kind) {
         .postgres => .postgres,
         .mysql, .clickhouse => .mysql,
@@ -971,7 +1158,7 @@ fn filterViolation(app: *App, filter: []const u8) !?[]const u8 {
     return lexer.readOnlyViolation(try app.tmpPrint("select 1 where {s}", .{filter}), dialect);
 }
 
-pub const delete_without_where_message = "DELETE without WHERE is blocked: nothing was run. Add a WHERE clause (WHERE true deletes every row) or use TRUNCATE.";
+pub const delete_without_where_message = "DELETE without WHERE is blocked: nothing was run. Add a WHERE clause (WHERE true deletes every row).";
 
 fn redactConnectionInput(text: []const u8) []const u8 {
     const name_end = std.mem.indexOfAny(u8, text, " \t\n") orelse return text;
@@ -1078,36 +1265,244 @@ fn runCommand(app: *App, text: []const u8) !void {
     }
 }
 
+fn openConfigEditor(app: *App) !void {
+    if (app.cfg.path.len == 0) return app.transcript.addMessage(.err, "cannot determine config path — start zpeek with --config <path>", .{});
+    const original = Io.Dir.cwd().readFileAlloc(app.io, app.cfg.path, app.gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return app.transcript.addMessage(.err, "cannot open config: {t}", .{err}),
+    };
+    errdefer if (original) |text| app.gpa.free(text);
+    var editor: Editor = .init(app.gpa);
+    errdefer editor.deinit();
+    try editor.setText(original orelse config.example);
+    editor.cursor = 0;
+    app.closePopup();
+    app.config_edit = .{ .previous = app.editor, .original = original };
+    app.editor = editor;
+    app.mode = .config;
+}
+
+fn closeConfigEditor(app: *App) void {
+    app.closePopup();
+    const edit = app.config_edit.?;
+    app.editor.deinit();
+    app.editor = edit.previous;
+    if (edit.original) |text| app.gpa.free(text);
+    if (edit.message) |message| app.gpa.free(message);
+    app.config_edit = null;
+    app.mode = .console;
+}
+
+fn configNotice(app: *App, message: []const u8) !void {
+    const owned = try app.gpa.dupe(u8, message);
+    if (app.config_edit.?.message) |old| app.gpa.free(old);
+    app.config_edit.?.message = owned;
+}
+
+fn saveConfigEditor(app: *App) !void {
+    app.config_edit.?.discard_armed = false;
+    var arena: std.heap.ArenaAllocator = .init(app.gpa);
+    var transferred = false;
+    defer if (!transferred) arena.deinit();
+    var diag: config.Diagnostic = .{};
+    const cfg = config.saveText(arena.allocator(), app.io, app.env, app.cfg.path, app.editor.text(), app.config_edit.?.original, &diag) catch |err| {
+        return app.configNotice(switch (err) {
+            error.InvalidConfig => try app.tmpPrint("Not saved: {s}", .{diag.message}),
+            error.ConfigChanged => "Not saved: config changed outside zpeek — reopen /config edit to load the latest version",
+            error.ConfigTooLarge => "Not saved: config exceeds the 4 MiB limit",
+            else => try app.tmpPrint("Not saved: {t} — check the config path and file permissions", .{err}),
+        });
+    };
+    if (app.config_arena) |*old| old.deinit();
+    app.config_arena = arena;
+    transferred = true;
+    app.cfg = cfg;
+    if (cfg.find(app.conn_name)) |entry| app.conn_color = entry.color;
+    app.closeConfigEditor();
+    return app.transcript.addMessage(.ok, "config saved: {s} — saved connections updated; reconnect to apply changed connection parameters", .{cfg.path});
+}
+
 fn configure(app: *App, arg: []const u8) !void {
-    if (arg.len == 0) {
-        try app.transcript.addMessage(.dim, "config: {s}", .{app.cfg.path});
-        for (app.cfg.connections) |entry| try app.transcript.addMessage(.dim, "  {s}", .{entry.name});
-        return app.transcript.addMessage(.dim, "usage: /config add <name> <#RRGGBB> <url|path> | /config remove <name>", .{});
-    }
+    const add_usage = "usage: /config add <name> <#RRGGBB> <url|path> — example: /config add local #2F6B43 postgres://postgres@localhost/app";
+    const remove_usage = "usage: /config remove <name> — example: /config remove local";
     var words = std.mem.tokenizeAny(u8, arg, " \t\r\n");
-    const action = words.next().?;
-    const name = words.next() orelse return app.transcript.addMessage(.err, "missing connection name — use /config for help", .{});
-    const change: config.Change = if (std.mem.eql(u8, action, "add")) blk: {
-        const color = words.next() orelse return app.transcript.addMessage(.err, "missing color (#RRGGBB)", .{});
+    const action = words.next() orelse {
+        try app.transcript.addMessage(.dim, "config: {s}", .{app.cfg.path});
+        if (app.cfg.connections.len == 0) try app.transcript.addMessage(.dim, "no saved connections yet — add one with /config add", .{});
+        for (app.cfg.connections) |entry| try app.transcript.addMessage(.dim, "  {s}", .{entry.name});
+        try app.transcript.addMessage(.info, "{s}", .{add_usage});
+        try app.transcript.addMessage(.info, "edit the file in zpeek: /config edit", .{});
+        return app.transcript.addMessage(.info, "{s}", .{remove_usage});
+    };
+    if (std.mem.eql(u8, action, "edit")) {
+        if (words.next() != null) return app.transcript.addMessage(.err, "usage: /config edit — no arguments needed", .{});
+        return app.openConfigEditor();
+    }
+    const adding = std.mem.eql(u8, action, "add");
+    if (!adding and !std.mem.eql(u8, action, "remove"))
+        return app.transcript.addMessage(.err, "unknown /config action — use add, remove or edit; /config shows examples", .{});
+    const usage = if (adding) add_usage else remove_usage;
+    const name = words.next() orelse return app.transcript.addMessage(.err, "missing connection name; {s}", .{usage});
+    const change: config.Change = if (adding) blk: {
+        const color = words.next() orelse return app.transcript.addMessage(.err, "missing connection color (example: #2F6B43); {s}", .{usage});
+        _ = config.parseColor(color) catch return app.transcript.addMessage(.err, "invalid connection color — use # followed by 6 hexadecimal digits (example: #2F6B43); {s}", .{usage});
         const url = std.mem.trim(u8, words.rest(), " \t\r\n");
-        if (url.len == 0) return app.transcript.addMessage(.err, "missing connection URL or path", .{});
+        if (url.len == 0) return app.transcript.addMessage(.err, "missing connection URL or SQLite file path; {s}", .{usage});
         break :blk .{ .add = .{ .name = name, .url = url, .color = color } };
-    } else if (std.mem.eql(u8, action, "remove") and words.next() == null)
+    } else if (words.next() == null)
         .{ .remove = name }
     else
-        return app.transcript.addMessage(.err, "usage: /config add <name> <#RRGGBB> <url|path> | /config remove <name>", .{});
+        return app.transcript.addMessage(.err, "too many arguments — remove accepts only a connection name; {s}", .{usage});
 
     var arena: std.heap.ArenaAllocator = .init(app.gpa);
     var transferred = false;
     defer if (!transferred) arena.deinit();
     const cfg = config.update(arena.allocator(), app.io, app.env, app.cfg.path, change) catch |err| {
-        return app.transcript.addMessage(.err, "config was not changed: {t}", .{err});
+        const message = switch (err) {
+            error.ConnectionExists => "this connection name is already saved — choose another name or remove the existing connection first",
+            error.UnknownConnection => "no saved connection has this name — use /config to list saved connections",
+            error.InvalidName => "invalid connection name — use a non-empty name without spaces",
+            error.InvalidConnectionString => "malformed connection string — example: postgres://postgres@localhost/app or ./app.sqlite",
+            error.UnknownScheme => "unsupported connection URL scheme — use postgres://, mysql://, mariadb://, sqlite:// or clickhouse://",
+            error.InvalidPort => "invalid connection port — use a number between 0 and 65535",
+            error.InvalidSslMode => "invalid sslmode — use disable, prefer, require, verify-ca or verify-full",
+            error.InvalidConfig => "the config file contains invalid settings or TOML syntax — fix it before saving connections",
+            error.MissingConfigPath => "cannot determine the config path — start zpeek with --config <path>",
+            error.ConfigTooLarge => "the config file exceeds the 4 MiB limit — reduce its size before saving",
+            else => return app.transcript.addMessage(.err, "cannot read or write config {s}: {t} — check the file and directory permissions; no changes were saved", .{ app.cfg.path, err }),
+        };
+        return app.transcript.addMessage(.err, "{s}; config was not changed ({s})", .{ message, app.cfg.path });
     };
     if (app.config_arena) |*old| old.deinit();
     app.config_arena = arena;
     transferred = true;
     app.cfg = cfg;
     return app.transcript.addMessage(.dim, "{s} connection '{s}' in {s}", .{ if (change == .add) "saved" else "removed", name, cfg.path });
+}
+
+test "config editor preserves SQL drafts and never submits config as SQL" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "config.toml" });
+    defer a.free(path);
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = path, .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+    };
+    defer app.deinit();
+    try app.editor.setText("select 42;");
+    try app.editor.commitHistoryText("select 1;");
+    try app.runCommand("/config edit extra");
+    try std.testing.expectEqual(Mode.console, app.mode);
+    try app.runCommand("/config edit");
+    try std.testing.expectEqual(Mode.config, app.mode);
+    try std.testing.expectEqualStrings(config.example, app.editor.text());
+    try std.testing.expect(app.config_edit.?.show_help);
+    try app.handleKey(.{ .codepoint = vaxis.Key.page_down });
+    try std.testing.expectEqual(@as(usize, 5), app.config_edit.?.help_top);
+    try app.handleKey(.{ .codepoint = vaxis.Key.page_up });
+    try std.testing.expectEqual(@as(usize, 0), app.config_edit.?.help_top);
+    try app.handleKey(.{ .codepoint = vaxis.Key.f1 });
+    try std.testing.expect(!app.config_edit.?.show_help);
+    try std.testing.expectEqualStrings(config.example, app.editor.text());
+    try app.handleKey(.{ .codepoint = vaxis.Key.f1 });
+    try std.testing.expect(app.config_edit.?.show_help);
+    var output: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&output);
+    app.vx = try vaxis.init(app.io, a, &env, .{});
+    defer app.vx.deinit(a, &writer);
+    var long_url: [400]u8 = undefined;
+    @memset(&long_url, 'x');
+    std.mem.copyForwards(u8, &long_url, "url = \"postgres://");
+    long_url[long_url.len - 1] = '"';
+    for ([_]u16{ 120, 80, 40 }) |cols| {
+        try app.vx.resize(a, &writer, .{ .cols = cols, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+        try app.editor.setText(&long_url);
+        const editor_width = if (cols >= 110) cols - 56 else cols;
+        app.editor.cursor = editor_width - 4;
+        try app.draw();
+        const win = app.vx.window();
+        try std.testing.expect(app.vx.screen.cursor_vis);
+        try std.testing.expectEqual(@as(u16, 7), app.vx.screen.cursor.col);
+        try std.testing.expectEqual(@as(u16, 2), app.vx.screen.cursor.row);
+        try std.testing.expect(win.readCell(3, 2).?.default);
+        try std.testing.expectEqualStrings("x", win.readCell(7, 2).?.char.grapheme);
+        const help_col: u16 = if (cols >= 110) cols - 53 else 1;
+        const help_row: u16 = if (cols >= 110) 1 else 13;
+        try std.testing.expectEqualStrings("P", win.readCell(help_col, help_row).?.char.grapheme);
+        if (cols >= 110) try std.testing.expect(win.readCell(cols - 56, 2).?.default);
+    }
+    try app.editor.setText("[connections.local]\nacc");
+    try app.openCompletion(false);
+    try std.testing.expect(app.popup != null);
+    try app.handleKey(.{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("[connections.local]\naccess = ", app.editor.text());
+    try std.testing.expectEqual(@as(usize, 3), app.popup.?.completion.candidates.len);
+    for ([_]u16{ 120, 80, 40 }) |cols| {
+        try app.vx.resize(a, &writer, .{ .cols = cols, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+        try app.draw();
+        const help_col: u16 = if (cols >= 110) cols - 53 else 1;
+        const help_row: u16 = if (cols >= 110) 1 else 13;
+        try std.testing.expectEqualStrings("P", app.vx.window().readCell(help_col, help_row).?.char.grapheme);
+        try std.testing.expect(app.vx.screen.cursor_vis);
+    }
+    try app.handleKey(.{ .codepoint = vaxis.Key.down });
+    try app.handleKey(.{ .codepoint = vaxis.Key.down });
+    try app.handleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings("[connections.local]\naccess = \"read_delete\"", app.editor.text());
+    try std.testing.expect(app.popup == null);
+    try app.editor.setText("[connections.local]\nsslmode = 'verify-full' # keep");
+    app.editor.cursor = "[connections.local]\nsslmode = 'verify-f".len;
+    try app.handleKey(.{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("[connections.local]\nsslmode = 'verify-full' # keep", app.editor.text());
+    try app.editor.setText("[connections.local]\nco");
+    try app.openCompletion(false);
+    try app.handleKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.config, app.mode);
+    try std.testing.expect(!app.config_edit.?.discard_armed);
+    try app.handleKey(.{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("[connections.local]\ncolor = ", app.editor.text());
+    try std.testing.expect(app.popup == null);
+    try app.editor.setText("[broken");
+    try app.handleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings("[broken\n", app.editor.text());
+    try std.testing.expectEqual(@as(usize, 0), app.editor.history.items.len);
+    try app.handleKey(.{ .codepoint = 's', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqual(Mode.config, app.mode);
+    try std.testing.expect(std.mem.indexOf(u8, app.config_edit.?.message.?, "Not saved:") != null);
+    try std.testing.expect(!app.cfg.found);
+    try app.handleKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.config, app.mode);
+    try app.handleKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqualStrings("select 42;", app.editor.text());
+    try app.runCommand("/config edit");
+    const text = "# preserved comment\n[connections.local]\nurl = 'postgres://user:secret@localhost/app'\ncolor = '#2F6B43'\n";
+    try app.editor.setText(text);
+    try app.handleKey(.{ .codepoint = 's', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqual(Mode.console, app.mode);
+    try std.testing.expectEqualStrings("select 42;", app.editor.text());
+    try std.testing.expectEqual(@as(usize, 1), app.editor.history.items.len);
+    try std.testing.expect(app.cfg.find("local") != null);
+    const saved = try Io.Dir.cwd().readFileAlloc(app.io, path, a, .limited(4096));
+    defer a.free(saved);
+    try std.testing.expectEqualStrings(text, saved);
+    for (app.transcript.entries.items) |entry| {
+        if (entry.content == .message) try std.testing.expect(std.mem.indexOf(u8, entry.content.message.text, "secret") == null);
+    }
+    try app.runCommand("/config edit");
+    try std.testing.expectEqualStrings(text, app.editor.text());
+    try app.handleKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.console, app.mode);
 }
 
 test "config commands work disconnected and refresh saved connections" {
@@ -1130,8 +1525,31 @@ test "config commands work disconnected and refresh saved connections" {
         .frame_arena = .init(a),
     };
     defer app.deinit();
+    const invalid_commands = [_][2][]const u8{
+        .{ "/config", "example: /config remove local" },
+        .{ "/config nonsense", "unknown /config action" },
+        .{ "/config add", "missing connection name" },
+        .{ "/config remove", "missing connection name" },
+        .{ "/config add local", "missing connection color" },
+        .{ "/config add local red ./app.sqlite", "invalid connection color" },
+        .{ "/config add local #2F6B43", "missing connection URL" },
+        .{ "/config remove local extra", "too many arguments" },
+        .{ "/config remove missing", "no saved connection has this name" },
+        .{ "/config add local #2F6B43 unknown://user:secret@host/db", "unsupported connection URL scheme" },
+    };
+    for (invalid_commands) |case| {
+        try app.runCommand(case[0]);
+        const message = app.transcript.entries.items[app.transcript.entries.items.len - 1].content.message;
+        try std.testing.expect(std.mem.indexOf(u8, message.text, case[1]) != null);
+        try std.testing.expect(std.mem.indexOf(u8, message.text, "secret") == null);
+        try std.testing.expectEqual(if (std.mem.eql(u8, case[0], "/config")) Transcript.MessageKind.info else .err, message.kind);
+        try std.testing.expect(!app.cfg.found);
+    }
     try app.runCommand("/config add local #2F6B43 ./my database.sqlite");
     try std.testing.expect(app.cfg.found);
+    try std.testing.expectEqualStrings("./my database.sqlite", app.cfg.find("local").?.params.database);
+    try app.runCommand("/config add local #2F6B43 ./other.sqlite");
+    try std.testing.expect(std.mem.indexOf(u8, app.transcript.entries.items[app.transcript.entries.items.len - 1].content.message.text, "already saved") != null);
     try std.testing.expectEqualStrings("./my database.sqlite", app.cfg.find("local").?.params.database);
     try app.runCommand("/config add second #FF0000 ./second.sqlite");
     try std.testing.expectEqual(@as(usize, 2), app.cfg.connections.len);
@@ -1181,6 +1599,8 @@ fn showHelp(app: *App) !void {
         .{ "↑ ↓", "history (or move between lines)" },
         .{ "ctrl+o", "open the last result in the table viewer" },
         .{ "ctrl+y", "copy input (or the last SQL / definition if input is empty)" },
+        .{ "ctrl+s", "save input SQL (or the last query if input is empty)" },
+        .{ "ctrl+r", "search saved queries and preview SQL" },
         .{ "pgup pgdn, mouse wheel", "scroll" },
         .{ "ctrl+c", "cancel query / clear input / exit (twice)" },
         .{ "ctrl+d", "exit (on an empty input)" },
@@ -1385,6 +1805,7 @@ fn jobTask(app: *App, job: *Job) void {
         } else |e| {
             const outcome: Outcome = switch (e) {
                 error.Canceled => .canceled,
+                error.AccessDenied => .{ .failed = "connection access policy blocked this statement; nothing was run" },
                 error.OutOfMemory => .{ .failed = "out of memory" },
                 error.QueryFailed => .{ .failed = a.dupe(u8, conn.lastError()) catch "query failed" },
                 error.ConnectionLost => blk: {
@@ -1450,7 +1871,7 @@ test "read-only connections refuse writes before running them" {
         .frame_arena = .init(a),
         .conn = conn,
         .conn_name = "test",
-        .conn_params = .{ .kind = .sqlite, .database = ":memory:", .read_only = true },
+        .conn_params = .{ .kind = .sqlite, .database = ":memory:", .access = .read_only },
     };
     defer app.deinit();
     var setup = try conn.query(a, "create table people(id integer primary key); insert into people values (1);");
@@ -1463,6 +1884,14 @@ test "read-only connections refuse writes before running them" {
         const last = app.transcript.entries.items[app.transcript.entries.items.len - 1].content;
         try std.testing.expect(last == .message and last.message.kind == .err);
         try std.testing.expect(std.mem.startsWith(u8, last.message.text, "read-only connection"));
+    }
+    app.conn_params.?.access = .read_delete;
+    for ([_][]const u8{ "create table other(id integer)", "update people set id = 2", "delete from people where id = 1; drop table people" }) |sql| {
+        try app.editor.setText(sql);
+        try app.submit();
+        try std.testing.expect(app.job == null);
+        const last = app.transcript.entries.items[app.transcript.entries.items.len - 1].content;
+        try std.testing.expect(std.mem.startsWith(u8, last.message.text, "read-delete connection"));
     }
     try app.startBrowse("people", "id = 1; delete from people");
     try std.testing.expect(app.job == null);
@@ -2114,7 +2543,7 @@ test "choosing a table opens its SQLite browse view" {
 }
 
 fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
-    if (try app.filterViolation(filter)) |word| return app.transcript.addMessage(.err, read_only_message, .{word});
+    if (try app.filterViolation(filter)) |word| return app.transcript.addMessage(.err, "restricted connection: browse filters may only read ('{s}' was refused)", .{word});
     const job = try app.newJob(.{ .browse_open = undefined });
     const a = job.arena.allocator();
     const kind = app.conn.?.kind;
@@ -2128,7 +2557,7 @@ fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
         .database_color = app.conn_color,
         .filter = try a.dupe(u8, filter),
         .kind = kind,
-        .read_only = params.read_only,
+        .read_only = params.access == .read_only,
     };
     job.kind = .{ .browse_open = b };
     job.sqls = try a.dupe([]const u8, &.{
@@ -2159,7 +2588,7 @@ fn startBrowseReload(app: *App) !void {
     const tv = app.table_view orelse return;
     const b = tv.browse orelse return;
     if (try app.filterViolation(b.filter) != null) {
-        tv.notice = "read-only connection — the filter may only read";
+        tv.notice = "restricted connection — the filter may only read";
         return;
     }
     const job = try app.newJob(.browse_reload);
@@ -2173,7 +2602,7 @@ fn startBrowseCount(app: *App) !void {
     const tv = app.table_view orelse return;
     const b = tv.browse orelse return;
     if (try app.filterViolation(b.filter) != null) {
-        tv.notice = "read-only connection — the filter may only read";
+        tv.notice = "restricted connection — the filter may only read";
         return;
     }
     const job = try app.newJob(.browse_count);
@@ -2226,6 +2655,50 @@ fn draw(app: *App) !void {
     win.hideCursor();
     if (win.width < 20 or win.height < 8) {
         _ = win.printSegment(.{ .text = "terminal too small" }, .{});
+        return;
+    }
+
+    if (app.mode == .config) {
+        _ = win.print(&.{.{ .text = try app.tmpPrint(" Config: {s}", .{app.cfg.path}), .style = theme.accent_bold }}, .{ .wrap = .none });
+        const body = win.child(.{ .y_off = 1, .height = win.height - 3 });
+        var box = body;
+        const edit = &app.config_edit.?;
+        if (edit.show_help) {
+            const side = win.width >= 110;
+            const help_width: u16 = if (side) 55 else win.width;
+            const help_height: u16 = if (side) body.height else @min(10, body.height - 2);
+            const panel = body.child(.{
+                .x_off = if (side) @intCast(win.width - help_width) else 0,
+                .y_off = if (side) 0 else @intCast(body.height - help_height),
+                .width = help_width,
+                .height = help_height,
+                .border = .{ .where = if (side) .left else .top, .style = theme.border },
+            });
+            const help = panel.child(.{ .x_off = 1, .width = panel.width -| 2 });
+            box = body.child(.{
+                .width = if (side) body.width - help_width - 1 else body.width,
+                .height = if (side) body.height else body.height - help_height - 1,
+            });
+            edit.help_top = @min(edit.help_top, config_help.len - 1);
+            _ = help.print(&.{.{ .text = "Parameters · PgUp/PgDn · F1 hide", .style = theme.accent_bold }}, .{ .wrap = .none });
+            var help_row: u16 = 1;
+            var shown: usize = 0;
+            for (config_help[edit.help_top..]) |line| {
+                if (help_row >= help.height) break;
+                const result = help.print(&.{.{ .text = line, .style = theme.dim }}, .{ .row_offset = help_row, .wrap = .word });
+                shown += 1;
+                if (result.overflow) break;
+                help_row = result.row + 1;
+            }
+            edit.help_page_size = @max(1, shown -| 1);
+        }
+        const cursor = try app.drawInput(a, box);
+        if (app.popup) |*p| try app.drawPopup(a, box, p, cursor.row, cursor.col);
+        box.showCursor(cursor.col, cursor.row);
+        if (app.config_edit.?.message) |message| {
+            _ = win.print(&.{.{ .text = message, .style = theme.warn }}, .{ .row_offset = win.height - 2, .wrap = .none });
+        }
+        _ = win.print(&.{.{ .text = " ctrl+s save · esc cancel · tab complete · F1 parameters", .style = theme.dim }}, .{ .row_offset = win.height - 1, .wrap = .none });
         return;
     }
 
@@ -2299,12 +2772,16 @@ const CursorPos = struct { col: u16, row: u16 };
 fn drawInput(app: *App, a: Allocator, box: vaxis.Window) !CursorPos {
     const text = app.editor.text();
     const prompt_w: u16 = 3;
-    const width = box.width -| prompt_w;
+    const config_editor = app.mode == .config;
+    const width = box.width -| (prompt_w + @as(u16, if (config_editor) 1 else 0));
     if (width == 0) return .{ .col = 0, .row = 0 };
+    const continuation_indent = if (config_editor) @min(4, width - 1) else 0;
 
     // Styles per byte from the lexer.
     const styles = try a.alloc(vaxis.Style, text.len);
-    {
+    if (app.mode == .config) {
+        @memset(styles, .{});
+    } else {
         var it: lexer.Iterator = .init(text);
         const is_command = std.mem.startsWith(u8, text, "/");
         while (it.next()) |t| {
@@ -2325,13 +2802,13 @@ fn drawInput(app: *App, a: Allocator, box: vaxis.Window) !CursorPos {
     var found_cursor = false;
     var gi = vaxis.unicode.graphemeIterator(text);
     while (gi.next()) |g| {
-        if (g.start == app.editor.cursor) {
-            cursor_row = row;
-            cursor_pos = .{ .col = @intCast(col + prompt_w), .row = 0 };
-            found_cursor = true;
-        }
         const s = g.bytes(text);
         if (std.mem.eql(u8, s, "\n")) {
+            if (g.start == app.editor.cursor) {
+                cursor_row = row;
+                cursor_pos = .{ .col = @intCast(@min(col, width - 1) + prompt_w), .row = 0 };
+                found_cursor = true;
+            }
             row += 1;
             col = 0;
             continue;
@@ -2339,7 +2816,12 @@ fn drawInput(app: *App, a: Allocator, box: vaxis.Window) !CursorPos {
         const w = vaxis.gwidth.gwidth(s, .unicode);
         if (col + w > width) {
             row += 1;
-            col = 0;
+            col = continuation_indent;
+        }
+        if (g.start == app.editor.cursor) {
+            cursor_row = row;
+            cursor_pos = .{ .col = @intCast(col + prompt_w), .row = 0 };
+            found_cursor = true;
         }
         try cells.append(a, .{ .start = g.start, .len = g.len, .row = row, .col = col });
         col += w;
@@ -2347,7 +2829,7 @@ fn drawInput(app: *App, a: Allocator, box: vaxis.Window) !CursorPos {
     if (!found_cursor) {
         if (col >= width) {
             row += 1;
-            col = 0;
+            col = continuation_indent;
         }
         cursor_row = row;
         cursor_pos = .{ .col = @intCast(col + prompt_w), .row = 0 };
@@ -2373,7 +2855,7 @@ fn drawInput(app: *App, a: Allocator, box: vaxis.Window) !CursorPos {
         });
     }
 
-    if (text.len == 0) {
+    if (text.len == 0 and app.mode != .config) {
         const placeholder: []const u8 = if (app.conn == null)
             "/connect to a database, or /help"
         else
@@ -2399,12 +2881,15 @@ fn drawFooter(app: *App, a: Allocator, win: vaxis.Window) !void {
         try left.append(a, .{ .text = try std.fmt.allocPrint(a, "  {s} {s}", .{ c.kind.label(), c.server_version }), .style = theme.dim });
         if (!std.mem.eql(u8, desc, app.conn_name)) try left.append(a, .{ .text = try std.fmt.allocPrint(a, " · {s}", .{desc}), .style = theme.dim });
         if (app.readOnly()) try left.append(a, .{ .text = " · read-only", .style = theme.warn });
+        if (app.conn_params) |params| {
+            if (params.access == .read_delete) try left.append(a, .{ .text = " · read + delete", .style = theme.warn });
+        }
     } else {
         try left.append(a, .{ .text = "  ○ not connected", .style = theme.dim });
     }
     _ = win.print(left.items, .{ .row_offset = 0, .wrap = .none });
 
-    const hint = "/help · tab complete · ctrl+o viewer ";
+    const hint = "ctrl+s save · ctrl+r queries · /help ";
     const hw: u16 = @intCast(render.displayWidth(hint));
     var lw: usize = 0;
     for (left.items) |s| lw += render.displayWidth(s.text);
@@ -2415,9 +2900,10 @@ fn drawFooter(app: *App, a: Allocator, win: vaxis.Window) !void {
 
 /// Draws the completion list just above the input box.
 fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16, cursor_col: u16) !void {
-    _ = app;
     const cands = p.completion.candidates;
-    const max_visible: usize = @min(10, @as(usize, box_top));
+    const below = app.mode == .config and box_top < @min(4, win.height / 2);
+    const available = if (below) win.height -| (box_top + 1) else box_top;
+    const max_visible: usize = @min(10, @as(usize, available));
     if (max_visible == 0) return;
     const visible = @min(cands.len, max_visible);
     if (p.selected < p.top) p.top = p.selected;
@@ -2434,7 +2920,7 @@ fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16
     const inner: usize = 2 + 2 + label_w + (if (detail_w > 0) detail_w + 2 else 0) + 1;
     const w: u16 = @intCast(@min(inner, win.width));
     const x: u16 = @min(cursor_col -| @as(u16, @intCast(@min(p.completion.replace_len, cursor_col))), win.width -| w);
-    const y: u16 = box_top - @as(u16, @intCast(visible));
+    const y: u16 = if (below) box_top + 1 else box_top - @as(u16, @intCast(visible));
     const pop = win.child(.{ .x_off = x, .y_off = y, .width = w, .height = @intCast(visible) });
     pop.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .index = 0 } } });
 
@@ -2456,6 +2942,8 @@ fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16
             .function => "f",
             .connection => "●",
             .query => "q",
+            .config_key => "=",
+            .config_value => "v",
         };
         const fit = render.fitWidth(c.text, label_w);
         const detail = render.fitWidth(c.detail, detail_w);

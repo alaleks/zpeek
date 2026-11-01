@@ -6,7 +6,7 @@
 //! [connections.local]
 //! url = "postgres://me@localhost/app"
 //! color = "#2F6B43"                # optional database badge color
-//! read_only = true                 # optional: only SELECT and other reads
+//! access = "read_only"            # full | read_only | read_delete
 //!
 //! [connections.shop]
 //! driver = "mysql"                 # postgres | mysql | mariadb | sqlite | clickhouse
@@ -155,6 +155,8 @@ const EntryError = error{
     UnknownDriver,
     InvalidField,
     InvalidColor,
+    InvalidAccess,
+    ConflictingAccess,
 } || conninfo.ParseError;
 
 fn errorText(err: EntryError) []const u8 {
@@ -163,6 +165,8 @@ fn errorText(err: EntryError) []const u8 {
         error.UnknownDriver => "unknown driver (expected postgres, mysql, mariadb or sqlite)",
         error.InvalidField => "field has the wrong type",
         error.InvalidColor => "invalid color (expected #RRGGBB)",
+        error.InvalidAccess => "invalid access (expected full, read_only or read_delete)",
+        error.ConflictingAccess => "access and read_only disagree; use only access",
         error.InvalidConnectionString => "invalid 'url'",
         error.UnknownScheme => "unknown scheme in 'url'",
         error.InvalidPort => "invalid port",
@@ -194,9 +198,14 @@ fn entryParams(arena: Allocator, env: *const std.process.Environ.Map, t: *const 
     }
     if (try getString(t, "database")) |v| params.database = v;
     if (t.get("read_only")) |v| switch (v) {
-        .boolean => |b| params.read_only = b,
+        .boolean => |b| params.access = if (b) .read_only else .full,
         else => return error.InvalidField,
     };
+    if (try getString(t, "access")) |value| {
+        const access = std.meta.stringToEnum(conninfo.Access, value) orelse return error.InvalidAccess;
+        if (t.contains("read_only") and params.access != access) return error.ConflictingAccess;
+        params.access = access;
+    }
     if (try getString(t, "sslmode")) |v| {
         params.ssl = conninfo.SslMode.fromName(v) orelse return error.InvalidField;
     }
@@ -274,6 +283,28 @@ pub fn update(arena: Allocator, io: Io, env: *const std.process.Environ.Map, pat
     const data = out.written();
     if (data.len > 4 * 1024 * 1024) return error.ConfigTooLarge;
     const cfg = try parse(arena, env, owned_path, data, &diag);
+    try writeAtomic(io, path, data);
+    return cfg;
+}
+
+/// Validate edited text and refuse to overwrite changes made since it was opened.
+pub fn saveText(arena: Allocator, io: Io, env: *const std.process.Environ.Map, path: []const u8, text: []const u8, original: ?[]const u8, diag: *Diagnostic) !Config {
+    if (path.len == 0) return error.MissingConfigPath;
+    if (text.len > 4 * 1024 * 1024) return error.ConfigTooLarge;
+    const owned_path = try arena.dupe(u8, path);
+    const cfg = try parse(arena, env, owned_path, try arena.dupe(u8, text), diag);
+    const current: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (original) |before| {
+        if (current == null or !std.mem.eql(u8, before, current.?)) return error.ConfigChanged;
+    } else if (current != null) return error.ConfigChanged;
+    try writeAtomic(io, path, text);
+    return cfg;
+}
+
+fn writeAtomic(io: Io, path: []const u8, data: []const u8) !void {
     var file = try Io.Dir.cwd().createFileAtomic(io, path, .{
         .make_path = true,
         .replace = true,
@@ -282,7 +313,6 @@ pub fn update(arena: Allocator, io: Io, env: *const std.process.Environ.Map, pat
     defer file.deinit(io);
     try file.file.writeStreamingAll(io, data);
     try file.replace(io);
-    return cfg;
 }
 
 fn writeTable(arena: Allocator, w: *Io.Writer, table: *const toml.Table, path: []const u8) Io.Writer.Error!void {
@@ -349,7 +379,7 @@ pub const example =
     \\# [connections.local]
     \\# url = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
     \\# color = "#2F6B43"          # connection name badge background
-    \\# read_only = true            # allow only SELECT and other reads
+    \\# access = "read_only"       # full | read_only | read_delete
     \\
     \\# [connections.shop]
     \\# driver = "mysql"            # postgres | mysql | mariadb | sqlite | clickhouse
@@ -365,6 +395,30 @@ pub const example =
 ;
 
 const testing = std.testing;
+
+test "config text editing validates before writing and detects external changes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "config.toml" });
+    const text = "# Keep my comment\n[connections.local]\npath = './app.sqlite'\ncolor = '#2F6B43'\n";
+    var diag: Diagnostic = .{};
+    const cfg = try saveText(a, testing.io, &env, path, text, null, &diag);
+    try testing.expectEqualStrings("./app.sqlite", cfg.find("local").?.params.database);
+    const cwd = Io.Dir.cwd();
+    try testing.expectEqualStrings(text, try cwd.readFileAlloc(testing.io, path, a, .limited(4096)));
+    try testing.expectError(error.InvalidConfig, saveText(a, testing.io, &env, path, "[broken", text, &diag));
+    try testing.expect(diag.message.len > 0);
+    try testing.expectError(error.InvalidConfig, saveText(a, testing.io, &env, path, "default = 'missing'", text, &diag));
+    try testing.expectEqualStrings(text, try cwd.readFileAlloc(testing.io, path, a, .limited(4096)));
+    try testing.expectError(error.ConfigChanged, saveText(a, testing.io, &env, path, "", null, &diag));
+    try cwd.writeFile(testing.io, .{ .sub_path = path, .data = "# external edit\n" });
+    try testing.expectError(error.ConfigChanged, saveText(a, testing.io, &env, path, text, text, &diag));
+    try testing.expectEqualStrings("# external edit\n", try cwd.readFileAlloc(testing.io, path, a, .limited(4096)));
+}
 
 test "edit config atomically and preserve unresolved passwords and other settings" {
     var tmp = testing.tmpDir(.{});
@@ -389,7 +443,7 @@ test "edit config atomically and preserve unresolved passwords and other setting
         \\read_only = true
     });
     cfg = try update(a, io, &env, path, add);
-    try testing.expect(cfg.find("prod").?.params.read_only);
+    try testing.expectEqual(conninfo.Access.read_only, cfg.find("prod").?.params.access);
     try testing.expectEqualStrings("prod", cfg.default.?);
     const saved = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4096));
     const root = try toml.parse(a, saved, null);
@@ -442,8 +496,25 @@ test "config entries" {
     try testing.expectEqualStrings("secret", my.password);
     const sqlite_path = if (@import("builtin").os.tag == .windows) "/home/me\\x.db" else "/home/me/x.db";
     try testing.expectEqualStrings(sqlite_path, cfg.find("lite").?.params.database);
-    try testing.expect(cfg.find("lite").?.params.read_only);
-    try testing.expect(!pg.read_only);
+    try testing.expectEqual(conninfo.Access.read_only, cfg.find("lite").?.params.access);
+    try testing.expectEqual(conninfo.Access.full, pg.access);
+}
+
+test "connection access modes and legacy read_only" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    var diag: Diagnostic = .{};
+    for (std.enums.values(conninfo.Access)) |access| {
+        const src = try std.fmt.allocPrint(a, "[connections.x]\npath = './app.sqlite'\naccess = '{s}'\n", .{@tagName(access)});
+        const cfg = try parse(a, &env, "c", src, &diag);
+        try testing.expectEqual(access, cfg.find("x").?.params.access);
+    }
+    for ([_][]const u8{ "access = 'invalid'", "access = true", "access = 'full'\nread_only = true", "access = 'read_delete'\nread_only = true" }) |fields| {
+        const src = try std.fmt.allocPrint(a, "[connections.x]\npath = './app.sqlite'\n{s}\n", .{fields});
+        try testing.expectError(error.InvalidConfig, parse(a, &env, "c", src, &diag));
+    }
 }
 
 test "config errors" {

@@ -9,7 +9,7 @@ const render = @import("../render.zig");
 
 const Picker = @This();
 
-pub const Purpose = enum { connect, browse, describe, query, definition, type_value };
+pub const Purpose = enum { connect, browse, describe, query, save_query, overwrite_query, definition, type_value };
 
 pub const Item = struct {
     label: []const u8,
@@ -67,7 +67,8 @@ fn refilter(p: *Picker) Allocator.Error!void {
     if (q.len > 0) {
         for (p.items, 0..) |it, i| {
             if (!std.ascii.startsWithIgnoreCase(it.label, q) and
-                (std.ascii.findIgnoreCase(it.label, q) != null or std.ascii.findIgnoreCase(it.detail, q) != null))
+                (std.ascii.findIgnoreCase(it.label, q) != null or std.ascii.findIgnoreCase(it.detail, q) != null or
+                    (p.purpose == .query and std.ascii.findIgnoreCase(it.value, q) != null)))
                 try p.matches.append(p.gpa, i);
         }
     }
@@ -78,6 +79,8 @@ fn refilter(p: *Picker) Allocator.Error!void {
 pub fn handleKey(p: *Picker, key: vaxis.Key) Allocator.Error!Action {
     if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) return .cancel;
     if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.tab, .{})) {
+        if (p.purpose == .save_query and key.matches(vaxis.Key.enter, .{}) and p.query.items.len > 0)
+            return .{ .raw = p.query.items };
         if (p.matches.items.len > 0) return .{ .choose = p.matches.items[p.selected] };
         if (p.allow_raw and p.query.items.len > 0) return .{ .raw = p.query.items };
         return .none;
@@ -111,9 +114,10 @@ pub fn handleKey(p: *Picker, key: vaxis.Key) Allocator.Error!Action {
 
 pub fn draw(p: *Picker, win: vaxis.Window, a: Allocator) Allocator.Error!void {
     const w: u16 = @min(win.width -| 4, 90);
-    const visible: usize = @min(@max(p.matches.items.len, 1), @as(usize, win.height -| 8), 15);
+    const preview_rows: u16 = if (p.purpose == .query) @min(6, win.height -| 12) else 0;
+    const visible: usize = @min(@max(p.matches.items.len, 1), @as(usize, win.height -| (8 + preview_rows)), 15);
     // borders (2) + title + query + blank line
-    const h: u16 = @intCast(visible + 5);
+    const h: u16 = @intCast(visible + 5 + preview_rows);
     const box = win.child(.{
         .x_off = @intCast((win.width -| w) / 2),
         .y_off = @intCast(@max((win.height -| h) / 3, 1)),
@@ -135,9 +139,19 @@ pub fn draw(p: *Picker, win: vaxis.Window, a: Allocator) Allocator.Error!void {
     if (p.selected >= p.top + visible) p.top = p.selected + 1 - visible;
 
     if (p.matches.items.len == 0) {
-        const msg: []const u8 = if (p.allow_raw and p.query.items.len > 0) "no match — enter connects to this URL / path" else "no matches";
+        const msg: []const u8 = if (p.purpose == .save_query) "type a name · enter saves · esc cancels" else if (p.allow_raw and p.query.items.len > 0) "no match — enter connects to this URL / path" else "no matches";
         _ = box.print(&.{.{ .text = msg, .style = theme.dim }}, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
         return;
+    }
+    if (preview_rows > 0) {
+        _ = box.print(&.{.{ .text = "enter: load into editor · esc: cancel", .style = theme.dim }}, .{ .row_offset = @intCast(visible + 3), .col_offset = 1, .wrap = .none });
+        var lines = std.mem.splitScalar(u8, p.items[p.matches.items[p.selected]].value, '\n');
+        var row: u16 = @intCast(visible + 4);
+        while (lines.next()) |line| {
+            if (row >= box.height) break;
+            _ = box.print(&.{.{ .text = line, .style = theme.info }}, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
+            row += 1;
+        }
     }
     var label_w: usize = 0;
     for (p.matches.items) |m| label_w = @max(label_w, render.displayWidth(p.items[m].label));

@@ -10,6 +10,21 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const lexer = @import("sql/lexer.zig");
+
+pub const Access = enum {
+    full,
+    read_only,
+    read_delete,
+
+    pub fn violation(access: Access, sql: []const u8, dialect: lexer.Dialect) ?[]const u8 {
+        return switch (access) {
+            .full => null,
+            .read_only => lexer.readOnlyViolation(sql, dialect),
+            .read_delete => lexer.readDeleteViolation(sql, dialect),
+        };
+    }
+};
 
 pub const Kind = enum {
     postgres,
@@ -92,8 +107,7 @@ pub const Params = struct {
     /// Database name, or the file path for SQLite.
     database: []const u8 = "",
     ssl: SslMode = .prefer,
-    /// Only reading statements run; the session is read-only on the server too.
-    read_only: bool = false,
+    access: Access = .full,
 
     pub fn effectivePort(p: Params) u16 {
         return if (p.port != 0) p.port else p.kind.defaultPort();

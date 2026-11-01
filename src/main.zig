@@ -261,16 +261,24 @@ fn executeOnce(gpa: Allocator, io: Io, entry: config.Entry, sql: []const u8, std
         // Backslash escapes in strings, like MySQL.
         .clickhouse => .mysql,
     };
-    if (entry.params.read_only) if (@import("sql/lexer.zig").readOnlyViolation(sql, dialect)) |word| {
-        try stderr.print("zpeek: " ++ App.read_only_message ++ "\n", .{word});
+    if (entry.params.access.violation(sql, dialect)) |word| {
+        if (entry.params.access == .read_only) {
+            try stderr.print("zpeek: " ++ App.read_only_message ++ "\n", .{word});
+        } else {
+            try stderr.print("zpeek: " ++ App.read_delete_message ++ "\n", .{word});
+        }
         return 1;
-    };
+    }
     if (@import("sql/lexer.zig").hasDeleteWithoutWhere(sql, dialect)) {
         try stderr.print("zpeek: {s}\n", .{App.delete_without_where_message});
         return 1;
     }
 
     var result = conn.query(gpa, sql) catch |e| switch (e) {
+        error.AccessDenied => {
+            try stderr.writeAll("zpeek: connection access policy blocked this statement; nothing was run\n");
+            return 1;
+        },
         error.QueryFailed, error.ConnectionLost => {
             try stderr.print("{s}\n", .{conn.lastError()});
             return 1;
