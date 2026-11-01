@@ -142,6 +142,7 @@ const Job = struct {
     kind: JobKind,
     sqls: []const []const u8 = &.{},
     max_rows: usize = std.math.maxInt(usize),
+    max_result_bytes: usize = 32 * 1024 * 1024,
     /// Stop at the first failing statement.
     stop_on_error: bool = true,
     outcomes: std.ArrayList(Outcome) = .empty,
@@ -237,6 +238,7 @@ pub fn run(opts: Options) !void {
     try app.loop.installResizeHandler();
     defer app.loop.uninstallResizeHandler();
     try app.loop.start();
+    defer app.stopJob();
     defer app.loop.stop();
 
     try app.vx.enterAltScreen(writer);
@@ -273,15 +275,10 @@ pub fn run(opts: Options) !void {
         try app.vx.render(writer);
         try writer.flush();
     }
-
-    if (app.job) |job| {
-        app.cancelJob(false);
-        job.future.await(app.io);
-        app.finishJob();
-    }
 }
 
 fn deinit(app: *App) void {
+    app.stopJob();
     if (app.table_view) |tv| tv.deinit();
     if (app.picker) |p| p.deinit();
     if (app.conn) |c| c.close();
@@ -300,6 +297,7 @@ fn deinit(app: *App) void {
     app.notice.deinit(app.gpa);
     app.last_sql.deinit(app.gpa);
     app.pending_save.deinit(app.gpa);
+    if (app.history_path) |path| app.gpa.free(path);
 }
 
 fn tickerTask(app: *App) void {
@@ -339,18 +337,22 @@ fn loadHistory(app: *App) !void {
 
 fn saveHistory(app: *App) void {
     const path = app.history_path orelse return;
-    defer app.gpa.free(path);
     const items = if (app.config_edit) |edit| edit.previous.history.items else app.editor.history.items;
     const start = items.len -| history_limit;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(app.gpa);
+    var file = Io.Dir.cwd().createFileAtomic(app.io, path, .{
+        .replace = true,
+        .make_path = true,
+        .permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600),
+    }) catch return;
+    defer file.deinit(app.io);
+    var buffer: [4096]u8 = undefined;
+    var writer = file.file.writer(app.io, &buffer);
     for (items[start..]) |h| {
-        out.appendSlice(app.gpa, h) catch return;
-        out.append(app.gpa, 0) catch return;
+        writer.interface.writeAll(h) catch return;
+        writer.interface.writeByte(0) catch return;
     }
-    const cwd = Io.Dir.cwd();
-    if (std.fs.path.dirname(path)) |dir| cwd.createDirPath(app.io, dir) catch return;
-    cwd.writeFile(app.io, .{ .sub_path = path, .data = out.items }) catch {};
+    writer.interface.flush() catch return;
+    file.replace(app.io) catch {};
 }
 
 test "history rewrites connection URLs without credentials" {
@@ -384,9 +386,17 @@ test "history rewrites connection URLs without credentials" {
     try std.testing.expectEqual(@as(usize, 1), app.editor.history.items.len);
     try std.testing.expectEqualStrings("/connect <redacted>", app.editor.history.items[0]);
     app.saveHistory();
+    // Persistence streams directly to disk and can be repeated without consuming the path.
+    try app.editor.commitHistoryText("select 42");
+    var failing: std.testing.FailingAllocator = .init(a, .{ .fail_index = 0 });
+    app.gpa = failing.allocator();
+    app.saveHistory();
+    app.gpa = a;
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
     const saved = try cwd.readFileAlloc(std.testing.io, history_file, a, .limited(1024));
     defer a.free(saved);
-    try std.testing.expectEqualStrings("/connect <redacted>\x00", saved);
+    try std.testing.expectEqualStrings("/connect <redacted>\x00select 42\x00", saved);
 }
 
 // ───────────────────────────── events ─────────────────────────────
@@ -728,7 +738,7 @@ fn maybeQuote(app: *App, a: Allocator, name: []const u8) Allocator.Error![]const
 
 fn openCompletion(app: *App, explicit: bool) Allocator.Error!void {
     app.closePopup();
-    _ = app.popup_arena.reset(.retain_capacity);
+    _ = app.popup_arena.reset(.{ .retain_with_limit = render.scratch_limit });
     const a = app.popup_arena.allocator();
     const input = app.editor.text();
     const name_end = std.mem.indexOfAny(u8, input, " \t\n") orelse input.len;
@@ -2008,6 +2018,24 @@ fn cancelJob(app: *App, timed_out: bool) void {
     }
 }
 
+fn destroyJob(app: *App, job: *Job) void {
+    if (job.conn) |conn| conn.close();
+    for (job.outcomes.items) |*outcome| if (outcome.* == .result) outcome.result.result.deinit();
+    job.arena.deinit();
+    app.gpa.destroy(job);
+}
+
+fn stopJob(app: *App) void {
+    const job = app.job orelse return;
+    // A worker may be blocked posting completion to a full event queue.
+    app.loop.queue.close(error.Closed);
+    app.cancelJob(false);
+    job.future.await(app.io);
+    app.job = null;
+    app.busy.store(false, .release);
+    app.destroyJob(job);
+}
+
 /// Runs on a background task. Only touches `job` and the connection.
 fn jobTask(app: *App, job: *Job) void {
     defer _ = app.loop.postEvent(.job_done) catch {};
@@ -2032,16 +2060,32 @@ fn jobTask(app: *App, job: *Job) void {
     }
 
     const conn = app.conn orelse return;
+    var retained: usize = 0;
     for (job.sqls) |sql| {
         if (job.cancel_requested.load(.acquire)) {
             job.outcomes.append(a, .canceled) catch return;
             return;
         }
+        const remaining = job.max_result_bytes - retained;
+        if (remaining == 0) {
+            job.outcomes.append(a, .{ .failed = "batch result memory limit reached; remaining statements were not run" }) catch {};
+            return;
+        }
         const t0: Io.Timestamp = .now(app.io, .awake);
-        const result = conn.queryOpts(app.gpa, sql, .{ .max_rows = job.max_rows });
+        const result = conn.queryOpts(app.gpa, sql, .{
+            .max_rows = job.max_rows,
+            .max_bytes = @min((db.QueryOptions{}).max_bytes, remaining),
+        });
         const ms = t0.untilNow(app.io, .awake).toMilliseconds();
         if (result) |r| {
             var timed_result = r;
+            const capacity = r.arena.queryCapacity();
+            if (capacity > remaining) {
+                timed_result.deinit();
+                job.outcomes.append(a, .{ .failed = "statement completed but its result exceeded the batch memory limit and was discarded; remaining statements were not run" }) catch {};
+                return;
+            }
+            retained += capacity;
             timed_result.elapsed_ms = ms;
             job.outcomes.append(a, .{ .result = .{ .result = timed_result, .ms = ms } }) catch {
                 var rr = r;
@@ -2354,17 +2398,123 @@ test "query jobs honor cancellation and stop after connection loss" {
     try std.testing.expectEqualStrings("local", app.conn_name);
 }
 
+test "shutdown joins a worker even when the event queue is full" {
+    const Fake = struct {
+        started: Io.Event = .unset,
+        released: Io.Event = .unset,
+        finished: Io.Event = .unset,
+        closed: bool = false,
+
+        const vtable: db.Connection.VTable = .{ .query = query, .last_error = lastError, .cancel = cancel, .close = close };
+
+        fn query(ptr: *anyopaque, a: Allocator, _: []const u8, _: db.QueryOptions) db.QueryError!db.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.started.set(std.testing.io);
+            self.released.waitUncancelable(std.testing.io);
+            defer self.finished.set(std.testing.io);
+            var result: db.Result = .{ .arena = .init(a) };
+            errdefer result.deinit();
+            result.status = try result.arena.allocator().dupe(u8, "completed during shutdown");
+            return result;
+        }
+
+        fn lastError(_: *anyopaque) []const u8 {
+            return "";
+        }
+
+        fn cancel(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.released.set(std.testing.io);
+        }
+
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.finished.isSet());
+            self.closed = true;
+        }
+    };
+    const a = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var fake: Fake = .{};
+    {
+        var app: App = .{
+            .gpa = a,
+            .io = std.testing.io,
+            .env = &env,
+            .cfg = .{ .path = "", .found = false },
+            .editor = .init(a),
+            .transcript = .init(a),
+            .conn_arena = .init(a),
+            .popup_arena = .init(a),
+            .frame_arena = .init(a),
+        };
+        defer app.deinit();
+        app.loop = .init(app.io, &app.tty, &app.vx);
+        while (try app.loop.tryPostEvent(.tick)) {}
+        const job = try app.newJob(.console);
+        job.sqls = &.{"select 1"};
+        app.conn = .{ .ptr = &fake, .vtable = &Fake.vtable, .kind = .postgres };
+        try app.startJob(job);
+        try fake.started.wait(app.io);
+        app.stopJob();
+        try std.testing.expect(app.job == null);
+        try std.testing.expect(!app.busy.load(.acquire));
+        try std.testing.expect(!fake.closed);
+    }
+    try std.testing.expect(fake.closed);
+}
+
+test "SQL batch budgets include retained arenas and skip subsequent writes" {
+    const a = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try db.connect(a, std.testing.io, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+        .conn = conn,
+    };
+    defer app.deinit();
+    app.loop = .init(app.io, &app.tty, &app.vx);
+    var setup = try conn.query(a, "create table t(id integer)");
+    setup.deinit();
+    var sample = try conn.query(a, "select 1");
+    const capacity = sample.arena.queryCapacity();
+    sample.deinit();
+    try std.testing.expect(capacity > 0);
+    for ([_]usize{ 0, capacity, capacity + 1 }) |budget| {
+        const job = try app.newJob(.console);
+        defer app.destroyJob(job);
+        job.max_result_bytes = budget;
+        job.sqls = &.{ "select 1", "select 2", "insert into t values (1)" };
+        app.jobTask(job);
+        const n: usize = if (budget == 0) 1 else 2;
+        try std.testing.expectEqual(n, job.outcomes.items.len);
+        if (budget > 0) try std.testing.expect(job.outcomes.items[0] == .result);
+        try std.testing.expect(job.outcomes.items[n - 1] == .failed);
+        try std.testing.expect(std.mem.indexOf(u8, job.outcomes.items[n - 1].failed, "remaining statements were not run") != null);
+    }
+    var count = try conn.query(a, "select count(*) from t");
+    defer count.deinit();
+    try std.testing.expectEqualStrings("0", count.rows[0][0].?);
+}
+
 fn finishJob(app: *App) void {
     const job = app.job orelse return;
     job.future.await(app.io);
     app.job = null;
     app.busy.store(false, .release);
-    defer {
-        // results that were handed over are marked consumed by setting them to .canceled
-        for (job.outcomes.items) |*o| if (o.* == .result) o.result.result.deinit();
-        job.arena.deinit();
-        app.gpa.destroy(job);
-    }
+    defer app.destroyJob(job);
     app.processJob(job) catch |err| {
         app.transcript.addMessage(.err, "internal error: {t}", .{err}) catch {};
     };
@@ -3017,7 +3167,7 @@ fn inputHeight(app: *App, width: u16) u16 {
 }
 
 fn draw(app: *App) !void {
-    _ = app.frame_arena.reset(.retain_capacity);
+    _ = app.frame_arena.reset(.{ .retain_with_limit = render.scratch_limit });
     const a = app.frame_arena.allocator();
     const win = app.vx.window();
     win.clear();

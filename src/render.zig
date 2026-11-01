@@ -6,6 +6,37 @@ const vaxis = @import("vaxis");
 const db = @import("db/db.zig");
 
 pub const null_text = "NULL";
+pub const scratch_limit = 256 * 1024;
+
+/// Bound both scanning and allocation, including values made entirely of zero-width characters.
+pub fn preview(a: Allocator, s: []const u8, max: usize) Allocator.Error![]const u8 {
+    if (max == 0) return "";
+    var buffer: [4096]u8 = undefined;
+    const limit = @min(buffer.len, max *| 16 +| 16);
+    var pos: usize = 0;
+    var len: usize = 0;
+    var changed = false;
+    while (pos < s.len and pos < limit) {
+        const n = std.unicode.utf8ByteSequenceLength(s[pos]) catch 1;
+        if (n > s.len - pos or n > limit - len) break;
+        const bytes = s[pos..][0..n];
+        const text = switch (s[pos]) {
+            '\r' => "",
+            '\n' => "¶",
+            0...9, 11...12, 14...0x1f, 0x7f => " ",
+            else => if (std.unicode.utf8ValidateSlice(bytes)) bytes else "�",
+        };
+        if (text.len > limit - len) break;
+        changed = changed or !std.mem.eql(u8, bytes, text);
+        @memcpy(buffer[len..][0..text.len], text);
+        len += text.len;
+        pos += n;
+    }
+    const text = buffer[0..len];
+    const fit = fitWidth(text, max);
+    if (pos == s.len and fit.text.len == len) return if (changed) try a.dupe(u8, text) else s;
+    return std.mem.concat(a, u8, &.{ fitWidth(text, max - 1).text, "…" });
+}
 
 pub fn displayWidth(s: []const u8) usize {
     var total: usize = 0;
@@ -62,38 +93,41 @@ pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableO
     }
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const a = arena.allocator();
-
     const ncols = r.columns.len;
-    const widths = try a.alloc(usize, ncols);
-    const cells = try a.alloc([]const u8, ncols * (r.rows.len + 1));
+    const widths = try gpa.alloc(usize, ncols);
+    defer gpa.free(widths);
     for (r.columns, 0..) |name, i| {
-        cells[i] = try singleLine(a, name); // names are never truncated
-        widths[i] = displayWidth(cells[i]);
+        widths[i] = displayWidth(try singleLine(arena.allocator(), name));
+        _ = arena.reset(.{ .retain_with_limit = scratch_limit });
     }
-    for (r.rows, 1..) |row, ri| {
+    for (r.rows) |row| {
+        if (row.len != ncols) return error.InvalidRow;
         for (row, 0..) |v, i| {
-            const t = try cellText(a, v orelse null_text, opts.max_cell_width);
-            cells[ri * ncols + i] = t;
+            const t = try preview(arena.allocator(), v orelse null_text, opts.max_cell_width);
             widths[i] = @max(widths[i], displayWidth(t));
+            _ = arena.reset(.{ .retain_with_limit = scratch_limit });
         }
     }
 
     try rule(w, widths, "┌", "┬", "┐");
-    try line(w, widths, cells[0..ncols]);
+    try w.writeAll("│");
+    for (r.columns, widths) |name, width| {
+        try writeCell(w, try singleLine(arena.allocator(), name), width);
+        _ = arena.reset(.{ .retain_with_limit = scratch_limit });
+    }
+    try w.writeByte('\n');
     try rule(w, widths, "├", "┼", "┤");
-    for (1..r.rows.len + 1) |ri| try line(w, widths, cells[ri * ncols ..][0..ncols]);
+    for (r.rows) |row| {
+        try w.writeAll("│");
+        for (row, widths) |v, width| {
+            try writeCell(w, try preview(arena.allocator(), v orelse null_text, opts.max_cell_width), width);
+            _ = arena.reset(.{ .retain_with_limit = scratch_limit });
+        }
+        try w.writeByte('\n');
+    }
     try rule(w, widths, "└", "┴", "┘");
     try writeStatus(w, r, r.elapsed_ms);
     try w.writeByte('\n');
-}
-
-fn cellText(a: Allocator, v: []const u8, max: usize) Allocator.Error![]const u8 {
-    const s = try singleLine(a, v);
-    const fit = fitWidth(s, max);
-    if (fit.text.len == s.len) return s;
-    const cut = fitWidth(s, max - 1);
-    return std.mem.concat(a, u8, &.{ cut.text, "…" });
 }
 
 fn rule(w: *std.Io.Writer, widths: []const usize, left: []const u8, mid: []const u8, right: []const u8) !void {
@@ -106,15 +140,11 @@ fn rule(w: *std.Io.Writer, widths: []const usize, left: []const u8, mid: []const
     try w.writeAll("\n");
 }
 
-fn line(w: *std.Io.Writer, widths: []const usize, cells: []const []const u8) !void {
+fn writeCell(w: *std.Io.Writer, cell: []const u8, width: usize) !void {
+    try w.writeAll(" ");
+    try w.writeAll(cell);
+    try w.splatByteAll(' ', width - displayWidth(cell) + 1);
     try w.writeAll("│");
-    for (cells, widths) |cell, width| {
-        try w.writeAll(" ");
-        try w.writeAll(cell);
-        try w.splatByteAll(' ', width - displayWidth(cell) + 1);
-        try w.writeAll("│");
-    }
-    try w.writeAll("\n");
 }
 
 test "fitWidth and singleLine" {
@@ -133,4 +163,49 @@ test "status explicitly shows zero affected rows and duration" {
     var writer: std.Io.Writer = .fixed(&buffer);
     try writeStatus(&writer, r, 12);
     try std.testing.expectEqualStrings("UPDATE · 0 rows affected · 12 ms", writer.buffered());
+}
+
+test "previews bound work and allocation before normalizing large values" {
+    const large = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(large);
+    @memset(large, '\n');
+    var buffer: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+    const text = try preview(fixed.allocator(), large, 10);
+    try std.testing.expectEqualStrings("¶¶¶¶¶¶¶¶¶…", text);
+    try std.testing.expectEqualStrings("", try preview(fixed.allocator(), large, 0));
+    @memset(large, '\r');
+    try std.testing.expectEqualStrings("…", try preview(fixed.allocator(), large, 10));
+    for (0..large.len / 2) |i| @memcpy(large[i * 2 ..][0..2], "́");
+    const combining = try preview(fixed.allocator(), large, 1);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(combining));
+    try std.testing.expect(combining.len < 64);
+    const clean = "日本";
+    try std.testing.expectEqual(clean.ptr, (try preview(fixed.allocator(), clean, 4)).ptr);
+    try std.testing.expectEqualStrings("a¶b", try preview(fixed.allocator(), "a\r\nb", 3));
+    try std.testing.expectEqualStrings("日…", try preview(fixed.allocator(), "日本", 3));
+}
+
+test "CLI table streams normalized cells with memory independent of row count" {
+    var rows: [2000][]const ?[]const u8 = @splat(&.{ "a\nb", "日本", null });
+    var result: db.Result = .{ .arena = .init(std.testing.allocator), .columns = &.{ "a", "b", "c" }, .rows = &rows };
+    defer result.deinit();
+    var memory: [16 * 1024]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&memory);
+    var buffer: [256]u8 = undefined;
+    var discard: std.Io.Writer.Discarding = .init(&buffer);
+    try writeResult(fixed.allocator(), &discard.writer, result, .{});
+    try std.testing.expect(discard.fullCount() > 40_000);
+    result.rows = rows[0..1];
+    var output: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&output);
+    try writeResult(std.testing.allocator, &writer, result, .{});
+    try std.testing.expectEqualStrings(
+        "┌─────┬──────┬──────┐\n│ a   │ b    │ c    │\n├─────┼──────┼──────┤\n│ a¶b │ 日本 │ NULL │\n└─────┴──────┴──────┘\nOK\n",
+        writer.buffered(),
+    );
+    writer.end = 0;
+    try writeResult(std.testing.allocator, &writer, result, .{ .max_cell_width = 0 });
+    result.rows = &.{&.{"short row"}};
+    try std.testing.expectError(error.InvalidRow, writeResult(std.testing.allocator, &writer, result, .{}));
 }

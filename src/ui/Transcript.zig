@@ -176,7 +176,7 @@ fn compactEntry(t: *Transcript, e: *Entry) Allocator.Error!void {
     dropped.deinit();
     e.content.result.total_rows = total;
     // The cached layout pointed into the dropped arena.
-    _ = e.layout_arena.reset(.retain_capacity);
+    _ = e.layout_arena.reset(.{ .retain_with_limit = render.scratch_limit });
     e.layout = &.{};
     e.layout_width = 0;
     t.retained_bytes -|= e.retained_bytes;
@@ -232,6 +232,31 @@ pub fn prune(t: *Transcript) void {
         t.gpa.destroy(oldest);
         t.layout_dirty = true;
     }
+}
+
+test "layout rebuild releases oversized scratch capacity" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var transcript: Transcript = .init(std.testing.allocator);
+    defer transcript.deinit();
+    try transcript.add(.{ .input = "select 1" });
+    const entry = transcript.entries.items[0];
+    try ensureLayout(entry, 80);
+    _ = try entry.layout_arena.allocator().alloc(u8, render.scratch_limit * 4);
+    try std.testing.expect(entry.layout_arena.queryCapacity() > render.scratch_limit);
+    try ensureLayout(entry, 79);
+    try std.testing.expect(entry.layout.len > 0);
+    try std.testing.expect(entry.layout_arena.queryCapacity() <= render.scratch_limit);
+    const large = try entry.arena.allocator().alloc(u8, render.scratch_limit * 4);
+    @memset(large, 'x');
+    entry.content.input = large;
+    entry.layout_arena.child_allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, ensureLayout(entry, 80));
+    try std.testing.expectEqual(@as(usize, 0), entry.layout.len);
+    try std.testing.expectEqual(@as(u16, 0), entry.layout_width);
+    entry.layout_arena.child_allocator = std.testing.allocator;
+    entry.content.input = "select 1";
+    try ensureLayout(entry, 79);
+    try std.testing.expect(entry.layout.len > 0);
 }
 
 test "prune old transcript entries" {
@@ -331,7 +356,9 @@ fn gapAfter(e: *const Entry, next: *const Entry) bool {
 
 fn ensureLayout(e: *Entry, width: u16) Allocator.Error!void {
     if (e.layout_width == width and e.layout.len > 0) return;
-    _ = e.layout_arena.reset(.retain_capacity);
+    e.layout = &.{};
+    e.layout_width = 0;
+    _ = e.layout_arena.reset(.{ .retain_with_limit = render.scratch_limit });
     const a = e.layout_arena.allocator();
     var lines: std.ArrayList(Line) = .empty;
     switch (e.content) {
@@ -518,10 +545,7 @@ fn layoutResult(
 }
 
 fn cellText(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-    const one = try render.singleLine(a, s);
-    const fit = render.fitWidth(one, max_col_width);
-    if (fit.text.len == one.len) return one;
-    return std.mem.concat(a, u8, &.{ render.fitWidth(one, max_col_width - 1).text, "…" });
+    return render.preview(a, s, max_col_width);
 }
 
 fn appendCell(a: Allocator, line: *std.ArrayList(Segment), text: []const u8, width: usize, style: Style) Allocator.Error!void {

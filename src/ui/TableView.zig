@@ -1024,7 +1024,7 @@ fn rowAsTsv(tv: *TableView) Allocator.Error![]const u8 {
 }
 
 pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
-    _ = tv.frame_arena.reset(.retain_capacity);
+    _ = tv.frame_arena.reset(.{ .retain_with_limit = render.scratch_limit });
     const a = tv.frame_arena.allocator();
     win.clear();
     if (win.height < 4 or win.width < 10) return;
@@ -1135,7 +1135,7 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
         for (vis[tv.left..last_col], tv.left..) |ci, pos| {
             const w = tv.widths.items[ci];
             const v = row[ci];
-            const text = try render.singleLine(a, if (tv.browse != null) displayValue(r, ci, v) else v orelse render.null_text);
+            const text = try render.preview(a, if (tv.browse != null) displayValue(r, ci, v) else v orelse render.null_text, w);
             const selected = is_cur_row and ci == cur_col;
             var style: vaxis.Style = if (tv.browse != null)
                 browseCellStyle(v, ci < r.boolean_columns.len and r.boolean_columns[ci], tv.isForeignKeyColumn(ci), selected)
@@ -1229,7 +1229,7 @@ fn drawForeignPreview(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator
         drawCell(box, 0, y, field_w, name, theme.header);
         const column = tv.fk_scroll + i;
         const value = result.rows[0][column];
-        const label = try render.singleLine(a, displayValue(result, column, value));
+        const label = try render.preview(a, displayValue(result, column, value), value_w);
         drawCell(box, field_w + 2, y, value_w, label, if (value == null) theme.null_value else .{});
     }
 }
