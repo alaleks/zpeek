@@ -11,47 +11,45 @@ Set TypingSpeed 25ms
 Set Theme "Catppuccin Mocha"
 
 Hide
-Type "sqlite3 /tmp/zpeek-demo.db < examples/demo.sql"
+Type "mkdir -p .zig-cache/demo"
+Enter
+Type "sqlite3 .zig-cache/demo/zpeek-demo.db < examples/demo.sql"
+Enter
+Type "export ZPEEK_CONFIG=/dev/null XDG_STATE_HOME=$PWD/.zig-cache/demo/state"
 Enter
 Type "unset NO_COLOR"
 Enter
+Type "clear"
+Enter
+
+Type "./zig-out/bin/zpeek .zig-cache/demo/zpeek-demo.db"
+Enter
+Sleep 1s
 Show
-
-Type "ZPEEK_CONFIG=/dev/null ./zig-out/bin/zpeek"
-Enter
-Sleep 1s
-
-Type "/connect /tmp/zpeek-demo.db"
-Enter
-Sleep 1s
 
 Type "/tables"
 Enter
-Sleep 1s
+Sleep 1500ms
 
-Type "select * from orders"
+Type "orders"
+Sleep 800ms
 Enter
 Sleep 2s
 
-Type "/browse orders"
-Enter
-Sleep 3s
-Down 2
 Right 3
+Type "s"
 Sleep 1s
-
-Type "/"
-Type "total_usd >= 100"
-Enter
-Sleep 3s
-
-Type "t"
-Sleep 2s
 Type "s"
 Sleep 2s
-Enter
-Sleep 2s
-Escape
-Sleep 1s
+Left 2
+Type "f"
+Sleep 3s
+
 Type "q"
+Sleep 500ms
+Type "select item, total_usd from orders where total_usd >= 100;"
+Enter
+Sleep 4s
+
+Hide
 Ctrl+D
