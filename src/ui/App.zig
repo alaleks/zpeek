@@ -772,10 +772,11 @@ fn handlePickerKey(app: *App, key: vaxis.Key) !void {
             const purpose = p.purpose;
             switch (purpose) {
                 .connect => {
-                    const entry = app.cfg.connections[i];
+                    const name = try app.gpa.dupe(u8, p.items[i].label);
+                    defer app.gpa.free(name);
                     app.closePicker();
-                    try app.transcript.add(.{ .input = try app.tmpPrint("/connect {s}", .{entry.name}) });
-                    try app.startConnect(entry.name, entry.params);
+                    try app.transcript.add(.{ .input = try app.tmpPrint("/connect {s}", .{name}) });
+                    try app.connectTarget(name);
                 },
                 .browse, .describe => {
                     const name = try app.gpa.dupe(u8, label);
@@ -1318,13 +1319,46 @@ fn saveConfigEditor(app: *App) !void {
             else => try app.tmpPrint("Not saved: {t} — check the config path and file permissions", .{err}),
         });
     };
+    const access_changed = app.useConfig(cfg, arena);
+    transferred = true;
+    app.closeConfigEditor();
+    if (access_changed) {
+        return app.transcript.addMessage(.warn, "config saved; access changed or active entry was removed — old session closed; use /connect <name> to apply the saved settings", .{});
+    }
+    return app.transcript.addMessage(.ok, "config saved: {s} — saved connections updated; reconnect to apply changed connection parameters", .{cfg.path});
+}
+
+/// Takes ownership of arena and closes sessions whose saved access no longer matches.
+fn useConfig(app: *App, cfg: config.Config, arena: std.heap.ArenaAllocator) bool {
+    const active_entry = cfg.find(app.conn_name);
+    const access_changed = if (app.conn_params) |params|
+        (if (active_entry) |entry| params.access != entry.params.access else app.cfg.find(app.conn_name) != null)
+    else
+        false;
     if (app.config_arena) |*old| old.deinit();
     app.config_arena = arena;
-    transferred = true;
     app.cfg = cfg;
-    if (cfg.find(app.conn_name)) |entry| app.conn_color = entry.color;
-    app.closeConfigEditor();
-    return app.transcript.addMessage(.ok, "config saved: {s} — saved connections updated; reconnect to apply changed connection parameters", .{cfg.path});
+    if (active_entry) |entry| app.conn_color = entry.color;
+    if (access_changed) app.disconnect();
+    return access_changed;
+}
+
+fn reloadConfig(app: *App) !bool {
+    if (app.cfg.path.len == 0) return true;
+    var arena: std.heap.ArenaAllocator = .init(app.gpa);
+    var transferred = false;
+    defer if (!transferred) arena.deinit();
+    const a = arena.allocator();
+    var diag: config.Diagnostic = .{};
+    const path = try a.dupe(u8, app.cfg.path);
+    const cfg = config.load(a, app.io, app.env, path, &diag) catch |err| {
+        try app.transcript.addMessage(.err, "cannot reload config: {s} — connection was not opened", .{if (diag.message.len > 0) diag.message else @errorName(err)});
+        return false;
+    };
+    const closed = app.useConfig(cfg, arena);
+    transferred = true;
+    if (closed) try app.transcript.addMessage(.warn, "saved access changed or active entry was removed — old session closed", .{});
+    return true;
 }
 
 fn configure(app: *App, arg: []const u8) !void {
@@ -1524,6 +1558,60 @@ test "config editor preserves SQL drafts and never submits config as SQL" {
     try std.testing.expectEqual(Mode.console, app.mode);
 }
 
+test "changing access closes the old session and schema SQL is blocked after reconnect" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "config.toml" });
+    defer a.free(path);
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try db.connect(a, std.testing.io, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = path, .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+        .conn = conn,
+        .conn_name = "local",
+        .conn_params = .{ .kind = .sqlite, .database = ":memory:" },
+    };
+    defer app.deinit();
+    app.loop = .init(app.io, &app.tty, &app.vx);
+    try app.runCommand("/config edit");
+    try app.editor.setText("[connections.local]\npath = ':memory:'\naccess = 'read_delete'\n");
+    try app.saveConfigEditor();
+    defer while (app.job) |job| {
+        job.future.await(app.io);
+        app.finishJob();
+    };
+    const sql = "DROP SCHEMA IF EXISTS public CASCADE;\nCREATE SCHEMA IF NOT EXISTS public;";
+    try std.testing.expect(app.conn == null);
+    try app.editor.setText(sql);
+    try app.submit();
+    try std.testing.expect(app.job == null);
+    const entry = app.cfg.find("local").?;
+    app.conn = try db.connect(a, app.io, entry.params, &err);
+    app.conn_name = "local";
+    app.conn_params = entry.params;
+    try app.editor.setText(sql);
+    try app.submit();
+    try std.testing.expect(app.job == null);
+    try std.testing.expectEqual(conninfo.Access.read_delete, app.conn.?.access);
+    try std.testing.expectEqual(conninfo.Access.read_delete, app.conn_params.?.access);
+    try std.testing.expectError(error.AccessDenied, app.conn.?.query(a, sql));
+    try Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = "[connections.local]\npath = ':memory:'\naccess = 'read_only'\n" });
+    try app.connectTarget("local");
+    try std.testing.expectEqual(conninfo.Access.read_only, app.job.?.kind.connect.params.access);
+}
+
 test "config commands work disconnected and refresh saved connections" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1683,6 +1771,7 @@ fn tmpPrint(app: *App, comptime fmt: []const u8, args: anytype) ![]const u8 {
 }
 
 fn openConnectPicker(app: *App) !void {
+    if (!try app.reloadConfig()) return;
     if (app.cfg.connections.len == 0) {
         return app.transcript.addMessage(.dim, "no connections in config — use /connect <url|path>", .{});
     }
@@ -1723,8 +1812,9 @@ fn openLastResult(app: *App) !void {
 }
 
 fn connectTarget(app: *App, target: []const u8) !void {
-    if (app.cfg.find(target)) |e| return app.startConnect(e.name, e.params);
-    if (!conninfo.isConnectionString(target)) {
+    if (app.cfg.find(target) != null or !conninfo.isConnectionString(target)) {
+        if (!try app.reloadConfig()) return;
+        if (app.cfg.find(target)) |e| return app.startConnect(e.name, e.params);
         return app.transcript.addMessage(.err, "no connection named '{s}' (and it does not look like a URL or file path)", .{target});
     }
     const params = conninfo.parse(app.frame_arena.allocator(), target) catch |err| {
@@ -2078,7 +2168,7 @@ fn processJob(app: *App, job: *Job) !void {
                 p.password = try a.dupe(u8, p.password);
                 app.conn_params = p;
                 app.conn_color = if (app.cfg.find(c.name)) |entry| entry.color else null;
-                try app.transcript.addMessage(.ok, "connected to {s} · {s} {s}", .{ c.name, conn.kind.label(), conn.server_version });
+                try app.transcript.addMessage(.ok, "connected to {s} · {s} {s} · access: {s}", .{ c.name, conn.kind.label(), conn.server_version, @tagName(p.access) });
                 try app.startCacheLoad(false);
             } else {
                 try app.transcript.addMessage(.err, "{s}", .{job.connect_error orelse "connection failed"});
@@ -2914,6 +3004,7 @@ fn drawFooter(app: *App, a: Allocator, win: vaxis.Window) !void {
         if (app.readOnly()) try left.append(a, .{ .text = " · read-only", .style = theme.warn });
         if (app.conn_params) |params| {
             if (params.access == .read_delete) try left.append(a, .{ .text = " · read + delete", .style = theme.warn });
+            if (params.access == .full) try left.append(a, .{ .text = " · full", .style = theme.dim });
         }
     } else {
         try left.append(a, .{ .text = "  ○ not connected", .style = theme.dim });

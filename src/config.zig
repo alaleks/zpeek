@@ -117,6 +117,9 @@ pub fn parse(
     };
 
     var cfg: Config = .{ .path = path, .found = true };
+    for ([_][]const u8{ "access", "read_only" }) |field| {
+        if (root.contains(field)) return invalid(arena, diag, "{s}: '{s}' belongs inside [connections.<name>], not at the top level", .{ path, field });
+    }
     if (root.get("default")) |v| switch (v) {
         .string => |s| cfg.default = s,
         else => return invalid(arena, diag, "{s}: 'default' must be a string", .{path}),
@@ -506,6 +509,10 @@ test "connection access modes and legacy read_only" {
     const a = arena.allocator();
     var env: std.process.Environ.Map = .init(a);
     var diag: Diagnostic = .{};
+    for ([_][]const u8{ "access = 'read_delete'", "read_only = true" }) |setting| {
+        const src = try std.fmt.allocPrint(a, "{s}\n[connections.x]\npath = './app.sqlite'\n", .{setting});
+        try testing.expectError(error.InvalidConfig, parse(a, &env, "c", src, &diag));
+    }
     for (std.enums.values(conninfo.Access)) |access| {
         const src = try std.fmt.allocPrint(a, "[connections.x]\npath = './app.sqlite'\naccess = '{s}'\n", .{@tagName(access)});
         const cfg = try parse(a, &env, "c", src, &diag);

@@ -26,6 +26,16 @@ pub const Access = enum {
     }
 };
 
+test "DROP and CREATE SCHEMA require full access" {
+    const sql = "DROP SCHEMA IF EXISTS public CASCADE;\nCREATE SCHEMA IF NOT EXISTS public;";
+    for ([_]lexer.Dialect{ .postgres, .mysql, .sqlite }) |dialect| {
+        try std.testing.expectEqual(@as(?[]const u8, null), Access.full.violation(sql, dialect));
+        try std.testing.expectEqualStrings("DROP", Access.read_only.violation(sql, dialect).?);
+        try std.testing.expectEqualStrings("DROP", Access.read_delete.violation(sql, dialect).?);
+        try std.testing.expect(Access.read_delete.violation("CREATE SCHEMA IF NOT EXISTS public;", dialect) != null);
+    }
+}
+
 pub const Kind = enum {
     postgres,
     mysql,
