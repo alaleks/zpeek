@@ -232,10 +232,22 @@ const config_fields = [_]Candidate{
 // shortcut: completion follows line-based fields, extend when inline-table editing needs it.
 pub fn configComplete(a: Allocator, text: []const u8, cursor: usize, connections: []const []const u8) Allocator.Error!Completion {
     const empty: Completion = .{ .replace_len = 0, .candidates = &.{} };
+    if (cursor > text.len) return empty;
     const start = if (std.mem.lastIndexOfScalar(u8, text[0..cursor], '\n')) |i| i + 1 else 0;
     const end = if (std.mem.indexOfScalar(u8, text[cursor..], '\n')) |i| cursor + i else text.len;
+    var field_start = start;
+    while (field_start < cursor and std.ascii.isWhitespace(text[field_start])) field_start += 1;
+    if (field_start < end and text[field_start] == '#') return empty;
+    const equal = if (std.mem.indexOfScalar(u8, text[start..end], '=')) |i| start + i else end;
+    if (cursor > equal) {
+        const key = std.mem.trim(u8, text[field_start..equal], " \t\"'");
+        const has_values = for ([_][]const u8{ "access", "driver", "sslmode", "read_only", "default" }) |name| {
+            if (std.mem.eql(u8, name, key)) break true;
+        } else false;
+        if (!has_values) return empty;
+    }
     // An incomplete multiline value must not suggest setting names inside its text.
-    _ = toml.parse(a, text[0..start], null) catch |err| switch (err) {
+    const document = toml.parseDocument(a, text[0..start], null) catch |err| switch (err) {
         error.SyntaxError => return empty,
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -243,23 +255,17 @@ pub fn configComplete(a: Allocator, text: []const u8, cursor: usize, connections
         .{ .text = "default", .kind = .config_key, .detail = "default connection name" },
         .{ .text = "[connections.local]", .kind = .config_key, .detail = "new connection section" },
     };
-    var lines = std.mem.splitScalar(u8, text[0..start], '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or trimmed[0] != '[') continue;
-        const root = toml.parse(a, trimmed, null) catch |err| switch (err) {
-            error.SyntaxError => continue,
-            error.OutOfMemory => return error.OutOfMemory,
-        };
+    if (document.current != document.root) {
         fields = &.{};
-        if (root.get("connections")) |v| {
-            if (v == .table and v.table.count() > 0) fields = &config_fields;
+        if (document.root.get("connections")) |v| {
+            if (v == .table) for (v.table.values()) |entry| {
+                if (entry == .table and entry.table == document.current) {
+                    fields = &config_fields;
+                    break;
+                }
+            };
         }
     }
-    var field_start = start;
-    while (field_start < cursor and std.ascii.isWhitespace(text[field_start])) field_start += 1;
-    if (field_start < end and text[field_start] == '#') return empty;
-    const equal = if (std.mem.indexOfScalar(u8, text[start..end], '=')) |i| start + i else end;
     var candidates: std.ArrayList(Candidate) = .empty;
     if (cursor <= equal) {
         const prefix = std.mem.trim(u8, text[field_start..cursor], " \t\"'");
@@ -330,6 +336,27 @@ pub fn configComplete(a: Allocator, text: []const u8, cursor: usize, connections
     return .{ .replace_len = cursor - value_start, .replace_after = value_end - cursor, .candidates = candidates.items, .exact_match = exact };
 }
 
+test "free-form config values need no allocations" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    for ([_][]const u8{
+        "[connections.local]\nurl = 'postgres://localhost/app'",
+        "[connections.local]\npassword = 'secret'",
+        "[connections.local]\ncolor = '#ffffff'",
+    }) |input| try std.testing.expectEqual(@as(usize, 0), (try configComplete(failing.allocator(), input, input.len, &.{})).candidates.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "config completion releases parser allocations on failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: Allocator) !void {
+            var arena: std.heap.ArenaAllocator = .init(a);
+            defer arena.deinit();
+            const input = "[connections.local]\nurl = 'postgres://localhost/app'\naccess = re";
+            _ = try configComplete(arena.allocator(), input, input.len, &.{});
+        }
+    }.run, .{});
+}
+
 test "config completion replaces fields and values without duplicating quotes or suffixes" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -341,6 +368,7 @@ test "config completion replaces fields and values without duplicating quotes or
         .{ "[connections.local]\nsslmode = 'verify-f|ull'", "'verify-full'", "[connections.local]\nsslmode = 'verify-full'" },
         .{ "[connections.local]\nread_only = t|rue # keep", "true", "[connections.local]\nread_only = true # keep" },
         .{ "default = lo|", "\"local\"", "default = \"local\"" },
+        .{ "note = '''\n[connections.fake]\n'''\ndef|", "default = ", "note = '''\n[connections.fake]\n'''\ndefault = " },
         .{ "['connections'.'local']\n'co|lor' = '#FF0000'", "color", "['connections'.'local']\ncolor = '#FF0000'" },
     };
     for (cases) |case| {

@@ -25,7 +25,16 @@ pub const Diagnostic = struct {
 
 pub const Error = error{SyntaxError} || Allocator.Error;
 
+pub const Document = struct {
+    root: *Table,
+    current: *Table,
+};
+
 pub fn parse(arena: Allocator, src: []const u8, diag: ?*Diagnostic) Error!*Table {
+    return (try parseDocument(arena, src, diag)).root;
+}
+
+pub fn parseDocument(arena: Allocator, src: []const u8, diag: ?*Diagnostic) Error!Document {
     var p: Parser = .{ .arena = arena, .src = src, .diag = diag };
     return p.document();
 }
@@ -36,6 +45,7 @@ const Parser = struct {
     pos: usize = 0,
     line: usize = 1,
     diag: ?*Diagnostic,
+    nesting: usize = 0,
 
     fn fail(p: *Parser, message: []const u8) Error {
         if (p.diag) |d| d.* = .{ .line = p.line, .message = message };
@@ -88,13 +98,14 @@ const Parser = struct {
         };
     }
 
-    fn document(p: *Parser) Error!*Table {
+    fn document(p: *Parser) Error!Document {
         const root = try p.newTable();
         var current = root;
         while (true) {
             p.skipBlank();
             const c = p.peek() orelse break;
             if (c == '[') {
+                p.nesting = 0;
                 if (p.startsWith("[[")) return p.fail("arrays of tables are not supported");
                 p.advance();
                 p.skipSpaces();
@@ -105,12 +116,13 @@ const Parser = struct {
                 p.advance();
                 try p.endOfLine();
                 current = try p.descend(root, path.items);
+                p.nesting = path.items.len;
             } else {
                 try p.keyValue(current);
                 try p.endOfLine();
             }
         }
-        return root;
+        return .{ .root = root, .current = current };
     }
 
     fn newTable(p: *Parser) Allocator.Error!*Table {
@@ -145,6 +157,8 @@ const Parser = struct {
         if (p.peek() != '=') return p.fail("expected '='");
         p.advance();
         p.skipSpaces();
+        p.nesting += path.items.len;
+        defer p.nesting -= path.items.len;
         const value = try p.parseValue();
         const parent = try p.descend(table, path.items[0 .. path.items.len - 1]);
         const gop = try parent.getOrPut(p.arena, path.items[path.items.len - 1]);
@@ -156,6 +170,7 @@ const Parser = struct {
         while (true) {
             p.skipSpaces();
             try path.append(p.arena, try p.parseKey());
+            if (p.nesting + path.items.len >= 64) return p.fail("maximum nesting depth exceeded");
             p.skipSpaces();
             if (p.peek() == '.') {
                 p.advance();
@@ -178,6 +193,9 @@ const Parser = struct {
     }
 
     fn parseValue(p: *Parser) Error!Value {
+        if (p.nesting >= 64) return p.fail("maximum nesting depth exceeded");
+        p.nesting += 1;
+        defer p.nesting -= 1;
         const c = p.peek() orelse return p.fail("expected value");
         switch (c) {
             '"' => {
@@ -376,6 +394,25 @@ const Parser = struct {
 };
 
 const testing = std.testing;
+
+test "excessive nesting returns a diagnostic instead of exhausting the stack" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var nested: std.ArrayList(u8) = .empty;
+    try nested.appendSlice(a, "value = ");
+    try nested.appendNTimes(a, '[', 256);
+    try nested.appendSlice(a, "0");
+    try nested.appendNTimes(a, ']', 256);
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.SyntaxError, parse(a, nested.items, &diag));
+    try std.testing.expectEqualStrings("maximum nesting depth exceeded", diag.message);
+    nested.clearRetainingCapacity();
+    try nested.appendSlice(a, "[root");
+    for (0..256) |_| try nested.appendSlice(a, ".child");
+    try nested.appendSlice(a, "]");
+    try std.testing.expectError(error.SyntaxError, parse(a, nested.items, &diag));
+}
 
 test "parse config-like document" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

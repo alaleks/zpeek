@@ -46,8 +46,9 @@ pub fn clear(e: *Editor) void {
 }
 
 pub fn setText(e: *Editor, s: []const u8) Allocator.Error!void {
-    e.buf.clearRetainingCapacity();
-    try e.buf.appendSlice(e.gpa, s);
+    try e.buf.ensureTotalCapacity(e.gpa, s.len);
+    std.mem.copyForwards(u8, e.buf.allocatedSlice()[0..s.len], s);
+    e.buf.items.len = s.len;
     e.cursor = s.len;
     e.goal_col = null;
 }
@@ -256,7 +257,8 @@ pub fn commitHistoryText(e: *Editor, text_value: []const u8) Allocator.Error!voi
     const t = std.mem.trim(u8, text_value, " \t\r\n");
     if (t.len == 0) return;
     if (e.history.items.len > 0 and std.mem.eql(u8, e.history.items[e.history.items.len - 1], t)) return;
-    try e.history.append(e.gpa, try e.gpa.dupe(u8, t));
+    try e.history.ensureUnusedCapacity(e.gpa, 1);
+    e.history.appendAssumeCapacity(try e.gpa.dupe(u8, t));
 }
 
 pub fn historyPrev(e: *Editor) Allocator.Error!void {
@@ -286,11 +288,40 @@ pub fn loadHistory(e: *Editor, data: []const u8) Allocator.Error!void {
     var it = std.mem.splitScalar(u8, data, 0);
     while (it.next()) |entry| {
         if (entry.len == 0) continue;
-        try e.history.append(e.gpa, try e.gpa.dupe(u8, entry));
+        try e.history.ensureUnusedCapacity(e.gpa, 1);
+        e.history.appendAssumeCapacity(try e.gpa.dupe(u8, entry));
     }
 }
 
 const testing = std.testing;
+
+test "failed text replacement preserves the buffer and cursor" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var e: Editor = .init(failing.allocator());
+    defer e.deinit();
+    try e.setText("original");
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    var large: [4096]u8 = undefined;
+    @memset(&large, 'x');
+    try testing.expectError(error.OutOfMemory, e.setText(&large));
+    try testing.expectEqualStrings("original", e.text());
+    try testing.expectEqual(@as(usize, 8), e.cursor);
+    e.backspace();
+    try e.setText(e.text()[1..]);
+    try testing.expectEqualStrings("rigina", e.text());
+}
+
+test "history allocation failures release all owned strings" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(a: Allocator) !void {
+            var e: Editor = .init(a);
+            defer e.deinit();
+            try e.commitHistoryText("select 1;");
+            try e.loadHistory("select 2;\x00select 3;\x00");
+        }
+    }.run, .{});
+}
 
 test "editing and cursor movement" {
     var e: Editor = .init(testing.allocator);

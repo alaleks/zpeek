@@ -41,6 +41,7 @@ allow_raw: bool = false,
 pub fn init(gpa: Allocator, purpose: Purpose, title: []const u8, items: []const Item, allow_raw: bool) Allocator.Error!*Picker {
     const p = try gpa.create(Picker);
     p.* = .{ .gpa = gpa, .arena = .init(gpa), .purpose = purpose, .title = undefined, .items = undefined, .allow_raw = allow_raw };
+    errdefer p.deinit();
     const a = p.arena.allocator();
     p.title = try a.dupe(u8, title);
     const copy = try a.alloc(Item, items.len);
@@ -192,4 +193,14 @@ fn spaces(a: Allocator, n: usize) Allocator.Error![]const u8 {
     const s = try a.alloc(u8, n);
     @memset(s, ' ');
     return s;
+}
+
+test "picker initialization cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: Allocator) !void {
+            const p = try Picker.init(a, .query, "Saved queries", &.{.{ .label = "example", .detail = "select 1", .value = "select 1" }}, false);
+            defer p.deinit();
+            _ = try p.handleKey(.{ .codepoint = 'x', .text = "x" });
+        }
+    }.run, .{});
 }

@@ -707,17 +707,22 @@ fn maybeQuote(app: *App, a: Allocator, name: []const u8) Allocator.Error![]const
 }
 
 fn openCompletion(app: *App, explicit: bool) Allocator.Error!void {
+    app.closePopup();
     _ = app.popup_arena.reset(.retain_capacity);
     const a = app.popup_arena.allocator();
+    const input = app.editor.text();
+    const name_end = std.mem.indexOfAny(u8, input, " \t\n") orelse input.len;
+    const command = findCommand(input[0..name_end]);
     var names: std.ArrayList([]const u8) = .empty;
-    for (app.cfg.connections) |c| try names.append(a, c.name);
+    if (app.mode == .config or (command != null and command.?.arg == .connection)) {
+        for (app.cfg.connections) |c| try names.append(a, c.name);
+    }
     const result = if (app.mode == .config) try complete.configComplete(a, app.editor.text(), app.editor.cursor, names.items) else try complete.complete(a, .{
         .text = app.editor.text(),
         .cursor = app.editor.cursor,
         .cache = if (app.cache) |*c| c else null,
         .connections = names.items,
-        // Only slash-command arguments complete saved queries; avoids disk reads per SQL keystroke.
-        .queries = if (std.mem.startsWith(u8, app.editor.text(), "/")) try app.savedQueryNames(a) else &.{},
+        .queries = if (command != null and command.?.arg == .query) try app.savedQueryNames(a) else &.{},
         .commands = &commands,
         .kind = if (app.conn) |conn| conn.kind else null,
     });
@@ -927,7 +932,7 @@ fn queriesDir(app: *App) !?[]const u8 {
 
 fn savedQueryNames(app: *App, a: Allocator) ![]const []const u8 {
     const dir = (try app.queriesDir()) orelse return &.{};
-    const entries = queries.list(a, app.io, dir) catch return &.{};
+    const entries = queries.list(a, app.io, dir, false) catch return &.{};
     const names = try a.alloc([]const u8, entries.len);
     for (entries, names) |e, *n| n.* = e.name;
     return names;
@@ -1096,7 +1101,7 @@ fn saveQuery(app: *App, name: []const u8) !void {
     if (name.len > 0) return app.writeSavedQuery(name, false);
     const dir = (try app.queriesDir()) orelse return app.transcript.addMessage(.err, "cannot determine the config directory", .{});
     const a = app.frame_arena.allocator();
-    const entries = queries.list(a, app.io, dir) catch |err| return app.transcript.addMessage(.err, "cannot read saved queries: {t}", .{err});
+    const entries = queries.list(a, app.io, dir, true) catch |err| return app.transcript.addMessage(.err, "cannot read saved queries: {t}", .{err});
     var items: std.ArrayList(Picker.Item) = .empty;
     for (entries) |entry| try items.append(a, .{ .label = entry.name, .detail = entry.preview });
     app.picker = try Picker.init(app.gpa, .save_query, "Save query · type a name · enter saves · tab selects · esc cancels", items.items, true);
@@ -1106,7 +1111,7 @@ fn saveQuery(app: *App, name: []const u8) !void {
 fn writeSavedQuery(app: *App, name: []const u8, overwrite: bool) !void {
     if (!queries.validName(name)) return app.transcript.addMessage(.err, "invalid query name — use letters, digits, '_', '-', '.' (up to 64 characters)", .{});
     const dir = (try app.queriesDir()) orelse return app.transcript.addMessage(.err, "cannot determine the config directory", .{});
-    queries.save(app.gpa, app.io, dir, name, app.pending_save.items, overwrite) catch |err| {
+    queries.save(app.io, dir, name, app.pending_save.items, overwrite) catch |err| {
         if (err == error.PathAlreadyExists and !overwrite) {
             app.picker = try Picker.init(app.gpa, .overwrite_query, "Query already exists · overwrite?", &.{
                 .{ .label = "Cancel" },
@@ -1132,7 +1137,7 @@ fn loadSavedQuery(app: *App, name: []const u8) !void {
 fn openQueriesPicker(app: *App) !void {
     const dir = (try app.queriesDir()) orelse return app.transcript.addMessage(.err, "cannot determine the config directory", .{});
     const a = app.frame_arena.allocator();
-    const entries = queries.list(a, app.io, dir) catch |err| return app.transcript.addMessage(.err, "cannot read {s}: {t}", .{ dir, err });
+    const entries = queries.list(a, app.io, dir, true) catch |err| return app.transcript.addMessage(.err, "cannot read {s}: {t}", .{ dir, err });
     if (entries.len == 0) return app.transcript.addMessage(.dim, "no saved queries yet — type SQL and press ctrl+s to save it", .{});
     var items: std.ArrayList(Picker.Item) = .empty;
     for (entries) |e| try items.append(a, .{ .label = e.name, .detail = e.preview, .value = e.sql });
@@ -1441,6 +1446,20 @@ test "config editor preserves SQL drafts and never submits config as SQL" {
         const help_row: u16 = if (cols >= 110) 1 else 13;
         try std.testing.expectEqualStrings("P", win.readCell(help_col, help_row).?.char.grapheme);
         if (cols >= 110) try std.testing.expect(win.readCell(cols - 56, 2).?.default);
+        _ = app.drawInput(win.child(.{ .width = 40, .height = 1 }));
+        _ = app.drawInput(win.child(.{ .width = 40, .height = 0 }));
+    }
+    {
+        app.mode = .console;
+        defer app.mode = .config;
+        const win = app.vx.window();
+        try app.editor.setText("select 1;");
+        _ = app.drawInput(win);
+        try std.testing.expect(std.meta.eql(theme.sqlStyle(.keyword), win.readCell(3, 0).?.style));
+        try std.testing.expect(std.meta.eql(theme.sqlStyle(.number), win.readCell(10, 0).?.style));
+        try app.editor.setText("/tables");
+        _ = app.drawInput(win);
+        try std.testing.expect(std.meta.eql(theme.accent_bold, win.readCell(3, 0).?.style));
     }
     try app.editor.setText("[connections.local]\nacc");
     try app.openCompletion(false);
@@ -2692,7 +2711,7 @@ fn draw(app: *App) !void {
             }
             edit.help_page_size = @max(1, shown -| 1);
         }
-        const cursor = try app.drawInput(a, box);
+        const cursor = app.drawInput(box);
         if (app.popup) |*p| try app.drawPopup(a, box, p, cursor.row, cursor.col);
         box.showCursor(cursor.col, cursor.row);
         if (app.config_edit.?.message) |message| {
@@ -2746,7 +2765,7 @@ fn draw(app: *App) !void {
         .height = box_h,
         .border = .{ .where = .all, .style = if (app.job == null) theme.border_focus else theme.border },
     });
-    const cursor = try app.drawInput(a, box);
+    const cursor = app.drawInput(box);
 
     try app.drawFooter(a, win.child(.{ .y_off = @intCast(win.height - footer_h), .height = footer_h }));
 
@@ -2769,32 +2788,15 @@ const CursorPos = struct { col: u16, row: u16 };
 
 /// Draws the editor contents with highlighting and soft wrapping. Returns the
 /// cursor position relative to `box`.
-fn drawInput(app: *App, a: Allocator, box: vaxis.Window) !CursorPos {
+fn drawInput(app: *App, box: vaxis.Window) CursorPos {
     const text = app.editor.text();
     const prompt_w: u16 = 3;
     const config_editor = app.mode == .config;
     const width = box.width -| (prompt_w + @as(u16, if (config_editor) 1 else 0));
-    if (width == 0) return .{ .col = 0, .row = 0 };
+    if (width == 0 or box.height == 0) return .{ .col = 0, .row = 0 };
     const continuation_indent = if (config_editor) @min(4, width - 1) else 0;
 
-    // Styles per byte from the lexer.
-    const styles = try a.alloc(vaxis.Style, text.len);
-    if (app.mode == .config) {
-        @memset(styles, .{});
-    } else {
-        var it: lexer.Iterator = .init(text);
-        const is_command = std.mem.startsWith(u8, text, "/");
-        while (it.next()) |t| {
-            var st = theme.sqlStyle(t.tag);
-            if (is_command and t.start == 0) st = theme.accent_bold;
-            if (is_command and t.start > 0 and t.start <= (std.mem.indexOfAny(u8, text, " \t") orelse text.len)) st = theme.accent_bold;
-            @memset(styles[t.start..t.end], st);
-        }
-    }
-
     // Lay out graphemes into rows.
-    const Cell = struct { start: usize, len: usize, row: usize, col: usize };
-    var cells: std.ArrayList(Cell) = .empty;
     var row: usize = 0;
     var col: usize = 0;
     var cursor_pos: CursorPos = .{ .col = prompt_w, .row = 0 };
@@ -2823,7 +2825,6 @@ fn drawInput(app: *App, a: Allocator, box: vaxis.Window) !CursorPos {
             cursor_pos = .{ .col = @intCast(col + prompt_w), .row = 0 };
             found_cursor = true;
         }
-        try cells.append(a, .{ .start = g.start, .len = g.len, .row = row, .col = col });
         col += w;
     }
     if (!found_cursor) {
@@ -2847,12 +2848,42 @@ fn drawInput(app: *App, a: Allocator, box: vaxis.Window) !CursorPos {
     const prompt_style: vaxis.Style = if (app.job == null) theme.accent_bold else theme.dim;
     if (first == 0) _ = box.print(&.{.{ .text = " > ", .style = prompt_style }}, .{ .row_offset = 0, .wrap = .none });
 
-    for (cells.items) |c| {
-        if (c.row < first or c.row >= first + visible) continue;
-        box.writeCell(@intCast(c.col + prompt_w), @intCast(c.row - first), .{
-            .char = .{ .grapheme = text[c.start .. c.start + c.len], .width = @intCast(vaxis.gwidth.gwidth(text[c.start .. c.start + c.len], .unicode)) },
-            .style = styles[c.start],
-        });
+    row = 0;
+    col = 0;
+    var tokens: lexer.Iterator = .init(text);
+    var token: ?lexer.Token = null;
+    const command_end = if (std.mem.startsWith(u8, text, "/")) std.mem.indexOfAny(u8, text, " \t") orelse text.len else 0;
+    gi = vaxis.unicode.graphemeIterator(text);
+    while (gi.next()) |g| {
+        if (row >= first + visible) break;
+        const s = g.bytes(text);
+        if (std.mem.eql(u8, s, "\n")) {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        const w = vaxis.gwidth.gwidth(s, .unicode);
+        if (col + w > width) {
+            row += 1;
+            col = continuation_indent;
+        }
+        if (row >= first and row < first + visible) {
+            var style: vaxis.Style = .{};
+            if (!config_editor) {
+                while (token == null or token.?.end <= g.start) {
+                    token = tokens.next();
+                    if (token == null) break;
+                }
+                if (token) |t| {
+                    style = if (command_end > 0 and t.start <= command_end) theme.accent_bold else theme.sqlStyle(t.tag);
+                }
+            }
+            box.writeCell(@intCast(col + prompt_w), @intCast(row - first), .{
+                .char = .{ .grapheme = s, .width = @intCast(w) },
+                .style = style,
+            });
+        }
+        col += w;
     }
 
     if (text.len == 0 and app.mode != .config) {

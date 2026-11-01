@@ -35,7 +35,7 @@ fn fileName(buf: []u8, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}.sql", .{name}) catch unreachable;
 }
 
-pub fn save(gpa: Allocator, io: Io, dir_path: []const u8, name: []const u8, sql: []const u8, overwrite: bool) !void {
+pub fn save(io: Io, dir_path: []const u8, name: []const u8, sql: []const u8, overwrite: bool) !void {
     if (!validName(name)) return error.InvalidName;
     const cwd = Io.Dir.cwd();
     try cwd.createDirPath(io, dir_path);
@@ -43,12 +43,11 @@ pub fn save(gpa: Allocator, io: Io, dir_path: []const u8, name: []const u8, sql:
     defer dir.close(io);
     var buf: [80]u8 = undefined;
     const trimmed = std.mem.trim(u8, sql, " \t\r\n");
-    if (trimmed.len + 1 > max_size) return error.QueryTooLarge;
-    const data = try std.mem.concat(gpa, u8, &.{ trimmed, "\n" });
-    defer gpa.free(data);
+    if (trimmed.len >= max_size) return error.QueryTooLarge;
     var file = try dir.createFileAtomic(io, fileName(&buf, name), .{ .replace = overwrite });
     defer file.deinit(io);
-    try file.file.writeStreamingAll(io, data);
+    try file.file.writeStreamingAll(io, trimmed);
+    try file.file.writeStreamingAll(io, "\n");
     if (overwrite) try file.replace(io) else try file.link(io);
 }
 
@@ -69,8 +68,9 @@ pub fn remove(io: Io, dir_path: []const u8, name: []const u8) !void {
     try dir.deleteFile(io, fileName(&buf, name));
 }
 
-/// Saved queries sorted by name. A missing directory means no queries.
-pub fn list(arena: Allocator, io: Io, dir_path: []const u8) ![]const Entry {
+/// Saved queries sorted by name. Completion skips file contents with include_sql=false.
+/// A missing directory means no queries.
+pub fn list(arena: Allocator, io: Io, dir_path: []const u8, include_sql: bool) ![]const Entry {
     var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return &.{},
         else => |e| return e,
@@ -83,7 +83,10 @@ pub fn list(arena: Allocator, io: Io, dir_path: []const u8) ![]const Entry {
         const name = entry.name[0 .. entry.name.len - ".sql".len];
         if (!validName(name)) continue;
         const owned = try arena.dupe(u8, name);
-        const sql = load(arena, io, dir_path, owned) catch "";
+        const sql = if (include_sql) load(arena, io, dir_path, owned) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => "",
+        } else "";
         try out.append(arena, .{ .name = owned, .preview = previewLine(sql), .sql = sql });
     }
     std.mem.sort(Entry, out.items, {}, struct {
@@ -125,20 +128,23 @@ test "saved queries round trip through files" {
     const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "queries" });
     const io = std.testing.io;
 
-    try std.testing.expectEqual(@as(usize, 0), (try list(a, io, dir)).len);
-    try save(gpa, io, dir, "recent", " \nSELECT *\nFROM people; \n", false);
-    try save(gpa, io, dir, "active", "select * from people where active = 1;", false);
-    try std.testing.expectError(error.PathAlreadyExists, save(gpa, io, dir, "recent", "select 2;", false));
+    try std.testing.expectEqual(@as(usize, 0), (try list(a, io, dir, true)).len);
+    try save(io, dir, "recent", " \nSELECT *\nFROM people; \n", false);
+    try save(io, dir, "active", "select * from people where active = 1;", false);
+    try std.testing.expectError(error.PathAlreadyExists, save(io, dir, "recent", "select 2;", false));
     try std.testing.expectEqualStrings("SELECT *\nFROM people;", try load(a, io, dir, "recent"));
-    const entries = try list(a, io, dir);
+    const entries = try list(a, io, dir, true);
     try std.testing.expectEqual(@as(usize, 2), entries.len);
     try std.testing.expectEqualStrings("active", entries[0].name);
     try std.testing.expectEqualStrings("SELECT *", entries[1].preview);
     try std.testing.expectEqualStrings("SELECT *\nFROM people;", entries[1].sql);
-    try save(gpa, io, dir, "recent", "select 2;", true);
+    try save(io, dir, "recent", "select 2;", true);
     try std.testing.expectEqualStrings("select 2;", try load(a, io, dir, "recent"));
 
     try remove(io, dir, "recent");
     try std.testing.expectError(error.FileNotFound, load(a, io, dir, "recent"));
-    try std.testing.expectEqual(@as(usize, 1), (try list(a, io, dir)).len);
+    const names = try list(a, io, dir, false);
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("active", names[0].name);
+    try std.testing.expectEqualStrings("", names[0].sql);
 }
