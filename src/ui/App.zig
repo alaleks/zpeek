@@ -231,6 +231,7 @@ pub fn run(opts: Options) !void {
 
     app.vx = try vaxis.init(app.io, app.gpa, app.env, .{
         .kitty_keyboard_flags = .{ .report_events = false },
+        .system_clipboard_allocator = app.gpa,
     });
     defer app.vx.deinit(app.gpa, app.tty.writer());
 
@@ -428,14 +429,82 @@ fn handleEvent(app: *App, event: Event) !void {
                 return;
             }
             if (app.mode == .console or app.mode == .config) try app.editor.insertPaste(text);
+            if (app.filterEditor()) |editor| {
+                try editor.insertPaste(text);
+                app.table_view.?.completion.clearRetainingCapacity();
+            }
         },
         .focus_in => {},
-        .mouse => |m| app.handleMouse(m),
+        .mouse => |m| try app.handleMouse(m),
         .key_press => |key| try app.handleKey(key),
     }
 }
 
-fn handleMouse(app: *App, m: vaxis.Mouse) void {
+fn filterEditor(app: *App) ?*Editor {
+    if (app.mode == .table) {
+        if (app.table_view) |tv| {
+            if (tv.editing_filter) return &tv.filter_editor;
+        }
+    }
+    return null;
+}
+
+test "WHERE accepts paste events and bracketed paste without submitting" {
+    const a = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+    };
+    defer app.deinit();
+    var builder = db.ResultBuilder.init(a);
+    try builder.setColumns(&.{"id"});
+    var result = builder.finish();
+    defer result.deinit();
+    app.table_view = try TableView.init(a, &result, false, "people", .{ .table = "people", .kind = .sqlite }, "", null);
+    app.mode = .table;
+    const tv = app.table_view.?;
+    try app.handleKey(.{ .codepoint = '/' });
+    try tv.filter_editor.setText("id = ");
+    try app.handleEvent(.{ .paste = try a.dupe(u8, "'Привет'") });
+    try std.testing.expectEqualStrings("id = 'Привет'", tv.filter_editor.text());
+    try app.handleEvent(.paste_start);
+    try app.handleKey(.{ .codepoint = vaxis.Key.enter });
+    try app.handleKey(.{ .codepoint = 0, .text = "AND id > 0" });
+    try app.handleEvent(.paste_end);
+    try std.testing.expectEqualStrings("id = 'Привет'\nAND id > 0", tv.filter_editor.text());
+    try std.testing.expect(tv.editing_filter);
+    try std.testing.expectEqualStrings("", tv.browse.?.filter);
+    try std.testing.expectEqualStrings("", app.editor.text());
+
+    app.tty = try vaxis.Tty.init(app.io, &app.tty_buf);
+    defer app.tty.deinit();
+    var output: [1024]u8 = undefined;
+    const writer = app.tty.writer();
+    const original_writer = writer.*;
+    writer.* = .fixed(&output);
+    defer writer.* = original_writer;
+    app.vx = try vaxis.init(app.io, a, &env, .{ .system_clipboard_allocator = a });
+    defer app.vx.deinit(a, writer);
+    try app.handleKey(.{ .codepoint = 's', .mods = .{ .ctrl = true } });
+    try app.handleKey(.{ .codepoint = 'v', .mods = .{ .ctrl = true } });
+    try app.handleEvent(.{ .mouse = .{ .button = .right, .type = .press, .col = 0, .row = 0, .mods = .{} } });
+    try app.handleEvent(.{ .mouse = .{ .button = .right, .type = .release, .col = 0, .row = 0, .mods = .{} } });
+    try std.testing.expectEqualStrings("\x1b]52;c;?\x1b\\\x1b]52;c;?\x1b\\\x1b]52;c;?\x1b\\", writer.buffered());
+}
+
+fn handleMouse(app: *App, m: vaxis.Mouse) !void {
+    if (m.button == .right and m.type == .press and app.filterEditor() != null) {
+        return app.vx.requestSystemClipboard(app.tty.writer());
+    }
     const delta: isize = switch (m.button) {
         .wheel_up => -3,
         .wheel_down => 3,
@@ -456,6 +525,17 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             if (key.text) |text| _ = try p.handleKey(.{ .codepoint = 0, .text = text });
             return;
         }
+        if (app.filterEditor()) |editor| {
+            if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                try editor.insertPaste("\n");
+            } else if (key.matches(vaxis.Key.tab, .{})) {
+                try editor.insertPaste("\t");
+            } else if (key.text) |text| {
+                try editor.insertPaste(text);
+            }
+            app.table_view.?.completion.clearRetainingCapacity();
+            return;
+        }
         if (app.mode != .console and app.mode != .config) return;
         if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
             try app.editor.insert("\n");
@@ -465,6 +545,12 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             try app.editor.insert(t);
         }
         return;
+    }
+
+    if (app.filterEditor() != null and
+        (key.matches('s', .{ .ctrl = true }) or key.matches('v', .{ .ctrl = true })))
+    {
+        return app.vx.requestSystemClipboard(app.tty.writer());
     }
 
     switch (app.mode) {
