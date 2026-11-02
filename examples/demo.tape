@@ -1,4 +1,5 @@
 Output examples/demo.gif
+Output examples/demo.mp4
 
 Require sqlite3
 
@@ -27,29 +28,34 @@ Enter
 Sleep 1s
 Show
 
+# 0–5s: connected SQLite session.
+Set TypingSpeed 100ms
+Sleep 5s
+
+# 5–12s: choose orders from /tables.
 Type "/tables"
-Enter
-Sleep 1500ms
+Enter@100ms
+Sleep 2s
 
 Type "orders"
-Sleep 800ms
-Enter
-Sleep 2s
+Enter@100ms
+Sleep 3500ms
 
-Right 3
-Type "s"
-Sleep 1s
-Type "s"
-Sleep 2s
-Left 2
+# 12–22s: customer_id -> related customer. Keep the FK preview visible.
+Right@100ms
+Sleep 1400ms
 Type "f"
-Sleep 3s
+Sleep 8400ms
 
+# 22–35s: SQL autocomplete, then results.
 Type "q"
-Sleep 500ms
-Type "select item, total_usd from orders where total_usd >= 100;"
-Enter
-Sleep 4s
+Sleep 400ms
+Type "SELECT * FROM ord"
+Sleep 2300ms
+Tab@100ms
+Type " WHERE total_usd >= 100;"
+Enter@100ms
+Sleep 6s
 
 Hide
 Ctrl+D

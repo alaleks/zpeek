@@ -143,7 +143,7 @@ sqlite3 /tmp/zpeek-demo.db < examples/demo.sql
 ./zig-out/bin/zpeek /tmp/zpeek-demo.db
 ```
 
-The sample script recreates its `customers` and `orders` tables; use a disposable database file. The [recording script](../examples/demo.tape) selects `orders` through `/tables`, sorts by `total_usd`, previews the related customer through `customer_id`, and executes SQL. Regenerate the GIF from the repository root with VHS and its recording dependencies installed:
+The sample script recreates its `customers` and `orders` tables; use a disposable database file. The [35-second recording script](../examples/demo.tape) shows a connected SQLite session (0–5s), selects `orders` through `/tables` (5–12s), previews the related customer through `customer_id` (12–22s), then executes SQL with autocomplete (22–35s). It produces a GIF and a silent MP4. Regenerate them from the repository root with VHS and its recording dependencies installed:
 
 ```sh
 vhs examples/demo.tape

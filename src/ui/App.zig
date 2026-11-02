@@ -338,8 +338,8 @@ fn loadHistory(app: *App) !void {
 
 fn saveHistory(app: *App) void {
     const path = app.history_path orelse return;
-    const items = if (app.config_edit) |edit| edit.previous.history.items else app.editor.history.items;
-    const start = items.len -| history_limit;
+    const editor = if (app.config_edit) |*edit| &edit.previous else &app.editor;
+    const start = editor.historyLen() -| history_limit;
     var file = Io.Dir.cwd().createFileAtomic(app.io, path, .{
         .replace = true,
         .make_path = true,
@@ -348,7 +348,8 @@ fn saveHistory(app: *App) void {
     defer file.deinit(app.io);
     var buffer: [4096]u8 = undefined;
     var writer = file.file.writer(app.io, &buffer);
-    for (items[start..]) |h| {
+    for (start..editor.historyLen()) |i| {
+        const h = editor.historyAt(i);
         writer.interface.writeAll(h) catch return;
         writer.interface.writeByte(0) catch return;
     }
@@ -384,8 +385,8 @@ test "history rewrites connection URLs without credentials" {
     };
     defer app.deinit();
     try app.loadHistory();
-    try std.testing.expectEqual(@as(usize, 1), app.editor.history.items.len);
-    try std.testing.expectEqualStrings("/connect <redacted>", app.editor.history.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), app.editor.historyLen());
+    try std.testing.expectEqualStrings("/connect <redacted>", app.editor.historyAt(0));
     app.saveHistory();
     // Persistence streams directly to disk and can be repeated without consuming the path.
     try app.editor.commitHistoryText("select 42");
@@ -398,11 +399,25 @@ test "history rewrites connection URLs without credentials" {
     const saved = try cwd.readFileAlloc(std.testing.io, history_file, a, .limited(1024));
     defer a.free(saved);
     try std.testing.expectEqualStrings("/connect <redacted>\x00select 42\x00", saved);
+    var entry: [32]u8 = undefined;
+    for (0..1005) |i| try app.editor.commitHistoryText(try std.fmt.bufPrint(&entry, "select {d}", .{i}));
+    app.saveHistory();
+    const wrapped = try cwd.readFileAlloc(std.testing.io, history_file, a, .limited(64 * 1024));
+    defer a.free(wrapped);
+    try std.testing.expect(std.mem.startsWith(u8, wrapped, "select 5\x00"));
+    try std.testing.expect(std.mem.endsWith(u8, wrapped, "select 1004\x00"));
 }
 
 // ───────────────────────────── events ─────────────────────────────
 
 fn handleEvent(app: *App, event: Event) !void {
+    app.handleEventInner(event) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => try app.transcript.addMessage(.err, "cannot start query: {t}", .{err}),
+        else => return err,
+    };
+}
+
+fn handleEventInner(app: *App, event: Event) !void {
     switch (event) {
         .winsize => |ws| try app.vx.resize(app.gpa, app.tty.writer(), ws),
         .tick => {
@@ -995,6 +1010,7 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
         .follow_fk => |sql| {
             defer app.gpa.free(sql);
             const job = try app.newJob(.browse_fk);
+            errdefer if (app.job != job) app.destroyJob(job);
             job.sqls = try job.arena.allocator().dupe([]const u8, &.{try job.arena.allocator().dupe(u8, sql)});
             try app.startJob(job);
         },
@@ -1010,6 +1026,7 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
                 return;
             }
             const job = try app.newJob(.browse_delete);
+            errdefer if (app.job != job) app.destroyJob(job);
             job.sqls = try job.arena.allocator().dupe([]const u8, &.{try job.arena.allocator().dupe(u8, sql)});
             try app.startJob(job);
         },
@@ -1069,6 +1086,7 @@ fn executeSql(app: *App, text: []const u8, approved: bool) !void {
     try lexer.splitStatements(text, dialect, &stmts, app.gpa);
     if (stmts.items.len == 0) return;
     const job = try app.newJob(.console);
+    errdefer if (app.job != job) app.destroyJob(job);
     const a = job.arena.allocator();
     const sqls = try a.alloc([]const u8, stmts.items.len);
     for (stmts.items, sqls) |s, *d| d.* = try a.dupe(u8, s);
@@ -1084,10 +1102,10 @@ fn executeSql(app: *App, text: []const u8, approved: bool) !void {
 fn openHistory(app: *App, search: []const u8) !void {
     const a = app.frame_arena.allocator();
     var items: std.ArrayList(Picker.Item) = .empty;
-    var i = app.editor.history.items.len;
+    var i = app.editor.historyLen();
     while (i > 0) {
         i -= 1;
-        const sql = app.editor.history.items[i];
+        const sql = app.editor.historyAt(i);
         if (sql.len == 0 or sql[0] == '/') continue;
         const first_line = sql[0 .. std.mem.indexOfScalar(u8, sql, '\n') orelse sql.len];
         try items.append(a, .{ .label = try std.fmt.allocPrint(a, "#{d}", .{i + 1}), .detail = first_line, .value = sql });
@@ -1139,6 +1157,7 @@ fn startExplain(app: *App, query: []const u8) !void {
         return app.transcript.addMessage(.err, "cannot explain: {t} — supply one SELECT or DML statement; ANALYZE is not enabled", .{err});
     };
     const job = try app.newJob(.explain);
+    errdefer if (app.job != job) app.destroyJob(job);
     const a = job.arena.allocator();
     job.sqls = try a.dupe([]const u8, &.{try a.dupe(u8, sql)});
     job.max_rows = console_row_limit;
@@ -1484,6 +1503,7 @@ fn runCommand(app: *App, text: []const u8) !void {
     if (eql(u8, cmd.name, "/databases")) {
         const sql = schema.databasesSql(app.conn.?.kind) orelse return;
         const job = try app.newJob(.console);
+        errdefer if (app.job != job) app.destroyJob(job);
         job.sqls = try job.arena.allocator().dupe([]const u8, &.{sql});
         return app.startJob(job);
     }
@@ -1759,7 +1779,7 @@ test "config editor preserves SQL drafts and never submits config as SQL" {
     try app.editor.setText("[broken");
     try app.handleKey(.{ .codepoint = vaxis.Key.enter });
     try std.testing.expectEqualStrings("[broken\n", app.editor.text());
-    try std.testing.expectEqual(@as(usize, 0), app.editor.history.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.editor.historyLen());
     try app.handleKey(.{ .codepoint = 's', .mods = .{ .ctrl = true } });
     try std.testing.expectEqual(Mode.config, app.mode);
     try std.testing.expect(std.mem.indexOf(u8, app.config_edit.?.message.?, "Not saved:") != null);
@@ -1774,7 +1794,7 @@ test "config editor preserves SQL drafts and never submits config as SQL" {
     try app.handleKey(.{ .codepoint = 's', .mods = .{ .ctrl = true } });
     try std.testing.expectEqual(Mode.console, app.mode);
     try std.testing.expectEqualStrings("select 42;", app.editor.text());
-    try std.testing.expectEqual(@as(usize, 1), app.editor.history.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.editor.historyLen());
     try std.testing.expect(app.cfg.find("local") != null);
     const saved = try Io.Dir.cwd().readFileAlloc(app.io, path, a, .limited(4096));
     defer a.free(saved);
@@ -2073,12 +2093,54 @@ fn disconnect(app: *App) void {
 
 // ───────────────────────────── jobs ─────────────────────────────
 
+test "connection preparation frees jobs on allocation and task start failures" {
+    const Fail = struct {
+        fn concurrent(_: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) Io.ConcurrentError!*Io.AnyFuture {
+            return error.ConcurrencyUnavailable;
+        }
+    };
+    const a = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    const large = try a.alloc(u8, 8192);
+    defer a.free(large);
+    @memset(large, 'x');
+    var vtable = std.testing.io.vtable.*;
+    vtable.concurrent = Fail.concurrent;
+    for (0..5) |fail_index| {
+        var failing: std.testing.FailingAllocator = .init(a, .{ .fail_index = if (fail_index == 4) std.math.maxInt(usize) else fail_index });
+        const gpa = failing.allocator();
+        var app: App = .{
+            .gpa = gpa,
+            .io = if (fail_index == 4) .{ .userdata = std.testing.io.userdata, .vtable = &vtable } else std.testing.io,
+            .env = &env,
+            .cfg = .{ .path = "", .found = false },
+            .editor = .init(gpa),
+            .transcript = .init(gpa),
+            .conn_arena = .init(gpa),
+            .popup_arena = .init(gpa),
+            .frame_arena = .init(gpa),
+        };
+        defer app.deinit();
+        try std.testing.expectError(if (fail_index == 4) error.ConcurrencyUnavailable else error.OutOfMemory, app.startConnect(large, .{
+            .kind = .postgres,
+            .host = large,
+            .user = large,
+            .password = large,
+            .database = large,
+        }));
+        try std.testing.expect(app.job == null);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
 fn newJob(app: *App, kind: JobKind) !*Job {
     const job = try app.gpa.create(Job);
     job.* = .{ .arena = .init(app.gpa), .kind = kind, .started = .now(app.io, .awake) };
     return job;
 }
 
+/// Takes ownership only on success; the caller cleans up a failed start.
 fn startJob(app: *App, job: *Job) !void {
     std.debug.assert(app.job == null);
     app.job = job;
@@ -2087,9 +2149,7 @@ fn startJob(app: *App, job: *Job) !void {
     job.future = app.io.concurrent(jobTask, .{ app, job }) catch |err| {
         app.job = null;
         app.busy.store(false, .release);
-        job.arena.deinit();
-        app.gpa.destroy(job);
-        return app.transcript.addMessage(.err, "cannot start query: {t}", .{err});
+        return err;
     };
 }
 
@@ -2910,12 +2970,14 @@ fn startList(app: *App, obj: schema.Object) !void {
     const kind = app.conn.?.kind;
     const sql = schema.listSql(kind, obj) orelse return app.transcript.addMessage(.dim, "{s}", .{schema.unsupportedReason(kind, obj)});
     const job = try app.newJob(.{ .list = obj });
+    errdefer if (app.job != job) app.destroyJob(job);
     job.sqls = try job.arena.allocator().dupe([]const u8, &.{sql});
     try app.startJob(job);
 }
 
 fn startDescribe(app: *App, table: []const u8) !void {
     const job = try app.newJob(.{ .describe = undefined });
+    errdefer if (app.job != job) app.destroyJob(job);
     const a = job.arena.allocator();
     job.kind = .{ .describe = try a.dupe(u8, table) };
     job.sqls = try schema.describeSql(a, app.conn.?.kind, table);
@@ -2930,6 +2992,7 @@ fn startDefinition(app: *App, name: []const u8) !void {
 
 fn startDefinitionSql(app: *App, name: []const u8, sql: []const u8) !void {
     const job = try app.newJob(.{ .definition = undefined });
+    errdefer if (app.job != job) app.destroyJob(job);
     const a = job.arena.allocator();
     job.kind = .{ .definition = try a.dupe(u8, name) };
     job.sqls = try a.dupe([]const u8, &.{try a.dupe(u8, sql)});
@@ -3150,6 +3213,7 @@ test "choosing a table opens its SQLite browse view" {
 fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
     if (try app.filterViolation(filter)) |word| return app.transcript.addMessage(.err, "browse filters may only read ('{s}' was refused)", .{word});
     const job = try app.newJob(.{ .browse_open = undefined });
+    errdefer if (app.job != job) app.destroyJob(job);
     const a = job.arena.allocator();
     const kind = app.conn.?.kind;
     const params = app.conn_params.?;
@@ -3197,6 +3261,7 @@ fn startBrowseReload(app: *App) !void {
         return;
     }
     const job = try app.newJob(.browse_reload);
+    errdefer if (app.job != job) app.destroyJob(job);
     const a = job.arena.allocator();
     const kind = app.conn.?.kind;
     job.sqls = try a.dupe([]const u8, &.{try schema.browseSql(a, kind, b.table, b.filter, b.order, b.page_size, b.offset)});
@@ -3211,6 +3276,7 @@ fn startBrowseCount(app: *App) !void {
         return;
     }
     const job = try app.newJob(.browse_count);
+    errdefer if (app.job != job) app.destroyJob(job);
     const a = job.arena.allocator();
     job.sqls = try a.dupe([]const u8, &.{try schema.countSql(a, b.kind, b.table, b.filter)});
     try app.startJob(job);
@@ -3220,6 +3286,7 @@ fn startCacheLoad(app: *App, announce: bool) !void {
     const conn = app.conn orelse return;
     if (app.job != null) return;
     const job = try app.newJob(.cache);
+    errdefer if (app.job != job) app.destroyJob(job);
     job.sqls = try job.arena.allocator().dupe([]const u8, &.{schema.completionSql(conn.kind)});
     try app.startJob(job);
     if (announce) try app.transcript.addMessage(.dim, "reloading table and column names…", .{});
@@ -3228,6 +3295,7 @@ fn startCacheLoad(app: *App, announce: bool) !void {
 fn startConnect(app: *App, name: []const u8, params: conninfo.Params) !void {
     if (app.job != null) return app.transcript.addMessage(.warn, "busy — wait for the running query", .{});
     const job = try app.newJob(.{ .connect = undefined });
+    errdefer if (app.job != job) app.destroyJob(job);
     const a = job.arena.allocator();
     var p = params;
     conninfo.passwordFromEnv(&p, app.env);

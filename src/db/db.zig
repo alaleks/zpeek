@@ -63,12 +63,18 @@ pub const ResultBuilder = struct {
         for (row) |cell| if (cell) |value| {
             row_bytes +|= value.len;
         };
-        if (row_bytes > opts.max_bytes -| b.stored_bytes) {
-            b.result.truncated = true;
-            return;
-        }
+        if (!b.acceptsRow(row_bytes, opts)) return;
         try b.rows.append(b.allocator(), row);
         b.stored_bytes += row_bytes;
+    }
+
+    /// Drivers call this before copying a row into the result arena.
+    pub fn acceptsRow(b: *ResultBuilder, row_bytes: usize, opts: QueryOptions) bool {
+        if (b.full(opts) or row_bytes > opts.max_bytes -| b.stored_bytes) {
+            b.result.truncated = true;
+            return false;
+        }
+        return true;
     }
 
     /// True when a result limit is reached; drivers then skip storing rows.

@@ -381,6 +381,8 @@ const My = struct {
                             continue;
                         }
                         var rr: Io.Reader = .fixed(p);
+                        const row_bytes = try dataRowBytes(rr, ncols);
+                        if (!b.acceptsRow(row_bytes, opts)) continue;
                         const row = try a.alloc(?[]const u8, ncols);
                         for (row) |*cell| {
                             const lead = try rr.peekByte();
@@ -715,4 +717,24 @@ test "lenenc" {
         var r: Io.Reader = .fixed(list.items);
         try std.testing.expectEqual(@as(u64, n), try readLenenc(&r));
     }
+}
+
+fn dataRowBytes(reader: Io.Reader, ncols: usize) !usize {
+    var sizes = reader;
+    var row_bytes = ncols *| @sizeOf(?[]const u8);
+    for (0..ncols) |_| {
+        if (try sizes.peekByte() == 0xFB) {
+            sizes.toss(1);
+        } else {
+            const len: usize = @intCast(try readLenenc(&sizes));
+            row_bytes +|= len;
+            _ = try sizes.take(len);
+        }
+    }
+    return row_bytes;
+}
+
+test "row preflight counts nulls and rejects incomplete values" {
+    try std.testing.expectEqual(@as(usize, 2 * @sizeOf(?[]const u8) + 3), try dataRowBytes(.fixed("\x03abc\xfb"), 2));
+    try std.testing.expectError(error.EndOfStream, dataRowBytes(.fixed("\x03"), 2));
 }

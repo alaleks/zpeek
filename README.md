@@ -4,7 +4,7 @@
 
 <p align="center">A keyboard-driven database browser and SQL client for your terminal.<br>PostgreSQL · MySQL/MariaDB · SQLite · ClickHouse</p>
 
-![zpeek: choose a table, sort orders by price, preview a customer through a foreign key, then run SQL](examples/demo.gif)
+![zpeek: open orders, follow customer_id to a customer, then run SQL with autocomplete](examples/demo.gif)
 
 ## Features
 

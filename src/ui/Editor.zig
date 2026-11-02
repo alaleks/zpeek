@@ -16,6 +16,8 @@ cursor: usize = 0,
 goal_col: ?usize = null,
 
 history: std.ArrayList([]const u8) = .empty,
+history_head: usize = 0,
+history_count: usize = 0,
 history_bytes: usize = 0,
 /// Index into `history` while browsing it; null when editing a fresh line.
 history_pos: ?usize = null,
@@ -27,7 +29,7 @@ pub fn init(gpa: Allocator) Editor {
 }
 
 pub fn deinit(e: *Editor) void {
-    for (e.history.items) |h| e.gpa.free(h);
+    for (0..e.history_count) |i| e.gpa.free(e.historyAt(i));
     e.history.deinit(e.gpa);
     e.buf.deinit(e.gpa);
     e.draft.deinit(e.gpa);
@@ -260,34 +262,74 @@ pub fn commitHistoryText(e: *Editor, text_value: []const u8) Allocator.Error!voi
     const t = std.mem.trim(u8, text_value, " \t\r\n");
     if (t.len == 0) return;
     if (t.len >= max_history_bytes) return;
-    if (e.history.items.len > 0 and std.mem.eql(u8, e.history.items[e.history.items.len - 1], t)) return;
-    try e.history.ensureUnusedCapacity(e.gpa, 1);
-    e.history.appendAssumeCapacity(try e.gpa.dupe(u8, t));
-    e.history_bytes += t.len + 1;
-    while (e.history.items.len > max_history or e.history_bytes > max_history_bytes) {
-        const old = e.history.orderedRemove(0);
+    if (e.history_count > 0 and std.mem.eql(u8, e.historyAt(e.history_count - 1), t)) return;
+    try e.history.ensureTotalCapacity(e.gpa, max_history);
+    const owned = try e.gpa.dupe(u8, t);
+    e.history.items.len = max_history;
+    while (e.history_count == max_history or e.history_bytes + t.len + 1 > max_history_bytes) {
+        const old = e.historyAt(0);
         e.history_bytes -= old.len + 1;
         e.gpa.free(old);
+        e.history_head = (e.history_head + 1) % max_history;
+        e.history_count -= 1;
         e.history_pos = null;
     }
+    e.history.items[(e.history_head + e.history_count) % max_history] = owned;
+    e.history_count += 1;
+    e.history_bytes += t.len + 1;
+}
+
+pub fn historyLen(e: *const Editor) usize {
+    return e.history_count;
+}
+
+test "history ring wraps repeatedly and preserves navigation and drafts" {
+    var editor: Editor = .init(std.testing.allocator);
+    defer editor.deinit();
+    var buffer: [40]u8 = undefined;
+    for (0..max_history * 3) |i| try editor.commitHistoryText(try std.fmt.bufPrint(&buffer, "select {d}", .{i}));
+    try std.testing.expectEqual(max_history, editor.historyLen());
+    try std.testing.expectEqualStrings("select 2000", editor.historyAt(0));
+    try std.testing.expectEqualStrings("select 2999", editor.historyAt(999));
+    try editor.setText("draft");
+    try editor.historyPrev();
+    try std.testing.expectEqualStrings("select 2999", editor.text());
+    try editor.historyPrev();
+    try std.testing.expectEqualStrings("select 2998", editor.text());
+    try editor.historyNext();
+    try editor.historyNext();
+    try std.testing.expectEqualStrings("draft", editor.text());
+    const large = try std.testing.allocator.alloc(u8, max_history_bytes / 2);
+    defer std.testing.allocator.free(large);
+    @memset(large, 'x');
+    try editor.commitHistoryText(large);
+    large[0] = 'y';
+    try editor.commitHistoryText(large);
+    try std.testing.expectEqual(@as(usize, 1), editor.historyLen());
+    try std.testing.expectEqualStrings(large, editor.historyAt(0));
+}
+
+pub fn historyAt(e: *const Editor, index: usize) []const u8 {
+    std.debug.assert(index < e.history_count);
+    return e.history.items[(e.history_head + index) % max_history];
 }
 
 pub fn historyPrev(e: *Editor) Allocator.Error!void {
-    if (e.history.items.len == 0) return;
+    if (e.history_count == 0) return;
     const pos = if (e.history_pos) |p| (if (p == 0) return else p - 1) else blk: {
         e.draft.clearRetainingCapacity();
         try e.draft.appendSlice(e.gpa, e.buf.items);
-        break :blk e.history.items.len - 1;
+        break :blk e.history_count - 1;
     };
     e.history_pos = pos;
-    try e.setText(e.history.items[pos]);
+    try e.setText(e.historyAt(pos));
 }
 
 pub fn historyNext(e: *Editor) Allocator.Error!void {
     const p = e.history_pos orelse return;
-    if (p + 1 < e.history.items.len) {
+    if (p + 1 < e.history_count) {
         e.history_pos = p + 1;
-        try e.setText(e.history.items[p + 1]);
+        try e.setText(e.historyAt(p + 1));
     } else {
         e.history_pos = null;
         try e.setText(e.draft.items);
@@ -340,10 +382,10 @@ test "history keeps the newest entries within its count limit" {
         var buffer: [32]u8 = undefined;
         try e.commitHistoryText(try std.fmt.bufPrint(&buffer, "select {d}", .{i}));
     }
-    try testing.expectEqual(max_history, e.history.items.len);
-    try testing.expectEqualStrings("select 3", e.history.items[0]);
+    try testing.expectEqual(max_history, e.historyLen());
+    try testing.expectEqualStrings("select 3", e.historyAt(0));
     var bytes: usize = 0;
-    for (e.history.items) |entry| bytes += entry.len + 1;
+    for (0..e.historyLen()) |i| bytes += e.historyAt(i).len + 1;
     try testing.expectEqual(bytes, e.history_bytes);
 }
 

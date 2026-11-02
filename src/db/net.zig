@@ -11,15 +11,24 @@ const conninfo = @import("../conninfo.zig");
 const connect_timeout: Io.Duration = .fromSeconds(10);
 const read_timeout: Io.Duration = .fromSeconds(300);
 
+const ConnectRace = union(enum) {
+    conn: Io.net.HostName.ConnectError!Io.net.Stream,
+    timer: Io.Cancelable!void,
+};
+
+fn cancelConnectRace(race: *Io.Select(ConnectRace)) void {
+    while (race.cancel()) |pending| switch (pending) {
+        .conn => |result| if (result) |stream| stream.close(race.io) else |_| {},
+        .timer => {},
+    };
+}
+
 /// std.Io.Threaded (Zig 0.17) panics on `ConnectOptions.timeout`, so the
 /// timeout is implemented by racing the connect against a sleep.
 fn connectWithTimeout(io: Io, name: Io.net.HostName, port: u16) !Io.net.Stream {
-    const Race = union(enum) {
-        conn: Io.net.HostName.ConnectError!Io.net.Stream,
-        timer: Io.Cancelable!void,
-    };
-    var buf: [2]Race = undefined;
-    var race: Io.Select(Race) = .init(io, &buf);
+    var buf: [2]ConnectRace = undefined;
+    var race: Io.Select(ConnectRace) = .init(io, &buf);
+    defer cancelConnectRace(&race);
     race.concurrent(.conn, Io.net.HostName.connect, .{ name, io, port, .{ .mode = .stream } }) catch
         return name.connect(io, port, .{ .mode = .stream });
     race.concurrent(.timer, Io.sleep, .{ io, connect_timeout, .awake }) catch {
@@ -41,6 +50,50 @@ fn connectWithTimeout(io: Io, name: Io.net.HostName, port: u16) !Io.net.Stream {
             return error.Timeout;
         },
     }
+}
+
+test "canceling a connect race joins children and closes queued connections" {
+    const State = struct {
+        started: Io.Event = .unset,
+        finished: Io.Event = .unset,
+        blocker: Io.Event = .unset,
+        var closed: usize = 0;
+
+        fn worker(state: *@This()) Io.Cancelable!void {
+            defer state.finished.set(std.testing.io);
+            state.started.set(std.testing.io);
+            try state.blocker.wait(std.testing.io);
+        }
+
+        fn run(state: *@This()) Io.Cancelable!void {
+            var buffer: [2]ConnectRace = undefined;
+            var race: Io.Select(ConnectRace) = .init(std.testing.io, &buffer);
+            defer cancelConnectRace(&race);
+            race.concurrent(.timer, worker, .{state}) catch return error.Canceled;
+            _ = try race.await();
+        }
+
+        fn close(_: ?*anyopaque, sockets: []const Io.net.Socket) void {
+            closed += sockets.len;
+        }
+    };
+    var state: State = .{};
+    var future = try std.testing.io.concurrent(State.run, .{&state});
+    defer _ = future.cancel(std.testing.io) catch {};
+    try state.started.wait(std.testing.io);
+    try std.testing.expectError(error.Canceled, future.cancel(std.testing.io));
+    try std.testing.expect(state.finished.isSet());
+
+    var vtable = std.testing.io.vtable.*;
+    vtable.netClose = State.close;
+    const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var buffer: [2]ConnectRace = undefined;
+    var race: Io.Select(ConnectRace) = .init(io, &buffer);
+    State.closed = 0;
+    try race.queue.putOneUncancelable(io, .{ .conn = .{ .socket = undefined } });
+    cancelConnectRace(&race);
+    cancelConnectRace(&race);
+    try std.testing.expectEqual(@as(usize, 1), State.closed);
 }
 
 pub const Transport = struct {

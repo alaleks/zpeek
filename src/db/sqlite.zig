@@ -76,6 +76,19 @@ const Sqlite = struct {
                 if (dml) continue;
                 break;
             }
+            var row_bytes = ncols *| @sizeOf(?[]const u8);
+            for (0..ncols) |i| {
+                const index: c_int = @intCast(i);
+                const size: usize = @intCast(c.sqlite3_column_bytes(s, index));
+                row_bytes +|= if (c.sqlite3_column_type(s, index) == c.SQLITE_BLOB)
+                    3 + @as(usize, @min(size, 64)) * 2 + (if (size > 64) std.fmt.count("… ({d} bytes)", .{size}) else @as(usize, 0))
+                else
+                    size;
+            }
+            if (!b.acceptsRow(row_bytes, opts)) {
+                if (dml) continue;
+                break;
+            }
             const row = try a.alloc(?[]const u8, ncols);
             for (row, 0..) |*cell, i| cell.* = try columnText(a, s, @intCast(i));
             try b.addRow(row, opts);
@@ -214,6 +227,34 @@ fn isDml(word: []const u8) bool {
 
 fn plural(n: usize) []const u8 {
     return if (n == 1) "" else "s";
+}
+
+test "oversized text is rejected before allocation and BLOB uses preview size" {
+    const a = std.testing.allocator;
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try connect(a, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    defer conn.close();
+    var memory: [32 * 1024]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&memory);
+    var large = try conn.queryOpts(fixed.allocator(), "select printf('%.*c', 1000000, 'x')", .{ .max_bytes = 512 });
+    try std.testing.expect(large.truncated);
+    try std.testing.expectEqual(@as(usize, 0), large.rows.len);
+    large.deinit();
+    fixed.reset();
+    var blob = try conn.queryOpts(fixed.allocator(), "select zeroblob(1000000)", .{ .max_bytes = 512 });
+    defer blob.deinit();
+    try std.testing.expectEqual(@as(usize, 1), blob.rows.len);
+    try std.testing.expect(!blob.truncated);
+    try std.testing.expect(std.mem.endsWith(u8, blob.rows[0][0].?, "(1000000 bytes)"));
+    var setup = try conn.query(a, "create table t(id integer)");
+    setup.deinit();
+    var insert = try conn.queryOpts(a, "insert into t values(1),(2),(3) returning printf('%.*c', 10000, 'x')", .{ .max_bytes = 512 });
+    defer insert.deinit();
+    try std.testing.expectEqual(@as(?u64, 3), insert.affected_rows);
+    var count = try conn.query(a, "select count(*) from t");
+    defer count.deinit();
+    try std.testing.expectEqualStrings("3", count.rows[0][0].?);
 }
 
 test "sqlite in-memory round trip" {
