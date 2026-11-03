@@ -2225,7 +2225,7 @@ fn jobTask(app: *App, job: *Job) void {
         const ms = t0.untilNow(app.io, .awake).toMilliseconds();
         if (result) |r| {
             var timed_result = r;
-            const capacity = r.arena.queryCapacity();
+            const capacity = r.capacity();
             if (capacity > remaining) {
                 timed_result.deinit();
                 job.outcomes.append(a, .{ .failed = "statement completed but its result exceeded the batch memory limit and was discarded; remaining statements were not run" }) catch {};
@@ -2635,7 +2635,7 @@ test "SQL batch budgets include retained arenas and skip subsequent writes" {
     var setup = try conn.query(a, "create table t(id integer)");
     setup.deinit();
     var sample = try conn.query(a, "select 1");
-    const capacity = sample.arena.queryCapacity();
+    const capacity = sample.capacity();
     sample.deinit();
     try std.testing.expect(capacity > 0);
     for ([_]usize{ 0, capacity, capacity + 1 }) |budget| {

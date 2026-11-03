@@ -72,6 +72,8 @@ After selecting a view in `/views`, use `/copy` or `ctrl+y` with empty input to 
 
 Row deletion requires a primary key and is unavailable for ClickHouse or read-only connections. See [deletion safeguards](security.md#deleting-rows).
 
+In the standalone query-result viewer, local sorting prepares numeric keys once. Ascending order puts numbers before text and NULLs; descending order reverses this. Signed 64-bit integers are compared exactly, including values above the exact-integer range of `f64`. Non-finite values such as NaN are sorted as text. Browse mode uses database-side sorting.
+
 ## Save and select SQL
 
 Press `ctrl+s` to save SQL from the editor without executing it. With empty input, zpeek saves the last executed SQL instead. Type a name and press `enter`; `tab` selects an existing name. Replacing an existing query requires confirmation. `esc` cancels without changing your input.
@@ -131,7 +133,7 @@ The console shows 50 rows. `ctrl+o` opens the retained result in the full-screen
 
 Once a newer result arrives, older results keep only cell previews for the first 50 rows. Full cell values, viewing and export remain available for the newest retained result.
 
-An interactive SQL batch retains at most 32 MiB of result arena capacity across its statements. Each query also respects the remaining row-data budget. If the returned arena exceeds that budget, its result is discarded and subsequent statements are skipped with an explicit error. The statement that produced that result has already executed; earlier changes are not rolled back. This is a retained-result limit, not a process memory limit: an in-flight result, SQL text, driver buffers and UI state consume additional memory.
+An interactive SQL batch retains at most 32 MiB of result arena and row-index capacity across its statements. Each query also respects the remaining row-data budget. If the returned storage exceeds that budget, its result is discarded and subsequent statements are skipped with an explicit error. The statement that produced that result has already executed; earlier changes are not rolled back. This is a retained-result limit, not a process memory limit: an in-flight result, SQL text, driver buffers and UI state consume additional memory.
 
 Cell previews inspect at most 4 KiB of each value before normalization and clipping. Full retained values remain available in the detail viewer and exports. Temporary rendering and completion arenas retain at most 256 KiB on reset; a larger individual frame can still allocate more. CLI table rendering keeps column widths and one normalized cell at a time.
 

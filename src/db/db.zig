@@ -19,6 +19,7 @@ pub const Result = struct {
     /// PostgreSQL boolean columns; empty when the driver does not provide types.
     boolean_columns: []const bool = &.{},
     rows: []const []const ?[]const u8 = &.{},
+    row_storage: ?struct { gpa: Allocator, allocation: [][]const ?[]const u8 } = null,
     /// Rows changed by INSERT/UPDATE/DELETE when the server reports it.
     affected_rows: ?u64 = null,
     elapsed_ms: ?i64 = null,
@@ -31,7 +32,12 @@ pub const Result = struct {
     retained_bytes: usize = 0,
 
     pub fn deinit(r: *Result) void {
+        if (r.row_storage) |storage| storage.gpa.free(storage.allocation);
         r.arena.deinit();
+    }
+
+    pub fn capacity(r: *const Result) usize {
+        return r.arena.queryCapacity() +| (if (r.row_storage) |storage| storage.allocation.len *| @sizeOf([]const ?[]const u8) else @as(usize, 0));
     }
 
     pub fn hasRows(r: Result) bool {
@@ -42,11 +48,12 @@ pub const Result = struct {
 /// Helper used by drivers to accumulate rows into a Result.
 pub const ResultBuilder = struct {
     result: Result,
+    gpa: Allocator,
     rows: std.ArrayList([]const ?[]const u8) = .empty,
     stored_bytes: usize = 0,
 
     pub fn init(gpa: Allocator) ResultBuilder {
-        return .{ .result = .{ .arena = .init(gpa) } };
+        return .{ .gpa = gpa, .result = .{ .arena = .init(gpa) } };
     }
 
     pub fn allocator(b: *ResultBuilder) Allocator {
@@ -64,7 +71,7 @@ pub const ResultBuilder = struct {
             row_bytes +|= value.len;
         };
         if (!b.acceptsRow(row_bytes, opts)) return;
-        try b.rows.append(b.allocator(), row);
+        try b.rows.append(b.gpa, row);
         b.stored_bytes += row_bytes;
     }
 
@@ -84,12 +91,15 @@ pub const ResultBuilder = struct {
 
     pub fn finish(b: *ResultBuilder) Result {
         b.result.rows = b.rows.items;
-        b.result.retained_bytes +|= b.stored_bytes;
+        b.result.row_storage = .{ .gpa = b.gpa, .allocation = b.rows.allocatedSlice() };
+        b.result.retained_bytes +|= b.stored_bytes +| b.rows.capacity *| @sizeOf([]const ?[]const u8);
+        b.rows = .empty;
         return b.result;
     }
 
     pub fn deinit(b: *ResultBuilder) void {
-        b.result.arena.deinit();
+        b.rows.deinit(b.gpa);
+        b.result.deinit();
     }
 };
 
@@ -303,4 +313,25 @@ test "result byte limit stops storing rows" {
     try std.testing.expect(b.result.truncated);
     try std.testing.expectEqual(@as(usize, 0), b.rows.items.len);
     try std.testing.expect(b.full(opts));
+}
+
+fn buildOwnedRows(a: Allocator) !void {
+    var builder = ResultBuilder.init(a);
+    errdefer builder.deinit();
+    try builder.setColumns(&.{"id"});
+    for (0..1000) |_| {
+        const row = try builder.allocator().alloc(?[]const u8, 1);
+        row[0] = try builder.allocator().dupe(u8, "123");
+        try builder.addRow(row, .{});
+    }
+    var result = builder.finish();
+    defer result.deinit();
+    std.debug.assert(result.row_storage != null);
+    std.debug.assert(result.rows.len == 1000);
+    std.debug.assert(result.capacity() > result.arena.queryCapacity());
+    std.debug.assert(std.mem.eql(u8, result.rows[999][0].?, "123"));
+}
+
+test "row storage transfers ownership and survives allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, buildOwnedRows, .{});
 }

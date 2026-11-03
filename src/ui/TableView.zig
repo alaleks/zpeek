@@ -221,16 +221,7 @@ fn rebuild(tv: *TableView) Allocator.Error!void {
         if (needle.len == 0 or filter.matches(row)) try tv.view.append(tv.gpa, i);
     }
     if (tv.local_sort) |s| {
-        const Ctx = struct {
-            rows: []const []const ?[]const u8,
-            col: usize,
-            desc: bool,
-            fn lessThan(ctx: @This(), a: usize, b: usize) bool {
-                const ord = compareValues(ctx.rows[a][ctx.col], ctx.rows[b][ctx.col]);
-                return if (ctx.desc) ord == .gt else ord == .lt;
-            }
-        };
-        std.sort.block(usize, tv.view.items, Ctx{ .rows = r.rows, .col = s.col, .desc = s.desc }, Ctx.lessThan);
+        try sortView(tv.gpa, tv.view.items, r.rows, s.col, s.desc);
     }
 
     // Widths depend only on the data, not on filter/sort: computed in computeWidths.
@@ -345,13 +336,84 @@ fn parseLocalFilter(columns: []const []const u8, s: []const u8) LocalFilter {
     return .{ .column = null, .text = s, .exact = false };
 }
 
-fn compareValues(a: ?[]const u8, b: ?[]const u8) std.math.Order {
-    const x = a orelse return if (b == null) .eq else .gt; // NULLs last
-    const y = b orelse return .lt;
-    const fx = std.fmt.parseFloat(f64, x) catch null;
-    const fy = std.fmt.parseFloat(f64, y) catch null;
-    if (fx != null and fy != null) return std.math.order(fx.?, fy.?);
-    return std.mem.order(u8, x, y);
+const SortKey = union(enum) {
+    integer: i128,
+    number: f64,
+    text: []const u8,
+    null_value,
+
+    fn init(value: ?[]const u8) SortKey {
+        const text = value orelse return .null_value;
+        if (std.fmt.parseInt(i128, text, 10)) |n| return .{ .integer = n } else |_| {}
+        if (std.fmt.parseFloat(f64, text)) |n| {
+            if (std.math.isFinite(n)) return .{ .number = n };
+        } else |_| {}
+        return .{ .text = text };
+    }
+
+    fn order(a: SortKey, b: SortKey) std.math.Order {
+        return switch (a) {
+            .null_value => if (b == .null_value) .eq else .gt,
+            .text => |x| switch (b) {
+                .null_value => .lt,
+                .text => |y| std.mem.order(u8, x, y),
+                else => .gt,
+            },
+            .integer => |x| switch (b) {
+                .integer => |y| std.math.order(x, y),
+                .number => |y| integerFloatOrder(x, y),
+                else => .lt,
+            },
+            .number => |x| switch (b) {
+                .integer => |y| integerFloatOrder(y, x).invert(),
+                .number => |y| std.math.order(x, y),
+                else => .lt,
+            },
+        };
+    }
+};
+
+fn integerFloatOrder(integer: i128, number: f64) std.math.Order {
+    if (number >= 0x1p127) return .lt;
+    if (number < -0x1p127) return .gt;
+    const whole: i128 = @intFromFloat(number);
+    const ord = std.math.order(integer, whole);
+    if (ord != .eq) return ord;
+    return std.math.order(@as(f64, 0), number - @trunc(number));
+}
+
+test "cached sort keys preserve bigint precision and order mixed values consistently" {
+    const rows: []const []const ?[]const u8 = &.{
+        &.{"9007199254740993"},    &.{"9007199254740992"},
+        &.{"9223372036854775807"}, &.{"-9223372036854775808"},
+        &.{"0.5"},                 &.{"0"},
+        &.{"text"},                &.{null},
+    };
+    var view = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    try sortView(std.testing.allocator, &view, rows, 0, false);
+    try std.testing.expectEqualSlices(usize, &.{ 3, 5, 4, 1, 0, 2, 6, 7 }, &view);
+    try sortView(std.testing.allocator, &view, rows, 0, true);
+    try std.testing.expectEqualSlices(usize, &.{ 7, 6, 2, 0, 1, 4, 5, 3 }, &view);
+    try std.testing.expectEqual(std.math.Order.gt, SortKey.init("9007199254740993").order(SortKey.init("9007199254740992.0")));
+    try std.testing.expectEqual(std.math.Order.gt, SortKey.init("0").order(SortKey.init("-0.5")));
+    try std.testing.expectEqual(std.math.Order.lt, integerFloatOrder(std.math.maxInt(i128), 0x1p127));
+    try std.testing.expectEqual(std.math.Order.eq, integerFloatOrder(std.math.minInt(i128), -0x1p127));
+}
+
+fn sortView(gpa: Allocator, view: []usize, rows: []const []const ?[]const u8, col: usize, desc: bool) !void {
+    const Item = struct {
+        index: usize,
+        key: SortKey,
+        fn lessThan(reverse: bool, a: @This(), b: @This()) bool {
+            const ord = a.key.order(b.key);
+            return if (reverse) ord == .gt else ord == .lt;
+        }
+    };
+    const items = try gpa.alloc(Item, view.len);
+    defer gpa.free(items);
+    for (items, view) |*item, index| item.* = .{ .index = index, .key = .init(rows[index][col]) };
+    std.sort.block(Item, items, desc, Item.lessThan);
+    for (view, items) |*index, item| index.* = item.index;
 }
 
 fn isNumberText(value: []const u8) bool {

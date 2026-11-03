@@ -8,9 +8,19 @@ const db = @import("db/db.zig");
 pub const null_text = "NULL";
 pub const scratch_limit = 256 * 1024;
 
+fn printableAscii(s: []const u8) bool {
+    for (s) |byte| if (byte < 0x20 or byte >= 0x7f) return false;
+    return true;
+}
+
 /// Bound both scanning and allocation, including values made entirely of zero-width characters.
 pub fn preview(a: Allocator, s: []const u8, max: usize) Allocator.Error![]const u8 {
     if (max == 0) return "";
+    const probe = s[0..@min(s.len, @min(4096, max +| 1))];
+    if (printableAscii(probe)) {
+        if (probe.len == s.len and s.len <= max) return s;
+        if (probe.len > max) return std.mem.concat(a, u8, &.{ s[0 .. max - 1], "…" });
+    }
     var buffer: [4096]u8 = undefined;
     const limit = @min(buffer.len, max *| 16 +| 16);
     var pos: usize = 0;
@@ -39,6 +49,7 @@ pub fn preview(a: Allocator, s: []const u8, max: usize) Allocator.Error![]const 
 }
 
 pub fn displayWidth(s: []const u8) usize {
+    if (printableAscii(s)) return s.len;
     var total: usize = 0;
     var it = vaxis.unicode.graphemeIterator(s);
     while (it.next()) |g| total += vaxis.gwidth.gwidth(g.bytes(s), .unicode);
@@ -103,8 +114,8 @@ pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableO
     for (r.rows) |row| {
         if (row.len != ncols) return error.InvalidRow;
         for (row, 0..) |v, i| {
-            const t = try preview(arena.allocator(), v orelse null_text, opts.max_cell_width);
-            widths[i] = @max(widths[i], displayWidth(t));
+            const cell = try prepareCell(arena.allocator(), v orelse null_text, opts.max_cell_width);
+            widths[i] = @max(widths[i], cell.width);
             _ = arena.reset(.{ .retain_with_limit = scratch_limit });
         }
     }
@@ -112,7 +123,8 @@ pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableO
     try rule(w, widths, "┌", "┬", "┐");
     try w.writeAll("│");
     for (r.columns, widths) |name, width| {
-        try writeCell(w, try singleLine(arena.allocator(), name), width);
+        const text = try singleLine(arena.allocator(), name);
+        try writeCell(w, .{ .text = text, .width = displayWidth(text) }, width);
         _ = arena.reset(.{ .retain_with_limit = scratch_limit });
     }
     try w.writeByte('\n');
@@ -120,7 +132,7 @@ pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableO
     for (r.rows) |row| {
         try w.writeAll("│");
         for (row, widths) |v, width| {
-            try writeCell(w, try preview(arena.allocator(), v orelse null_text, opts.max_cell_width), width);
+            try writeCell(w, try prepareCell(arena.allocator(), v orelse null_text, opts.max_cell_width), width);
             _ = arena.reset(.{ .retain_with_limit = scratch_limit });
         }
         try w.writeByte('\n');
@@ -140,10 +152,17 @@ fn rule(w: *std.Io.Writer, widths: []const usize, left: []const u8, mid: []const
     try w.writeAll("\n");
 }
 
-fn writeCell(w: *std.Io.Writer, cell: []const u8, width: usize) !void {
+const Cell = struct { text: []const u8, width: usize };
+
+fn prepareCell(a: Allocator, value: []const u8, max: usize) !Cell {
+    const text = try preview(a, value, max);
+    return .{ .text = text, .width = displayWidth(text) };
+}
+
+fn writeCell(w: *std.Io.Writer, cell: Cell, width: usize) !void {
     try w.writeAll(" ");
-    try w.writeAll(cell);
-    try w.splatByteAll(' ', width - displayWidth(cell) + 1);
+    try w.writeAll(cell.text);
+    try w.splatByteAll(' ', width - cell.width + 1);
     try w.writeAll("│");
 }
 
@@ -154,6 +173,23 @@ test "fitWidth and singleLine" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectEqualStrings("a¶b", try singleLine(arena.allocator(), "a\r\nb"));
+}
+
+test "prepared cells preserve ASCII clipping, Unicode widths and controls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_]struct { input: []const u8, max: usize, text: []const u8, width: usize }{
+        .{ .input = "12345", .max = 4, .text = "123…", .width = 4 },
+        .{ .input = "12345", .max = 1, .text = "…", .width = 1 },
+        .{ .input = "12345", .max = 0, .text = "", .width = 0 },
+        .{ .input = "日本", .max = 4, .text = "日本", .width = 4 },
+        .{ .input = "a\nb", .max = 3, .text = "a¶b", .width = 3 },
+        .{ .input = "é", .max = 1, .text = "é", .width = 1 },
+    }) |case| {
+        const cell = try prepareCell(arena.allocator(), case.input, case.max);
+        try std.testing.expectEqualStrings(case.text, cell.text);
+        try std.testing.expectEqual(case.width, cell.width);
+    }
 }
 
 test "status explicitly shows zero affected rows and duration" {

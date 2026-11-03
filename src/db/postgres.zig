@@ -46,14 +46,8 @@ const Pg = struct {
     // ───────────── message I/O ─────────────
 
     /// Reads one backend message into `self.msg`; returns its type byte.
-    fn readMessage(self: *Pg) Error!u8 {
-        const r = self.t.reader();
-        const kind = try r.takeByte();
-        const len = try r.takeInt(u32, .big);
-        const body_len = try checkedMessageBodyLength(len);
-        try self.msg.resize(self.gpa, body_len);
-        try r.readSliceAll(self.msg.items);
-        return kind;
+    fn readMessage(self: *Pg, skip_rows: bool) Error!u8 {
+        return receiveMessage(self.t.reader(), &self.msg, self.gpa, skip_rows);
     }
 
     fn sendMessage(self: *Pg, kind: ?u8, parts: []const []const u8) Error!void {
@@ -93,7 +87,7 @@ const Pg = struct {
 
         var scram: ?Scram = null;
         while (true) {
-            const kind = try self.readMessage();
+            const kind = try self.readMessage(false);
             const m = self.msg.items;
             switch (kind) {
                 'R' => {
@@ -266,7 +260,7 @@ const Pg = struct {
         var copy_out = false;
 
         while (true) {
-            const kind = try self.readMessage();
+            const kind = try self.readMessage(b.full(opts));
             const m = self.msg.items;
             switch (kind) {
                 'T' => {
@@ -650,4 +644,35 @@ fn dataRowBytes(reader: Io.Reader, ncols: usize) !usize {
 test "row preflight counts nulls and rejects incomplete values" {
     try std.testing.expectEqual(@as(usize, 2 * @sizeOf(?[]const u8) + 3), try dataRowBytes(.fixed("\x00\x00\x00\x03abc\xff\xff\xff\xff"), 2));
     try std.testing.expectError(error.EndOfStream, dataRowBytes(.fixed("\x03"), 2));
+}
+
+fn receiveMessage(r: *Io.Reader, message: *std.ArrayList(u8), gpa: Allocator, skip_rows: bool) Pg.Error!u8 {
+    const kind = try r.takeByte();
+    const body_len = try checkedMessageBodyLength(try r.takeInt(u32, .big));
+    if (skip_rows and (kind == 'D' or kind == 'd')) {
+        message.clearRetainingCapacity();
+        try r.discardAll(body_len);
+    } else {
+        try message.resize(gpa, body_len);
+        try r.readSliceAll(message.items);
+    }
+    return kind;
+}
+
+test "discarded row messages allocate nothing and preserve following protocol messages" {
+    var reader: Io.Reader = .fixed("D\x00\x00\x00\x07abc" ++ "d\x00\x00\x00\x06xy" ++ "E\x00\x00\x00\x08oops" ++ "Z\x00\x00\x00\x05I");
+    var message: std.ArrayList(u8) = .empty;
+    defer message.deinit(std.testing.allocator);
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectEqual(@as(u8, 'D'), try receiveMessage(&reader, &message, failing.allocator(), true));
+    try std.testing.expectEqual(@as(u8, 'd'), try receiveMessage(&reader, &message, failing.allocator(), true));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u8, 'E'), try receiveMessage(&reader, &message, std.testing.allocator, true));
+    try std.testing.expectEqualStrings("oops", message.items);
+    try std.testing.expectEqual(@as(u8, 'Z'), try receiveMessage(&reader, &message, std.testing.allocator, true));
+    try std.testing.expectEqualStrings("I", message.items);
+    var incomplete: Io.Reader = .fixed("D\x00\x00\x00\x07ab");
+    try std.testing.expectError(error.EndOfStream, receiveMessage(&incomplete, &message, std.testing.allocator, true));
+    var invalid: Io.Reader = .fixed("D\xff\xff\xff\xff");
+    try std.testing.expectError(error.StreamTooLong, receiveMessage(&invalid, &message, std.testing.allocator, true));
 }
