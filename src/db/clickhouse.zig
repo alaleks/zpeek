@@ -14,6 +14,136 @@ const lexer = @import("../sql/lexer.zig");
 /// ClickHouse error code for a query stopped by KILL QUERY.
 const query_was_cancelled = "394";
 
+/// One reusable line buffer; retained values belong only to the result arena.
+const BodySink = struct {
+    gpa: Allocator,
+    response: *Ch.Response,
+    builder: ?*db.ResultBuilder,
+    opts: db.QueryOptions,
+    line: std.ArrayList(u8) = .empty,
+    pending_empty: usize = 0,
+
+    fn feed(s: *BodySink, bytes: []const u8) !void {
+        if (bytes.len > s.opts.max_bytes -| s.response.body_bytes) return error.ResponseTooLarge;
+        s.response.body_bytes += bytes.len;
+        if (s.builder == null) return s.response.body.appendSlice(s.gpa, bytes);
+        var remaining = bytes;
+        while (std.mem.indexOfScalar(u8, remaining, '\n')) |end| {
+            try s.line.appendSlice(s.gpa, remaining[0..end]);
+            try s.consumeLine(s.line.items);
+            @import("../memory.zig").clear(&s.line, s.gpa);
+            remaining = remaining[end + 1 ..];
+        }
+        try s.line.appendSlice(s.gpa, remaining);
+    }
+
+    fn finish(s: *BodySink) !void {
+        if (s.builder == null) return;
+        if (s.line.items.len > 0) try s.consumeLine(s.line.items);
+        // Raw FORMAT output historically ignores trailing newlines.
+        if (s.pending_empty > 0 and s.builder.?.rows.items.len == 0) try s.rawRow("");
+    }
+
+    fn rawRow(s: *BodySink, line: []const u8) !void {
+        const b = s.builder.?;
+        if (!b.acceptsRow(@sizeOf(?[]const u8) +| line.len, s.opts)) return;
+        const a = b.allocator();
+        const row = try a.alloc(?[]const u8, 1);
+        row[0] = try a.dupe(u8, line);
+        try b.addRow(row, s.opts);
+    }
+
+    fn consumeLine(s: *BodySink, line: []const u8) !void {
+        const b = s.builder.?;
+        const a = b.allocator();
+        if (!std.mem.eql(u8, s.response.format(), "TabSeparatedWithNames")) {
+            if (b.result.columns.len == 0) try b.setColumns(try a.dupe([]const u8, &.{"output"}));
+            if (line.len == 0) {
+                s.pending_empty += 1;
+                return;
+            }
+            while (s.pending_empty > 0) : (s.pending_empty -= 1) try s.rawRow("");
+            return s.rawRow(line);
+        }
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        if (b.result.columns.len == 0) {
+            var names: std.ArrayList([]const u8) = .empty;
+            while (fields.next()) |field| try names.append(a, (try ownedField(a, field)) orelse return error.ProtocolError);
+            return b.setColumns(names.items);
+        }
+        const ncols = b.result.columns.len;
+        var row_bytes = ncols *| @sizeOf(?[]const u8);
+        for (0..ncols) |_| row_bytes +|= decodedSize(fields.next() orelse "");
+        if (!b.acceptsRow(row_bytes, s.opts)) return;
+        const row = try a.alloc(?[]const u8, ncols);
+        fields.reset();
+        for (row) |*cell| cell.* = try ownedField(a, fields.next() orelse "");
+        try b.addRow(row, s.opts);
+    }
+};
+
+fn decodedSize(field: []const u8) usize {
+    if (std.mem.eql(u8, field, "\\N")) return 0;
+    var size: usize = 0;
+    var i: usize = 0;
+    while (i < field.len) : (i += 1) {
+        if (field[i] == '\\' and i + 1 < field.len) i += 1;
+        size += 1;
+    }
+    return size;
+}
+
+fn ownedField(a: Allocator, field: []const u8) !?[]const u8 {
+    const value = (try unescape(a, field)) orelse return null;
+    return if (value.ptr == field.ptr) try a.dupe(u8, value) else value;
+}
+
+fn readBody(gpa: Allocator, r: *Io.Reader, response: *Ch.Response, builder: ?*db.ResultBuilder, opts: db.QueryOptions, content_length: ?usize, chunked: bool) !void {
+    var sink: BodySink = .{
+        .gpa = gpa,
+        .response = response,
+        .builder = if (response.status == 200 and response.exceptionCode() == null) builder else null,
+        .opts = opts,
+    };
+    defer sink.line.deinit(gpa);
+    var buffer: [4096]u8 = undefined;
+    if (chunked) {
+        while (true) {
+            const line = std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n");
+            const end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+            var remaining = std.fmt.parseInt(usize, line[0..end], 16) catch return error.ProtocolError;
+            if (remaining == 0) {
+                while (std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n").len != 0) {}
+                break;
+            }
+            if (remaining > opts.max_bytes -| response.body_bytes) return error.ResponseTooLarge;
+            while (remaining > 0) {
+                const part = buffer[0..@min(remaining, buffer.len)];
+                try r.readSliceAll(part);
+                try sink.feed(part);
+                remaining -= part.len;
+            }
+            if (!std.mem.eql(u8, try r.take(2), "\r\n")) return error.ProtocolError;
+        }
+    } else if (content_length) |length| {
+        if (length > opts.max_bytes) return error.ResponseTooLarge;
+        var remaining = length;
+        while (remaining > 0) {
+            const part = buffer[0..@min(remaining, buffer.len)];
+            try r.readSliceAll(part);
+            try sink.feed(part);
+            remaining -= part.len;
+        }
+    } else {
+        while (true) {
+            const n = try r.readSliceShort(&buffer);
+            if (n == 0) break;
+            try sink.feed(buffer[0..n]);
+        }
+    }
+    try sink.finish();
+}
+
 const Ch = struct {
     gpa: Allocator,
     io: Io,
@@ -60,12 +190,12 @@ const Ch = struct {
         var b: db.ResultBuilder = .init(gpa);
         errdefer b.deinit();
         const a = b.allocator();
-        const resp = self.request(a, sql, &id, opts.max_rows, opts.max_bytes, true, true) catch |first| retry: {
+        var resp = self.request(self.gpa, sql, &id, opts.max_rows, opts.max_bytes, true, true, &b) catch |first| retry: {
             // The server closed the kept-alive connection before answering (e.g.
             // it restarted). Replay reads on a fresh connection; never writes,
             // in case the server ran them before closing.
             if (first == error.StaleConnection and lexer.readOnlyViolation(sql, .mysql) == null) {
-                break :retry self.request(a, sql, &id, opts.max_rows, opts.max_bytes, true, true);
+                break :retry self.request(self.gpa, sql, &id, opts.max_rows, opts.max_bytes, true, true, &b);
             }
             break :retry first;
         } catch |err| switch (err) {
@@ -84,16 +214,14 @@ const Ch = struct {
                 return error.ConnectionLost;
             },
         };
+        defer resp.deinit(self.gpa);
         if (resp.status != 200 or resp.exceptionCode() != null) {
             const code = resp.exceptionCode() orelse "";
             self.err.set(self.gpa, "{s}", .{std.mem.trim(u8, resp.body.items, " \t\r\n")});
             return if (std.mem.eql(u8, code, query_was_cancelled)) error.Canceled else error.QueryFailed;
         }
 
-        const body = resp.body.items;
-        b.result.retained_bytes = body.len;
-
-        if (body.len == 0) {
+        if (resp.body_bytes == 0) {
             // DDL / INSERT: no result set.
             if (resp.written_rows) |n| if (n > 0) {
                 b.result.affected_rows = n;
@@ -105,40 +233,10 @@ const Ch = struct {
         }
 
         if (!std.mem.eql(u8, resp.format(), "TabSeparatedWithNames")) {
-            // The query chose its own FORMAT: show the raw output as one column.
-            try b.setColumns(try a.dupe([]const u8, &.{"output"}));
-            var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, body, "\n"), '\n');
-            while (lines.next()) |line| {
-                if (b.full(opts)) {
-                    b.result.truncated = true;
-                    break;
-                }
-                const row = try a.alloc(?[]const u8, 1);
-                row[0] = line;
-                try b.addRow(row, opts);
-            }
             b.result.status = try std.fmt.allocPrint(a, "{d} lines ({s})", .{ b.rows.items.len, resp.format() });
             return b.finish();
         }
 
-        var lines = std.mem.splitScalar(u8, body, '\n');
-        const header = lines.next() orelse "";
-        var names: std.ArrayList([]const u8) = .empty;
-        var fields = std.mem.splitScalar(u8, header, '\t');
-        while (fields.next()) |f| try names.append(a, (try unescape(a, f)).?);
-        try b.setColumns(names.items);
-
-        while (lines.next()) |line| {
-            if (line.len == 0 and lines.peek() == null) break; // trailing newline
-            if (b.full(opts)) {
-                b.result.truncated = true;
-                break;
-            }
-            const row = try a.alloc(?[]const u8, names.items.len);
-            var it = std.mem.splitScalar(u8, line, '\t');
-            for (row) |*cell| cell.* = try unescape(a, it.next() orelse "");
-            try b.addRow(row, opts);
-        }
         const n = b.rows.items.len;
         b.result.status = try std.fmt.allocPrint(a, "{d}{s} row{s}", .{ n, if (b.result.truncated) "+" else "", if (n == 1) "" else "s" });
         return b.finish();
@@ -153,6 +251,7 @@ const Ch = struct {
         code_len: ?usize = null,
         written_rows: ?u64 = null,
         body: std.ArrayList(u8) = .empty,
+        body_bytes: usize = 0,
 
         fn format(r: *const Response) []const u8 {
             return r.format_buf[0..r.format_len];
@@ -210,7 +309,7 @@ const Ch = struct {
     }
 
     /// `reuse`: keep the connection open for the next query (job thread only).
-    fn request(self: *Ch, gpa: Allocator, sql: []const u8, query_id: []const u8, max_rows: usize, max_bytes: usize, record_error: bool, reuse: bool) !Response {
+    fn request(self: *Ch, gpa: Allocator, sql: []const u8, query_id: []const u8, max_rows: usize, max_bytes: usize, record_error: bool, reuse: bool, builder: ?*db.ResultBuilder) !Response {
         const p = self.params;
         const host = if (p.host.len > 0) p.host else "localhost";
         const reused = if (reuse) self.takeIdle() else null;
@@ -285,38 +384,7 @@ const Ch = struct {
                 resp.written_rows = summaryNumber(value, "written_rows");
             }
         }
-        // Body.
-        if (chunked) {
-            while (true) {
-                const size_line = std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n");
-                const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
-                const size = std.fmt.parseInt(usize, size_line[0..semi], 16) catch return error.ProtocolError;
-                if (size == 0) {
-                    // Trailers end with an empty line; it must be consumed or the
-                    // next response on a kept-alive connection starts misaligned.
-                    while (std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n").len != 0) {}
-                    break;
-                }
-                const start = resp.body.items.len;
-                if (size > max_bytes -| start) return error.ResponseTooLarge;
-                try resp.body.resize(gpa, start + size);
-                try r.readSliceAll(resp.body.items[start..]);
-                _ = try r.takeDelimiterInclusive('\n'); // CRLF after the chunk
-            }
-        } else if (content_length) |len| {
-            if (len > max_bytes) return error.ResponseTooLarge;
-            try resp.body.resize(gpa, len);
-            try r.readSliceAll(resp.body.items);
-        } else {
-            // Connection: close without length: read to the end.
-            var buf: [4096]u8 = undefined;
-            while (true) {
-                const n = try r.readSliceShort(&buf);
-                if (n == 0) break;
-                if (n > max_bytes -| resp.body.items.len) return error.ResponseTooLarge;
-                try resp.body.appendSlice(gpa, buf[0..n]);
-            }
-        }
+        try readBody(gpa, r, &resp, builder, .{ .max_rows = max_rows, .max_bytes = max_bytes }, content_length, chunked);
         // A fully read, length-delimited response leaves the connection reusable.
         if (reuse and !server_closes and (chunked or content_length != null)) keep_alive_ms = server_timeout_ms;
         return resp;
@@ -331,7 +399,7 @@ const Ch = struct {
         var id_buf: [16]u8 = undefined;
         self.io.random(&id_buf);
         const id = std.fmt.bytesToHex(id_buf, .lower);
-        var resp = self.request(self.gpa, sql, &id, std.math.maxInt(usize), 16 * 1024 * 1024, false, false) catch return;
+        var resp = self.request(self.gpa, sql, &id, std.math.maxInt(usize), 16 * 1024 * 1024, false, false, null) catch return;
         resp.deinit(self.gpa);
     }
 
@@ -385,15 +453,17 @@ fn percentEncode(gpa: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
 fn unescape(a: Allocator, field: []const u8) Allocator.Error!?[]const u8 {
     if (std.mem.eql(u8, field, "\\N")) return null;
     if (std.mem.indexOfScalar(u8, field, '\\') == null) return field;
-    var out: std.ArrayList(u8) = .empty;
+    const out = try a.alloc(u8, decodedSize(field));
+    var written: usize = 0;
     var i: usize = 0;
     while (i < field.len) : (i += 1) {
         if (field[i] != '\\' or i + 1 == field.len) {
-            try out.append(a, field[i]);
+            out[written] = field[i];
+            written += 1;
             continue;
         }
         i += 1;
-        try out.append(a, switch (field[i]) {
+        out[written] = switch (field[i]) {
             'n' => '\n',
             't' => '\t',
             'r' => '\r',
@@ -401,9 +471,10 @@ fn unescape(a: Allocator, field: []const u8) Allocator.Error!?[]const u8 {
             'f' => 12,
             '0' => 0,
             else => field[i], // \\ \' and anything else
-        });
+        };
+        written += 1;
     }
-    return out.items;
+    return out;
 }
 
 pub fn connect(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *db.ErrorText) db.ConnectError!db.Connection {
@@ -441,6 +512,98 @@ pub fn connect(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *db.Err
 }
 
 const testing = std.testing;
+
+test "streamed TSV survives chunk boundaries and drains trailers after row limits" {
+    const a = std.testing.allocator;
+    const text = "id\tvalue\n1\ta\\tb\n2\t\\N\n3\tlast\n";
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    for (text) |byte| try wire.print(a, "1\r\n{c}\r\n", .{byte});
+    try wire.appendSlice(a, "0\r\nX-Trailer: done\r\n\r\nNEXT");
+    var reader: Io.Reader = .fixed(wire.items);
+    var response: Ch.Response = .{ .status = 200 };
+    defer response.deinit(a);
+    const format = "TabSeparatedWithNames";
+    @memcpy(response.format_buf[0..format.len], format);
+    response.format_len = format.len;
+    var builder: db.ResultBuilder = .init(a);
+    defer builder.deinit();
+    try readBody(a, &reader, &response, &builder, .{ .max_rows = 2 }, null, true);
+    try std.testing.expectEqualStrings("a\tb", builder.rows.items[0][1].?);
+    try std.testing.expect(builder.rows.items[1][1] == null);
+    try std.testing.expect(builder.result.truncated);
+    try std.testing.expectEqualStrings("NEXT", try reader.take(4));
+    try std.testing.expectEqual(@as(usize, 0), response.body.capacity);
+}
+
+test "streamed result does not retain the HTTP body or borrowed input" {
+    const a = std.testing.allocator;
+    const header = "value\n";
+    const body = try a.alloc(u8, header.len + 5000 * 256);
+    defer a.free(body);
+    @memcpy(body[0..header.len], header);
+    @memset(body[header.len..], 'a');
+    for (0..5000) |i| body[header.len + i * 256 + 255] = '\n';
+    var scratch: [32 * 1024]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
+    var reader: Io.Reader = .fixed(body);
+    var response: Ch.Response = .{ .status = 200 };
+    defer response.deinit(fixed.allocator());
+    const format = "TabSeparatedWithNames";
+    @memcpy(response.format_buf[0..format.len], format);
+    response.format_len = format.len;
+    var builder: db.ResultBuilder = .init(a);
+    defer builder.deinit();
+    try readBody(fixed.allocator(), &reader, &response, &builder, .{ .max_rows = 1 }, body.len, false);
+    @memset(body, 'z');
+    @memset(&scratch, 0);
+    try std.testing.expectEqual(@as(usize, 1), builder.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 255), builder.rows.items[0][0].?.len);
+    try std.testing.expectEqual(@as(u8, 'a'), builder.rows.items[0][0].?[0]);
+    try std.testing.expectEqualStrings("value", builder.result.columns[0]);
+    try std.testing.expect(builder.result.arena.queryCapacity() < 8192);
+    try std.testing.expectEqual(@as(usize, 0), response.body.capacity);
+}
+
+test "HTTP streaming handles EOF bodies, raw formats, errors and incomplete framing" {
+    const a = std.testing.allocator;
+    {
+        var response: Ch.Response = .{ .status = 200 };
+        defer response.deinit(a);
+        var builder: db.ResultBuilder = .init(a);
+        defer builder.deinit();
+        var reader: Io.Reader = .fixed("first\n\nlast\n\n");
+        try readBody(a, &reader, &response, &builder, .{}, null, false);
+        try std.testing.expectEqual(@as(usize, 3), builder.rows.items.len);
+        try std.testing.expectEqualStrings("", builder.rows.items[1][0].?);
+        try std.testing.expectEqualStrings("last", builder.rows.items[2][0].?);
+    }
+    {
+        var response: Ch.Response = .{ .status = 500 };
+        defer response.deinit(a);
+        var builder: db.ResultBuilder = .init(a);
+        defer builder.deinit();
+        var reader: Io.Reader = .fixed("failure");
+        try readBody(a, &reader, &response, &builder, .{}, 7, false);
+        try std.testing.expectEqualStrings("failure", response.body.items);
+        try std.testing.expectEqual(@as(usize, 0), builder.rows.items.len);
+    }
+    for ([_]struct { bytes: []const u8, length: ?usize, chunked: bool }{
+        .{ .bytes = "ab", .length = 3, .chunked = false },
+        .{ .bytes = "3\r\nab", .length = null, .chunked = true },
+        .{ .bytes = "0\r\nX-Trailer: incomplete", .length = null, .chunked = true },
+    }) |case| {
+        var response: Ch.Response = .{};
+        defer response.deinit(a);
+        var reader: Io.Reader = .fixed(case.bytes);
+        try std.testing.expectError(error.EndOfStream, readBody(a, &reader, &response, null, .{}, case.length, case.chunked));
+    }
+    var response: Ch.Response = .{};
+    defer response.deinit(a);
+    var reader: Io.Reader = .fixed("too large");
+    try std.testing.expectError(error.ResponseTooLarge, readBody(a, &reader, &response, null, .{ .max_bytes = 3 }, 9, false));
+    try std.testing.expectEqual(@as(usize, 0), response.body.capacity);
+}
 
 test "tsv unescape" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

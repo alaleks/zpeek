@@ -134,7 +134,7 @@ pub fn compact(t: *Transcript) Allocator.Error!void {
     for (t.entries.items) |e| {
         if (e.content != .result) continue;
         const r = &e.content.result.result;
-        if (r == newest or r.rows.len <= inline_rows) continue;
+        if (r == newest or e.content.result.total_rows != null) continue;
         try t.compactEntry(e);
     }
 }
@@ -150,12 +150,16 @@ fn compactEntry(t: *Transcript, e: *Entry) Allocator.Error!void {
     const boolean_columns = try a.dupe(bool, old.boolean_columns);
     const status = try a.dupe(u8, old.status);
     var bytes: usize = 0;
-    const rows = try a.alloc([]const ?[]const u8, inline_rows);
-    for (rows, old.rows[0..inline_rows]) |*dst, row| {
+    const shown_rows = @min(inline_rows, old.rows.len);
+    const rows = try a.alloc([]const ?[]const u8, shown_rows);
+    for (rows, old.rows[0..shown_rows]) |*dst, row| {
         const cells = try a.alloc(?[]const u8, row.len);
         for (cells, row) |*cell, value| {
-            cell.* = if (value) |v| try a.dupe(u8, v) else null;
-            bytes += if (value) |v| v.len else 0;
+            cell.* = if (value) |v| blk: {
+                const preview = try render.preview(a, v, max_col_width);
+                break :blk if (preview.ptr == v.ptr) try a.dupe(u8, preview) else preview;
+            } else null;
+            bytes += if (cell.*) |v| v.len else 0;
         }
         bytes += cells.len * @sizeOf(?[]const u8);
         dst.* = cells;
@@ -183,6 +187,33 @@ fn compactEntry(t: *Transcript, e: *Entry) Allocator.Error!void {
     e.retained_bytes = bytes;
     t.retained_bytes +|= bytes;
     t.layout_dirty = true;
+}
+
+test "compact stores previews even for a single large cell and preserves newest result" {
+    const a = std.testing.allocator;
+    var transcript: Transcript = .init(a);
+    defer transcript.deinit();
+    for (0..2) |_| {
+        var builder = db.ResultBuilder.init(a);
+        errdefer builder.deinit();
+        const value = try builder.allocator().alloc(u8, 1024 * 1024);
+        @memset(value, 'x');
+        try builder.setColumns(&.{"large"});
+        const row = try builder.allocator().alloc(?[]const u8, 1);
+        row[0] = value;
+        try builder.addRow(row, .{});
+        try transcript.add(.{ .result = .{ .result = builder.finish(), .elapsed_ms = 0 } });
+    }
+    try transcript.compact();
+    const older = &transcript.entries.items[0].content.result.result;
+    try std.testing.expect(older.rows[0][0].?.len < 128);
+    try std.testing.expect(std.mem.endsWith(u8, older.rows[0][0].?, "…"));
+    try std.testing.expect(older.arena.queryCapacity() < 8192);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), transcript.lastResult().?.rows[0][0].?.len);
+    const capacity = older.arena.queryCapacity();
+    try transcript.compact();
+    try std.testing.expectEqual(capacity, older.arena.queryCapacity());
+    try ensureLayout(transcript.entries.items[0], 80);
 }
 
 test "compact keeps shown rows of older results only" {

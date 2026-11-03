@@ -129,6 +129,8 @@ Plans open in the full-screen table viewer. Move between steps and columns, use 
 
 The console shows 50 rows. `ctrl+o` opens the retained result in the full-screen viewer. Ad-hoc queries retain up to 10,000 rows and 16 MiB of row data.
 
+Once a newer result arrives, older results keep only cell previews for the first 50 rows. Full cell values, viewing and export remain available for the newest retained result.
+
 An interactive SQL batch retains at most 32 MiB of result arena capacity across its statements. Each query also respects the remaining row-data budget. If the returned arena exceeds that budget, its result is discarded and subsequent statements are skipped with an explicit error. The statement that produced that result has already executed; earlier changes are not rolled back. This is a retained-result limit, not a process memory limit: an in-flight result, SQL text, driver buffers and UI state consume additional memory.
 
 Cell previews inspect at most 4 KiB of each value before normalization and clipping. Full retained values remain available in the detail viewer and exports. Temporary rendering and completion arenas retain at most 256 KiB on reset; a larger individual frame can still allocate more. CLI table rendering keeps column widths and one normalized cell at a time.
@@ -150,5 +152,7 @@ vhs examples/demo.tape
 ```
 
 ## Memory use
+
+PostgreSQL and MySQL release protocol buffers larger than 256 KiB after a query finishes, including on errors. Oversized editor buffers are released on clearing or trimmed after replacement; active SQL and drafts remain intact. ClickHouse parses successful HTTP responses incrementally with a reusable line buffer instead of keeping the entire response body alongside decoded values. A single large line can still require a large temporary buffer, within the response byte limit.
 
 In a macOS arm64 test with Zig 0.17.0 `ReleaseSafe`, zpeek peaked at **4.92 MiB RSS** while opening the sample SQLite database, listing tables, running `select name, city from customers order by name`, and viewing the result with `ctrl+o` (October 2026). Reproduce it with `/usr/bin/time -l ./zig-out/bin/zpeek /tmp/zpeek-demo.db`; memory use varies with platform and result size.

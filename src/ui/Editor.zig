@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const memory = @import("../memory.zig");
 const lexer = @import("../sql/lexer.zig");
 
 const Editor = @This();
@@ -44,7 +45,8 @@ pub fn isEmpty(e: *const Editor) bool {
 }
 
 pub fn clear(e: *Editor) void {
-    e.buf.clearRetainingCapacity();
+    memory.clear(&e.buf, e.gpa);
+    memory.clear(&e.draft, e.gpa);
     e.cursor = 0;
     e.goal_col = null;
     e.history_pos = null;
@@ -54,6 +56,7 @@ pub fn setText(e: *Editor, s: []const u8) Allocator.Error!void {
     try e.buf.ensureTotalCapacity(e.gpa, s.len);
     std.mem.copyForwards(u8, e.buf.allocatedSlice()[0..s.len], s);
     e.buf.items.len = s.len;
+    memory.trim(&e.buf, e.gpa);
     e.cursor = s.len;
     e.goal_col = null;
 }
@@ -317,7 +320,7 @@ pub fn historyAt(e: *const Editor, index: usize) []const u8 {
 pub fn historyPrev(e: *Editor) Allocator.Error!void {
     if (e.history_count == 0) return;
     const pos = if (e.history_pos) |p| (if (p == 0) return else p - 1) else blk: {
-        e.draft.clearRetainingCapacity();
+        memory.clear(&e.draft, e.gpa);
         try e.draft.appendSlice(e.gpa, e.buf.items);
         break :blk e.history_count - 1;
     };
@@ -333,6 +336,7 @@ pub fn historyNext(e: *Editor) Allocator.Error!void {
     } else {
         e.history_pos = null;
         try e.setText(e.draft.items);
+        memory.clear(&e.draft, e.gpa);
     }
 }
 
@@ -346,6 +350,29 @@ pub fn loadHistory(e: *Editor, data: []const u8) Allocator.Error!void {
 }
 
 const testing = std.testing;
+
+test "large input and drafts release excess capacity without losing restored text" {
+    const a = std.testing.allocator;
+    var editor: Editor = .init(a);
+    defer editor.deinit();
+    const large = try a.alloc(u8, memory.retained_buffer_limit * 4);
+    defer a.free(large);
+    @memset(large, 'x');
+    try editor.commitHistoryText("select 1");
+    try editor.setText(large);
+    try editor.historyPrev();
+    try std.testing.expectEqualStrings("select 1", editor.text());
+    try std.testing.expect(editor.buf.capacity <= memory.retained_buffer_limit);
+    try editor.historyNext();
+    try std.testing.expectEqualStrings(large, editor.text());
+    try std.testing.expectEqual(@as(usize, 0), editor.draft.capacity);
+    try editor.setText(editor.text()[0..8]);
+    try std.testing.expectEqualStrings("xxxxxxxx", editor.text());
+    try std.testing.expect(editor.buf.capacity <= memory.retained_buffer_limit);
+    try editor.setText(large);
+    editor.clear();
+    try std.testing.expectEqual(@as(usize, 0), editor.buf.capacity);
+}
 
 test "failed text replacement preserves the buffer and cursor" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});

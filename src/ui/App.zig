@@ -1092,7 +1092,7 @@ fn executeSql(app: *App, text: []const u8, approved: bool) !void {
     for (stmts.items, sqls) |s, *d| d.* = try a.dupe(u8, s);
     job.sqls = sqls;
     job.max_rows = console_row_limit;
-    app.last_sql.clearRetainingCapacity();
+    @import("../memory.zig").clear(&app.last_sql, app.gpa);
     try app.last_sql.appendSlice(app.gpa, text);
     try app.startJob(job);
 }

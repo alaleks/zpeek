@@ -234,6 +234,7 @@ const Pg = struct {
 
     fn query(ptr: *anyopaque, gpa: Allocator, sql: []const u8, opts: db.QueryOptions) db.QueryError!db.Result {
         const self: *Pg = @ptrCast(@alignCast(ptr));
+        defer @import("../memory.zig").clear(&self.msg, self.gpa);
         if (self.broken) {
             self.err.set(self.gpa, "connection lost — reconnect with /connect", .{});
             return error.ConnectionLost;
