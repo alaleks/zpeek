@@ -333,5 +333,8 @@ fn buildOwnedRows(a: Allocator) !void {
 }
 
 test "row storage transfers ownership and survives allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, buildOwnedRows, .{});
+    try buildOwnedRows(std.testing.allocator);
+    // In-place arena/list growth otherwise changes the allocation count between runs.
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), buildOwnedRows, .{});
 }
