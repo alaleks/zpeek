@@ -52,7 +52,7 @@ After selecting a view in `/views`, use `/copy` or `ctrl+y` with empty input to 
 
 ## Browse tables
 
-`NULL`, booleans, numbers, and FK values have distinct colors. The selected cell uses a high-contrast style; FK columns are marked `↗`.
+In browse, key columns are marked `PK`, `UQ`, or `↗` (foreign key). Key values use color and bold; ordinary values keep the terminal's text color, and `NULL` is italic. The selected row uses the terminal's reverse style, with the current cell emphasized in color. `UQ` marks a column participating in a unique index; a column in a composite index may not be unique on its own.
 
 | Key | Action |
 | --- | --- |
@@ -63,8 +63,10 @@ After selecting a view in `/views`, use `/copy` or `ctrl+y` with empty input to 
 | `n` / `p` | Next / previous page |
 | `enter` | Show the full cell value |
 | `f` on an FK cell | Preview the referenced row below the table |
-| `J` / `K` | Scroll fields in the FK preview |
-| `c` | Choose visible columns |
+| `↑` / `↓` or `J` / `K` in FK preview | Select a field in the related row |
+| `enter` / `y` in FK preview | Show the full selected value / copy it |
+| `f` / `esc` / `q` in FK preview | Close the related row |
+| `c` | Open columns; `space` hides/shows a column, `enter` jumps to it (showing it if hidden) |
 | `y` / `Y` | Copy a cell / row |
 | `d` | Prepare selected-row deletion for confirmation |
 | `e` | Export retained rows in the current sort/filter order and visible columns |
@@ -147,7 +149,7 @@ sqlite3 /tmp/zpeek-demo.db < examples/demo.sql
 ./zig-out/bin/zpeek /tmp/zpeek-demo.db
 ```
 
-The sample script recreates its `customers` and `orders` tables; use a disposable database file. The [35-second recording script](../examples/demo.tape) shows a connected SQLite session (0–5s), selects `orders` through `/tables` (5–12s), previews the related customer through `customer_id` (12–22s), then executes SQL with autocomplete (22–35s). It produces a GIF and a silent MP4. Regenerate them from the repository root with VHS and its recording dependencies installed:
+The sample script recreates its `customers` and `orders` tables; use a disposable database file. The [40-second video shot list](../examples/demo-video.md) focuses on browsing, FK navigation, SQL completion, and switching between two local SQLite profiles. Its [VHS tape](../examples/demo.tape) produces the terminal segment as a GIF and silent MP4. Regenerate them from the repository root with VHS and its recording dependencies installed:
 
 ```sh
 vhs examples/demo.tape

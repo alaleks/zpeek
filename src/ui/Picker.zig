@@ -171,11 +171,10 @@ pub fn draw(p: *Picker, win: vaxis.Window, a: Allocator) Allocator.Error!void {
         }
         const fit = render.fitWidth(it.label, label_w);
         const pad = label_w - fit.width + 2;
-        var detail_style = theme.dim;
-        if (sel) detail_style = .{ .fg = .{ .index = 15 }, .bg = style.bg };
+        const detail_style = if (sel) style else theme.dim;
         _ = box.print(&.{
             .{ .text = if (sel) " > " else "   ", .style = style },
-            .{ .text = fit.text, .style = if (sel) .{ .bold = true, .bg = style.bg, .fg = style.fg } else theme.bold },
+            .{ .text = fit.text, .style = .{ .bold = true, .reverse = sel } },
             .{ .text = try spaces(a, pad), .style = style },
             .{ .text = it.detail, .style = detail_style },
         }, .{ .row_offset = row, .wrap = .none });

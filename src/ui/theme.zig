@@ -7,18 +7,15 @@ const lexer = @import("../sql/lexer.zig");
 const Style = vaxis.Style;
 const Segment = vaxis.Segment;
 
-/// Soft green, readable on dark backgrounds (borders, prompt, titles, SQL keywords).
-pub const accent: vaxis.Color = .{ .rgb = .{ 0x7e, 0xe7, 0x87 } };
-const string_color: vaxis.Color = .{ .rgb = .{ 0xe5, 0xc0, 0x7b } }; // amber
-const number_color: vaxis.Color = .{ .rgb = .{ 0xd1, 0x9a, 0x66 } }; // orange
+pub const accent: vaxis.Color = .{ .index = 2 };
+pub const fk_color: vaxis.Color = .{ .index = 6 };
+const string_color: vaxis.Color = .{ .index = 3 };
+const number_color: vaxis.Color = .{ .index = 5 };
 pub const ok_color: vaxis.Color = .{ .index = 2 };
 pub const err_color: vaxis.Color = .{ .index = 1 };
 pub const warn_color: vaxis.Color = .{ .index = 3 };
 pub const info_color: vaxis.Color = .{ .index = 4 };
 pub const muted_color: vaxis.Color = .{ .index = 8 };
-/// Background of the selected cell / list item.
-pub const selection_bg: vaxis.Color = .{ .rgb = .{ 0x2f, 0x6b, 0x43 } }; // deep green, pairs with `accent`
-
 pub const plain: Style = .{};
 pub const bold: Style = .{ .bold = true };
 pub const dim: Style = .{ .fg = muted_color };
@@ -32,14 +29,12 @@ pub const border: Style = .{ .fg = muted_color };
 pub const border_focus: Style = .{ .fg = accent };
 pub const null_value: Style = .{ .fg = muted_color, .italic = true };
 pub const boolean_value: Style = .{ .fg = .{ .index = 6 } };
-pub const number_value: Style = .{ .fg = number_color };
-/// Column names: regular weight, color only.
-pub const header: Style = .{ .fg = info_color };
+pub const number_value: Style = .{ .fg = number_color, .bold = true };
+pub const header: Style = .{ .fg = info_color, .bold = true };
 pub const selected: Style = .{ .reverse = true };
-pub const selected_cell: Style = .{ .bg = selection_bg, .fg = .{ .index = 15 }, .bold = true };
-pub const row_highlight: Style = .{ .bg = .{ .index = 0 } };
+pub const selected_cell: Style = .{ .reverse = true, .bold = true };
 pub const popup: Style = .{};
-pub const popup_selected: Style = .{ .bg = selection_bg, .fg = .{ .index = 15 } };
+pub const popup_selected: Style = .{ .reverse = true };
 
 pub fn sqlStyle(tag: lexer.Tag) Style {
     return switch (tag) {

@@ -1,0 +1,11 @@
+default = "dev"
+
+[connections.dev]
+path = ".zig-cache/demo/dev.db"
+color = "#2F6B43"
+access = "read_only"
+
+[connections.prod]
+path = ".zig-cache/demo/prod.db"
+color = "#C6533D"
+access = "read_only"

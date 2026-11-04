@@ -546,6 +546,32 @@ pub fn primaryKeySql(a: Allocator, kind: Kind, table: []const u8) Allocator.Erro
     };
 }
 
+/// Columns participating in unique indexes other than the primary key.
+pub fn uniqueKeySql(a: Allocator, kind: Kind, table: []const u8) Allocator.Error![]const u8 {
+    return switch (kind) {
+        .postgres => std.fmt.allocPrint(a,
+            \\select distinct a.attname from pg_index i
+            \\  join lateral unnest(i.indkey) with ordinality as k(attnum, pos) on k.pos <= i.indnkeyatts
+            \\  join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
+            \\where i.indrelid = {s}::regclass and i.indisunique and not i.indisprimary
+            \\order by 1
+        , .{try quoteLiteral(a, kind, try quoteName(a, kind, table))}),
+        .mysql => std.fmt.allocPrint(a,
+            \\select distinct column_name from information_schema.statistics
+            \\where table_schema = database() and table_name = {s}
+            \\  and non_unique = 0 and index_name <> 'PRIMARY' and column_name is not null
+            \\order by 1
+        , .{try quoteLiteral(a, kind, splitName(table).name)}),
+        .sqlite => std.fmt.allocPrint(a,
+            \\select distinct ii.name from pragma_index_list({s}) il
+            \\  join pragma_index_info(il.name) ii
+            \\where il."unique" = 1 and il.origin <> 'pk' and ii.name is not null
+            \\order by 1
+        , .{try quoteLiteral(a, kind, table)}),
+        .clickhouse => a.dupe(u8, "select 1 where 0"),
+    };
+}
+
 /// Constraint id, source column, target schema, target table, target column.
 pub fn foreignKeySql(a: Allocator, kind: Kind, table: []const u8) Allocator.Error!?[]const u8 {
     return switch (kind) {

@@ -394,8 +394,7 @@ fn ensureLayout(e: *Entry, width: u16) Allocator.Error!void {
     var lines: std.ArrayList(Line) = .empty;
     switch (e.content) {
         .input => |s| {
-            // Bright white for plain words: a touch lighter than the default text color.
-            const segs = try theme.highlight(a, s, .{ .fg = .{ .index = 15 } });
+            const segs = try theme.highlight(a, s, .{});
             try wrapWithPrefix(a, &lines, segs, width, .{ .text = "> ", .style = theme.accent_bold }, "  ");
         },
         .message => |m| {

@@ -87,10 +87,13 @@ left: usize = 0,
 
 /// Primary key columns of the browsed table (owned); empty when unknown.
 primary_key: std.ArrayList([]const u8) = .empty,
+unique_keys: std.ArrayList([]const u8) = .empty,
 foreign_keys: std.ArrayList(ForeignKey) = .empty,
 fk_result: ?*db.Result = null,
 fk_target: ?[]const u8 = null,
 fk_scroll: usize = 0,
+fk_field: usize = 0,
+fk_detail: bool = false,
 /// DELETE statement awaiting confirmation (owned).
 confirm_delete: ?[]const u8 = null,
 
@@ -143,6 +146,7 @@ pub fn init(gpa: Allocator, result: *db.Result, owns_result: bool, title: []cons
         tv.filter_editor.deinit();
         tv.completion.deinit(gpa);
         tv.primary_key.deinit(gpa);
+        tv.unique_keys.deinit(gpa);
         tv.frame_arena.deinit();
     }
     if (tv.browse) |*b| {
@@ -186,6 +190,7 @@ pub fn deinit(tv: *TableView) void {
     tv.filter_editor.deinit();
     tv.completion.deinit(tv.gpa);
     tv.clearPrimaryKey();
+    tv.clearUniqueKeys();
     tv.clearForeignKeys();
     tv.clearForeignResult();
     if (tv.confirm_delete) |sql| tv.gpa.free(sql);
@@ -416,54 +421,31 @@ fn sortView(gpa: Allocator, view: []usize, rows: []const []const ?[]const u8, co
     for (view, items) |*index, item| index.* = item.index;
 }
 
-fn isNumberText(value: []const u8) bool {
-    // shortcut: values over 64 bytes stay plain, expand this if wide numeric values need coloring.
-    if (value.len == 0 or value.len > 64) return false;
-    var i: usize = 0;
-    if (value[i] == '+' or value[i] == '-') i += 1;
-    var digits: usize = 0;
-    while (i < value.len and std.ascii.isDigit(value[i])) : (i += 1) digits += 1;
-    if (i < value.len and value[i] == '.') {
-        i += 1;
-        while (i < value.len and std.ascii.isDigit(value[i])) : (i += 1) digits += 1;
-    }
-    if (digits == 0) return false;
-    if (i < value.len and (value[i] == 'e' or value[i] == 'E')) {
-        i += 1;
-        if (i < value.len and (value[i] == '+' or value[i] == '-')) i += 1;
-        const exponent_start = i;
-        while (i < value.len and std.ascii.isDigit(value[i])) : (i += 1) {}
-        if (i == exponent_start) return false;
-    }
-    return i == value.len;
-}
-
-fn browseCellStyle(value: ?[]const u8, typed_boolean: bool, foreign_key: bool, selected: bool) vaxis.Style {
-    if (selected) return theme.selected_cell;
-    const text = value orelse return theme.null_value;
-    if (foreign_key) return .{ .fg = theme.accent };
-    if ((typed_boolean and (std.mem.eql(u8, text, "t") or std.mem.eql(u8, text, "f"))) or
-        std.ascii.eqlIgnoreCase(text, "true") or std.ascii.eqlIgnoreCase(text, "false")) return theme.boolean_value;
-    if (isNumberText(text)) return theme.number_value;
+fn browseCellStyle(value: ?[]const u8, foreign_key: bool, primary_key: bool, unique_key: bool) vaxis.Style {
+    if (value == null) return .{ .italic = true };
+    if (foreign_key) return .{ .fg = theme.fk_color, .bold = true };
+    if (primary_key) return .{ .fg = theme.warn_color, .bold = true };
+    if (unique_key) return .{ .fg = .{ .index = 5 }, .bold = true };
     return .{};
 }
 
-test "browse value colors are allocation-free and preserve selection contrast" {
+test "browse colors only key values" {
     const testing = std.testing;
-    try testing.expectEqual(theme.null_value, browseCellStyle(null, false, false, false));
-    try testing.expectEqual(theme.boolean_value, browseCellStyle("f", true, false, false));
-    try testing.expectEqual(theme.boolean_value, browseCellStyle("TRUE", false, false, false));
-    try testing.expectEqual(theme.number_value, browseCellStyle("-12.5e+3", false, false, false));
-    try testing.expectEqual(vaxis.Style{}, browseCellStyle("12abc", false, false, false));
-    try testing.expectEqual(vaxis.Style{}, browseCellStyle("f", false, false, false));
-    try testing.expectEqual(vaxis.Style{ .fg = theme.accent }, browseCellStyle("123", false, true, false));
-    try testing.expectEqual(theme.selected_cell, browseCellStyle("123", false, true, true));
-    try testing.expect(!isNumberText("1e"));
-    try testing.expect(!isNumberText("."));
-    try testing.expect(!isNumberText("12345678901234567890123456789012345678901234567890123456789012345"));
+    try testing.expect(!std.meta.eql(theme.fk_color, theme.accent));
+    try testing.expectEqual(vaxis.Style{ .italic = true }, browseCellStyle(null, false, false, false));
+    try testing.expectEqual(vaxis.Style{}, browseCellStyle("123", false, false, false));
+    try testing.expectEqual(vaxis.Style{}, browseCellStyle("true", false, false, false));
+    try testing.expectEqual(vaxis.Style{ .fg = theme.fk_color, .bold = true }, browseCellStyle("1", true, false, false));
+    try testing.expectEqual(vaxis.Style{ .fg = theme.warn_color, .bold = true }, browseCellStyle("1", false, true, false));
+    try testing.expectEqual(vaxis.Style{ .fg = .{ .index = 5 }, .bold = true }, browseCellStyle("1", false, false, true));
 }
 
 fn currentValue(tv: *const TableView) ?[]const u8 {
+    if (tv.fk_detail) {
+        const r = tv.fk_result orelse return null;
+        if (r.rows.len == 0 or r.columns.len == 0) return null;
+        return r.rows[0][tv.fk_field];
+    }
     if (tv.view.items.len == 0 or tv.result.columns.len == 0) return null;
     return tv.result.rows[tv.view.items[tv.row]][tv.curCol()];
 }
@@ -483,6 +465,7 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
     if (tv.detail) {
         if (key.matchesAny(&.{ vaxis.Key.escape, vaxis.Key.enter, 'q' }, .{})) {
             tv.detail = false;
+            tv.fk_detail = false;
         } else if (key.matchesAny(&.{ vaxis.Key.down, 'j' }, .{})) {
             tv.detail_scroll += 1;
         } else if (key.matchesAny(&.{ vaxis.Key.up, 'k' }, .{})) {
@@ -493,16 +476,25 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
         return .none;
     }
     if (tv.fk_result != null) {
-        if (key.matches('J', .{}) or key.matches('j', .{ .shift = true })) {
-            tv.fk_scroll += 1;
+        const r = tv.fk_result.?;
+        if (key.matchesAny(&.{ vaxis.Key.down, 'j', 'J' }, .{}) or key.matches('j', .{ .shift = true })) {
+            tv.fk_field = @min(tv.fk_field + 1, r.columns.len -| 1);
             return .none;
         }
-        if (key.matches('K', .{}) or key.matches('k', .{ .shift = true })) {
-            tv.fk_scroll -|= 1;
+        if (key.matchesAny(&.{ vaxis.Key.up, 'k', 'K' }, .{}) or key.matches('k', .{ .shift = true })) {
+            tv.fk_field -|= 1;
             return .none;
         }
-        tv.clearForeignResult();
-        if (key.matches('f', .{})) return .none;
+        if (key.matches(vaxis.Key.enter, .{}) and r.rows.len > 0 and r.columns.len > 0) {
+            tv.detail = true;
+            tv.fk_detail = true;
+            tv.detail_scroll = 0;
+            return .none;
+        }
+        if (key.matches('y', .{}) and r.rows.len > 0 and r.columns.len > 0)
+            return .{ .copy = r.rows[0][tv.fk_field] orelse "" };
+        if (key.matchesAny(&.{ 'f', 'q', vaxis.Key.escape }, .{})) tv.clearForeignResult();
+        return .none;
     }
 
     const nrows = tv.view.items.len;
@@ -638,7 +630,21 @@ fn handleFilterKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
 fn handleChooserKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
     const ch = &tv.chooser.?;
     const n = tv.result.columns.len;
-    if (key.matchesAny(&.{ vaxis.Key.escape, vaxis.Key.enter, 'q', 'c' }, .{}) or key.matches('c', .{ .ctrl = true })) {
+    if (key.matchesAny(&.{ vaxis.Key.escape, 'q', 'c' }, .{}) or key.matches('c', .{ .ctrl = true })) {
+        tv.chooser = null;
+    } else if (key.matches(vaxis.Key.enter, .{})) {
+        const selected = ch.sel;
+        if (tv.hidden.items[selected]) {
+            tv.hidden.items[selected] = false;
+            try tv.rebuildVisible();
+        }
+        for (tv.visible.items, 0..) |ci, i| {
+            if (ci == selected) {
+                tv.col = i;
+                tv.left = i;
+                break;
+            }
+        }
         tv.chooser = null;
     } else if (key.matchesAny(&.{ vaxis.Key.down, 'j' }, .{})) {
         if (ch.sel + 1 < n) ch.sel += 1;
@@ -755,7 +761,7 @@ fn quoteIfNeeded(a: Allocator, kind: Kind, name: []const u8) Allocator.Error![]c
     return if (plain) name else schema.quoteIdent(a, kind, name);
 }
 
-fn drawCompletion(tv: *TableView, a: Allocator, win: vaxis.Window, input_row: u16) Allocator.Error!void {
+fn drawCompletion(tv: *TableView, win: vaxis.Window, input_row: u16) void {
     const items = tv.completion.items;
     if (items.len == 0 or input_row < items.len) return;
     const e = &tv.filter_editor;
@@ -771,20 +777,20 @@ fn drawCompletion(tv: *TableView, a: Allocator, win: vaxis.Window, input_row: u1
         .width = w,
         .height = @intCast(items.len),
     });
-    pop.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .index = 0 } } });
+    pop.fill(.{ .char = .{ .grapheme = " ", .width = 1 } });
     for (items, 0..) |candidate, i| {
         const sel = i == tv.completion_sel;
-        const bg: vaxis.Color = if (sel) theme.selection_bg else .{ .index = 0 };
+        const style: vaxis.Style = if (sel) theme.popup_selected else .{};
         if (sel) {
             var cx: u16 = 0;
-            while (cx < pop.width) : (cx += 1) pop.writeCell(cx, @intCast(i), .{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = bg } });
+            while (cx < pop.width) : (cx += 1) pop.writeCell(cx, @intCast(i), .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
         }
         const icon: []const u8 = if (candidate.kind == .operator) "=" else "c";
         _ = pop.print(&.{
-            .{ .text = " ", .style = .{ .bg = bg } },
-            .{ .text = icon, .style = .{ .fg = if (sel) .{ .index = 15 } else theme.muted_color, .bg = bg } },
-            .{ .text = " ", .style = .{ .bg = bg } },
-            .{ .text = try a.dupe(u8, render.fitWidth(candidate.text, w -| 4).text), .style = .{ .fg = if (sel) .{ .index = 15 } else .default, .bg = bg, .bold = sel } },
+            .{ .text = " ", .style = style },
+            .{ .text = icon, .style = if (sel) style else theme.dim },
+            .{ .text = " ", .style = style },
+            .{ .text = render.fitWidth(candidate.text, w -| 4).text, .style = .{ .reverse = sel, .bold = sel } },
         }, .{ .row_offset = @intCast(i), .wrap = .none });
     }
 }
@@ -799,6 +805,49 @@ fn clearPrimaryKey(tv: *TableView) void {
     tv.primary_key.clearRetainingCapacity();
     tv.primary_key.deinit(tv.gpa);
     tv.primary_key = .empty;
+}
+
+pub fn setUniqueKeys(tv: *TableView, columns: []const []const u8) Allocator.Error!void {
+    tv.clearUniqueKeys();
+    errdefer tv.clearUniqueKeys();
+    for (columns) |c| {
+        const copy = try tv.gpa.dupe(u8, c);
+        errdefer tv.gpa.free(copy);
+        try tv.unique_keys.append(tv.gpa, copy);
+    }
+}
+
+fn clearUniqueKeys(tv: *TableView) void {
+    for (tv.unique_keys.items) |c| tv.gpa.free(c);
+    tv.unique_keys.deinit(tv.gpa);
+    tv.unique_keys = .empty;
+}
+
+fn hasColumn(columns: []const []const u8, name: []const u8) bool {
+    for (columns) |column| if (std.mem.eql(u8, column, name)) return true;
+    return false;
+}
+
+fn keyMarkers(tv: *const TableView, ci: usize) []const u8 {
+    if (tv.browse == null) return "";
+    const name = tv.result.columns[ci];
+    const pk = hasColumn(tv.primary_key.items, name);
+    const uq = hasColumn(tv.unique_keys.items, name);
+    const fk = tv.isForeignKeyColumn(ci);
+    if (pk and uq and fk) return " PK UQ ↗";
+    if (pk and uq) return " PK UQ";
+    if (pk and fk) return " PK ↗";
+    if (uq and fk) return " UQ ↗";
+    if (pk) return " PK";
+    if (uq) return " UQ";
+    return if (fk) " ↗" else "";
+}
+
+pub fn fitKeyMarkers(tv: *TableView) void {
+    for (tv.result.columns, 0..) |name, ci| {
+        const width = render.displayWidth(name) + render.displayWidth(tv.keyMarkers(ci)) + 4;
+        tv.widths.items[ci] = @max(tv.widths.items[ci], @as(u16, @intCast(@min(width, std.math.maxInt(u16) / 2))));
+    }
 }
 
 pub fn setForeignKeys(tv: *TableView, result: db.Result) Allocator.Error!void {
@@ -851,6 +900,8 @@ fn clearForeignResult(tv: *TableView) void {
     tv.fk_result = null;
     tv.fk_target = null;
     tv.fk_scroll = 0;
+    tv.fk_field = 0;
+    tv.fk_detail = false;
 }
 
 fn followForeignKey(tv: *TableView) Allocator.Error!Action {
@@ -994,6 +1045,16 @@ test "browse follows a composite foreign key and handles null values" {
     linked.* = target.finish();
     tv.setForeignResult(linked);
     try std.testing.expectEqualStrings("Bob", tv.fk_result.?.rows[0][2].?);
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = vaxis.Key.down })) == .none);
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = vaxis.Key.down })) == .none);
+    try std.testing.expectEqual(@as(usize, 2), tv.fk_field);
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = vaxis.Key.enter })) == .none);
+    try std.testing.expect(tv.fk_detail);
+    const copied = try tv.handleKey(.{ .codepoint = 'y' });
+    try std.testing.expect(copied == .copy);
+    try std.testing.expectEqualStrings("Bob", copied.copy);
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = vaxis.Key.escape })) == .none);
+    try std.testing.expect(!tv.fk_detail);
     try std.testing.expect((try tv.handleKey(.{ .codepoint = 'f' })) == .none);
     try std.testing.expect(tv.fk_result == null);
 
@@ -1092,11 +1153,11 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
     if (win.height < 4 or win.width < 10) return;
 
     const r = tv.result;
-    const footer_h: u16 = 2;
-    const fk_h: u16 = if (tv.fk_result != null and win.height >= 11) @min(10, @max(5, win.height / 3)) else 0;
+    const footer_h: u16 = if (tv.browse != null or tv.editing_filter or tv.chooser != null or tv.fk_result != null) 2 else 1;
+    const fk_h: u16 = if (tv.fk_result != null) @min(10, @max(5, win.height / 3), win.height -| footer_h) else 0;
     const grid_h = win.height - footer_h - fk_h;
-    // title line + blank line + header + rule
-    const body_h: usize = grid_h -| 4;
+    // title, gap, top border, header, divider, bottom border
+    const body_h: usize = grid_h -| 6;
     tv.page_rows = @max(body_h, 1);
 
     // Title
@@ -1132,10 +1193,17 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
         _ = win.printSegment(.{ .text = " no columns", .style = theme.dim }, .{ .row_offset = 2 });
         return;
     }
+    if (tv.fk_result != null and grid_h < 7) {
+        try tv.drawForeignPreview(a, win.child(.{ .y_off = 1, .height = win.height - footer_h - 1 }));
+        try tv.drawFooter(a, win.child(.{ .y_off = @intCast(win.height - footer_h), .height = footer_h }), tv.visible.items.len);
+        if (tv.detail) try tv.drawDetail(a, win);
+        return;
+    }
 
     // Keep the cursor visible.
+    tv.top = @min(tv.top, tv.view.items.len -| 1);
     if (tv.row < tv.top) tv.top = tv.row;
-    if (tv.row >= tv.top + body_h) tv.top = tv.row + 1 - body_h;
+    if (body_h > 0 and tv.row >= tv.top + body_h) tv.top = tv.row + 1 - body_h;
     if (tv.col < tv.left) tv.left = tv.col;
     const vis = tv.visible.items;
     const cur_col = tv.curCol();
@@ -1148,7 +1216,7 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
     }
 
     // Visible positions [left, last_col) are drawn.
-    var x: u16 = 1;
+    var x: usize = 1;
     var last_col = tv.left;
     while (last_col < vis.len) : (last_col += 1) {
         const w = tv.widths.items[vis[last_col]];
@@ -1156,69 +1224,79 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
         x += w + 3;
     }
 
-    // A blank line separates the title (database, table) from the column names.
-    const grid = win.child(.{ .y_off = 2, .height = grid_h - 2 });
+    // A blank line separates the title from the boxed table.
+    const grid = win.child(.{ .y_off = 2, .height = grid_h -| 2 });
+    const columns = vis[tv.left..last_col];
+    tv.drawRule(grid, columns, 0, "┌", "┬", "┐");
 
     // Header
     {
-        var col_x: u16 = 0;
-        for (vis[tv.left..last_col], tv.left..) |ci, pos| {
-            const w = tv.widths.items[ci];
+        var col_x: u16 = 1;
+        grid.writeCell(0, 1, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = theme.border });
+        for (columns) |ci| {
+            const w = @min(tv.widths.items[ci], grid.width -| col_x -| 3);
             var name: []const u8 = r.columns[ci];
             const marker: []const u8 = blk: {
                 if (tv.browse) |b| if (b.order) |o| if (std.mem.eql(u8, o.column, name)) break :blk if (o.descending) " ↓" else " ↑";
                 if (tv.local_sort) |s| if (s.col == ci) break :blk if (s.desc) " ↓" else " ↑";
                 break :blk "";
             };
-            if (tv.isForeignKeyColumn(ci)) name = try std.mem.concat(a, u8, &.{ name, " ↗" });
+            const keys = tv.keyMarkers(ci);
+            if (keys.len > 0) name = try std.mem.concat(a, u8, &.{ name, keys });
             if (marker.len > 0) name = try std.mem.concat(a, u8, &.{ name, marker });
-            const style: vaxis.Style = if (ci == cur_col) .{ .fg = theme.accent } else theme.header;
-            drawCell(grid, col_x, 0, w, name, style);
-            if (pos + 1 < last_col) grid.writeCell(col_x + w + 2, 0, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = theme.border });
+            const style: vaxis.Style = if (ci == cur_col) theme.accent_bold else theme.header;
+            drawCell(grid, col_x, 1, w, name, style);
+            if (keys.len > 0 and render.displayWidth(r.columns[ci]) + render.displayWidth(keys) <= w) {
+                var labels: [3]Segment = undefined;
+                var count: usize = 0;
+                if (hasColumn(tv.primary_key.items, r.columns[ci])) {
+                    labels[count] = .{ .text = " PK", .style = .{ .fg = theme.warn_color, .bold = true } };
+                    count += 1;
+                }
+                if (hasColumn(tv.unique_keys.items, r.columns[ci])) {
+                    labels[count] = .{ .text = " UQ", .style = .{ .fg = .{ .index = 5 }, .bold = true } };
+                    count += 1;
+                }
+                if (tv.isForeignKeyColumn(ci)) {
+                    labels[count] = .{ .text = " ↗", .style = .{ .fg = theme.fk_color, .bold = true } };
+                    count += 1;
+                }
+                _ = grid.print(labels[0..count], .{ .row_offset = 1, .col_offset = col_x + 1 + @as(u16, @intCast(render.displayWidth(r.columns[ci]))), .wrap = .none });
+            }
+            grid.writeCell(col_x + w + 2, 1, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = theme.border });
             col_x += w + 3;
         }
-        // rule
-        var rule: std.ArrayList(u8) = .empty;
-        for (vis[tv.left..last_col], tv.left..) |ci, pos| {
-            const w = tv.widths.items[ci];
-            for (0..w + 2) |_| try rule.appendSlice(a, "─");
-            if (pos + 1 < last_col) try rule.appendSlice(a, "┼");
-        }
-        _ = grid.print(&.{.{ .text = rule.items, .style = theme.border }}, .{ .row_offset = 1, .wrap = .none });
     }
+    tv.drawRule(grid, columns, 2, "├", "┼", "┤");
 
     // Body
     const end_row = @min(tv.top + body_h, tv.view.items.len);
     for (tv.top..end_row, 0..) |vi, screen_row| {
         const row = r.rows[tv.view.items[vi]];
-        const y: u16 = @intCast(screen_row + 2);
+        const y: u16 = @intCast(screen_row + 3);
         const is_cur_row = vi == tv.row;
-        var col_x: u16 = 0;
-        for (vis[tv.left..last_col], tv.left..) |ci, pos| {
-            const w = tv.widths.items[ci];
+        var col_x: u16 = 1;
+        grid.writeCell(0, y, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = theme.border });
+        for (columns, 0..) |ci, column_index| {
+            const w = @min(tv.widths.items[ci], grid.width -| col_x -| 3);
             const v = row[ci];
             const text = try render.preview(a, if (tv.browse != null) displayValue(r, ci, v) else v orelse render.null_text, w);
             const selected = is_cur_row and ci == cur_col;
             var style: vaxis.Style = if (tv.browse != null)
-                browseCellStyle(v, ci < r.boolean_columns.len and r.boolean_columns[ci], tv.isForeignKeyColumn(ci), selected)
+                (if (selected) vaxis.Style{ .fg = theme.accent, .reverse = true, .bold = true } else if (is_cur_row) theme.selected else browseCellStyle(v, tv.isForeignKeyColumn(ci), hasColumn(tv.primary_key.items, r.columns[ci]), hasColumn(tv.unique_keys.items, r.columns[ci])))
             else if (v == null) theme.null_value else .{};
-            if (is_cur_row and !selected) style.bg = .{ .index = 8 };
             if (tv.browse == null and selected) style = theme.selected_cell;
-            // fill the padding around the cell for the current row
-            if (is_cur_row) fillRow(grid, col_x, y, w + 2, style);
+            if (selected or (tv.browse != null and is_cur_row)) fillRow(grid, col_x, y, w + 2, style);
             drawCell(grid, col_x, y, w, text, style);
-            const sep_style: vaxis.Style = if (is_cur_row) .{ .fg = theme.muted_color, .bg = .{ .index = 8 } } else theme.border;
-            if (pos + 1 < last_col) grid.writeCell(col_x + w + 2, y, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = sep_style });
+            grid.writeCell(col_x + w + 2, y, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = if (tv.browse != null and is_cur_row and column_index + 1 < columns.len) theme.selected else theme.border });
             col_x += w + 3;
         }
     }
-    if (tv.view.items.len == 0) {
-        _ = grid.printSegment(.{ .text = "  (no rows)", .style = theme.dim }, .{ .row_offset = 2 });
-    }
+    tv.drawRule(grid, columns, @intCast(3 + end_row - tv.top), "└", "┴", "┘");
 
     if (fk_h > 0) try tv.drawForeignPreview(a, win.child(.{ .y_off = grid_h, .height = fk_h }));
     try tv.drawFooter(a, win.child(.{ .y_off = @intCast(win.height - footer_h), .height = footer_h }), last_col);
-    if (tv.editing_filter) try tv.drawCompletion(a, win, win.height - footer_h);
+    if (tv.editing_filter) tv.drawCompletion(win, win.height - footer_h);
 
     if (tv.detail) try tv.drawDetail(a, win);
     if (tv.chooser != null) try tv.drawChooser(a, win);
@@ -1255,44 +1333,146 @@ test "database badge preserves configured background" {
     try std.testing.expectEqual(vaxis.Color{ .rgb = .{ 0xff, 0x63, 0x47 } }, tomato.bg);
 }
 
+fn drawRule(tv: *TableView, win: vaxis.Window, columns: []const usize, y: u16, left: []const u8, middle: []const u8, right: []const u8) void {
+    win.writeCell(0, y, .{ .char = .{ .grapheme = left, .width = 1 }, .style = theme.border });
+    var x: usize = 1;
+    for (columns, 0..) |ci, i| {
+        const end = x + @min(tv.widths.items[ci], win.width -| x -| 3) + 2;
+        while (x < end) : (x += 1) {
+            win.writeCell(@intCast(x), y, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = theme.border });
+        }
+        if (x >= win.width) break;
+        win.writeCell(@intCast(x), y, .{ .char = .{ .grapheme = if (i + 1 < columns.len) middle else right, .width = 1 }, .style = theme.border });
+        x += 1;
+    }
+}
+
+test "browse grid boxes headers and rows without losing selection" {
+    const a = std.testing.allocator;
+    var result: db.Result = .{ .arena = .init(a), .columns = &.{ "id", "item" }, .rows = &.{ &.{ "1", "a" }, &.{ "2", "b" } } };
+    defer result.deinit();
+    const tv = try TableView.init(a, &result, false, "orders", .{ .table = "orders" }, "", null);
+    defer tv.deinit();
+    try tv.setPrimaryKey(&.{"id"});
+    try tv.setUniqueKeys(&.{"item"});
+    tv.fitKeyMarkers();
+    try std.testing.expectEqualStrings(" PK", tv.keyMarkers(0));
+    try std.testing.expectEqualStrings(" UQ", tv.keyMarkers(1));
+    var screen = try vaxis.Screen.init(a, .{ .cols = 40, .rows = 12, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 40, .height = 12, .screen = &screen };
+
+    try tv.draw(win);
+    try std.testing.expectEqualStrings("┌", screen.readCell(0, 2).?.char.grapheme);
+    try std.testing.expectEqualStrings("┬", screen.readCell(12, 2).?.char.grapheme);
+    try std.testing.expectEqualStrings("│", screen.readCell(0, 3).?.char.grapheme);
+    try std.testing.expectEqualStrings("├", screen.readCell(0, 4).?.char.grapheme);
+    try std.testing.expectEqualStrings("┼", screen.readCell(12, 4).?.char.grapheme);
+    try std.testing.expect(!screen.readCell(0, 5).?.style.reverse);
+    try std.testing.expect(screen.readCell(2, 5).?.style.reverse);
+    try std.testing.expectEqual(theme.accent, screen.readCell(2, 5).?.style.fg);
+    try std.testing.expectEqual(vaxis.Style.Underline.off, screen.readCell(2, 5).?.style.ul_style);
+    try std.testing.expect(screen.readCell(15, 5).?.style.reverse);
+    try std.testing.expect(screen.readCell(12, 5).?.style.reverse);
+    try std.testing.expect(!screen.readCell(15, 6).?.style.reverse);
+    try std.testing.expect(screen.readCell(2, 5).?.style.bold);
+    try std.testing.expect(!screen.readCell(15, 5).?.style.bold);
+    try std.testing.expectEqual(theme.warn_color, screen.readCell(5, 3).?.style.fg);
+    try std.testing.expectEqual(vaxis.Color{ .index = 5 }, screen.readCell(19, 3).?.style.fg);
+    try std.testing.expectEqualStrings("└", screen.readCell(0, 7).?.char.grapheme);
+    try std.testing.expect(!screen.readCell(13 + tv.widths.items[1] + 2, 5).?.style.reverse);
+
+    _ = try tv.handleKey(.{ .codepoint = 'c' });
+    _ = try tv.handleKey(.{ .codepoint = vaxis.Key.down });
+    _ = try tv.handleKey(.{ .codepoint = ' ' });
+    try std.testing.expect(tv.hidden.items[1]);
+    _ = try tv.handleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(tv.chooser == null);
+    try std.testing.expect(!tv.hidden.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), tv.curCol());
+
+    var narrow: db.Result = .{ .arena = .init(a), .columns = &.{"long_column_name"}, .rows = &.{&.{"value"}} };
+    defer narrow.deinit();
+    const narrow_tv = try TableView.init(a, &narrow, false, "orders", .{ .table = "orders" }, "", null);
+    defer narrow_tv.deinit();
+    var narrow_screen = try vaxis.Screen.init(a, .{ .cols = 12, .rows = 12, .x_pixel = 0, .y_pixel = 0 });
+    defer narrow_screen.deinit(a);
+    const narrow_win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 12, .height = 12, .screen = &narrow_screen };
+    try narrow_tv.draw(narrow_win);
+    try std.testing.expectEqualStrings("┐", narrow_screen.readCell(11, 2).?.char.grapheme);
+    try std.testing.expect(!narrow_screen.readCell(11, 5).?.style.reverse);
+
+    var empty: db.Result = .{ .arena = .init(a), .columns = &.{ "id", "item" } };
+    defer empty.deinit();
+    const empty_tv = try TableView.init(a, &empty, false, "orders", .{ .table = "orders" }, "", null);
+    defer empty_tv.deinit();
+    try empty_tv.draw(win);
+    try std.testing.expectEqualStrings("└", screen.readCell(0, 5).?.char.grapheme);
+}
+
+test "FK preview and its controls remain visible on a short terminal" {
+    const a = std.testing.allocator;
+    var result: db.Result = .{ .arena = .init(a), .columns = &.{"customer_id"}, .rows = &.{&.{"1"}} };
+    defer result.deinit();
+    const tv = try TableView.init(a, &result, false, "orders", .{ .table = "orders" }, "", null);
+    defer tv.deinit();
+    const linked = try a.create(db.Result);
+    linked.* = .{ .arena = .init(a), .columns = &.{ "id", "name" }, .rows = &.{&.{ "1", "Ada" }} };
+    tv.setForeignResult(linked);
+    var screen = try vaxis.Screen.init(a, .{ .cols = 24, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 24, .height = 8, .screen = &screen };
+
+    try tv.draw(win);
+    try std.testing.expectEqualStrings("F", screen.readCell(2, 2).?.char.grapheme);
+    try std.testing.expect(screen.readCell(2, 4).?.style.reverse);
+    try std.testing.expectEqualStrings("↑", screen.readCell(1, 7).?.char.grapheme);
+}
+
 fn drawCell(win: vaxis.Window, x: u16, y: u16, width: u16, text: []const u8, style: vaxis.Style) void {
     const fit = render.fitWidth(text, width);
     var segs = [_]Segment{.{ .text = fit.text, .style = style }};
     _ = win.print(&segs, .{ .row_offset = y, .col_offset = x + 1, .wrap = .none });
     if (fit.text.len < text.len and width > 0) {
         // mark truncation in the last column of the cell
-        win.writeCell(x + width, y, .{ .char = .{ .grapheme = "…", .width = 1 }, .style = .{ .fg = theme.muted_color, .bg = style.bg } });
+        win.writeCell(x + width, y, .{ .char = .{ .grapheme = "…", .width = 1 }, .style = .{ .reverse = style.reverse, .fg = if (style.reverse) .default else theme.muted_color } });
     }
 }
 
 fn fillRow(win: vaxis.Window, x: u16, y: u16, width: u16, style: vaxis.Style) void {
     var i: u16 = 0;
     while (i < width) : (i += 1) {
-        win.writeCell(x + i, y, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = style.bg } });
+        win.writeCell(x + i, y, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
     }
 }
 
 fn drawForeignPreview(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!void {
     const result = tv.fk_result orelse return;
-    if (result.rows.len == 0) return;
     const box = win.child(.{ .width = win.width, .height = win.height, .border = .{ .where = .all, .style = theme.border_focus } });
     box.clear();
-    const title = try std.fmt.allocPrint(a, " FK → {s}  ·  J/K scroll  ·  f close", .{tv.fk_target orelse "row"});
-    _ = box.print(&.{.{ .text = title, .style = theme.accent_bold }}, .{ .row_offset = 0, .wrap = .none });
+    const title = try std.fmt.allocPrint(a, " FK → {s}  ·  {d}/{d}", .{ tv.fk_target orelse "row", if (result.columns.len == 0) 0 else tv.fk_field + 1, result.columns.len });
+    _ = box.print(&.{.{ .text = title, .style = .{ .fg = theme.fk_color, .bold = true } }}, .{ .row_offset = 0, .wrap = .none });
+    if (result.rows.len == 0) {
+        _ = box.print(&.{.{ .text = "No related row", .style = theme.warn }}, .{ .row_offset = 2, .wrap = .none });
+        return;
+    }
     const field_w: u16 = @min(24, box.width / 3);
     const value_w = box.width -| (field_w + 4);
     drawCell(box, 0, 1, field_w, "Column", theme.header);
     drawCell(box, field_w + 2, 1, value_w, "Value", theme.header);
     const shown = box.height -| 2;
-    tv.fk_scroll = @min(tv.fk_scroll, result.columns.len -| shown);
+    if (tv.fk_field < tv.fk_scroll) tv.fk_scroll = tv.fk_field;
+    if (shown > 0 and tv.fk_field >= tv.fk_scroll + shown) tv.fk_scroll = tv.fk_field + 1 - shown;
     for (result.columns[tv.fk_scroll..], 0..) |name, i| {
         if (i >= shown) break;
         const y: u16 = @intCast(i + 2);
-        drawCell(box, 0, y, field_w, name, theme.header);
         const column = tv.fk_scroll + i;
+        const selected = column == tv.fk_field;
+        if (selected) fillRow(box, 0, y, box.width, theme.selected_cell);
+        drawCell(box, 0, y, field_w, name, if (selected) theme.selected_cell else theme.header);
         const value = result.rows[0][column];
         const label = try render.preview(a, displayValue(result, column, value), value_w);
-        drawCell(box, field_w + 2, y, value_w, label, if (value == null) theme.null_value else .{});
+        drawCell(box, field_w + 2, y, value_w, label, if (selected) theme.selected_cell else if (value == null) theme.null_value else .{});
     }
 }
 
@@ -1365,42 +1545,54 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
             try info.print(a, " row {d}/{d}", .{ if (tv.view.items.len == 0) 0 else tv.row + 1, tv.view.items.len });
             if (tv.view.items.len != r.rows.len) try info.print(a, " (of {d})", .{r.rows.len});
         }
-        try info.print(a, " · col {d}/{d} {s}", .{ tv.col + 1, tv.visible.items.len, col_name });
+        try info.print(a, " · col {d}/{d} ", .{ tv.col + 1, tv.visible.items.len });
+        const name_start = info.items.len;
+        try info.appendSlice(a, col_name);
+        const name_end = info.items.len;
         if (last_col < tv.visible.items.len) try info.print(a, " · {d} more →", .{tv.visible.items.len - last_col});
         if (tv.hiddenCount() > 0) try info.print(a, " · {d} hidden", .{tv.hiddenCount()});
         if (r.elapsed_ms) |ms| try info.print(a, " · {d} ms", .{ms});
         if (r.affected_rows) |n| try info.print(a, " · {d} affected", .{n});
         var segs: std.ArrayList(Segment) = .empty;
-        try segs.append(a, .{ .text = info.items, .style = theme.bold });
+        try segs.append(a, .{ .text = info.items[0..name_start], .style = theme.bold });
+        try segs.append(a, .{ .text = info.items[name_start..name_end], .style = theme.accent_bold });
+        try segs.append(a, .{ .text = info.items[name_end..], .style = theme.bold });
         if (tv.notice) |n| try segs.append(a, .{ .text = try std.fmt.allocPrint(a, "  {s}", .{n}), .style = theme.warn });
         _ = win.print(segs.items, .{ .row_offset = 0, .wrap = .none });
         win.hideCursor();
     }
 
-    const hint: []const u8 = if (tv.chooser != null)
-        " space show/hide · a show all · o only this · esc done"
-    else if (tv.editing_filter)
-        (if (tv.completion.items.len > 0)
-            " ↑↓ choose column · tab/enter insert · esc hide suggestions"
-        else if (tv.browse != null)
-            " enter apply · esc cancel · empty clears · columns and operators autocomplete"
+    if (win.height > 1) {
+        const hint: []const u8 = if (tv.chooser != null)
+            " space hide/show · enter jump · a all · o only · esc close"
+        else if (tv.editing_filter and tv.completion.items.len > 0)
+            " ↑↓ choose · tab insert · esc dismiss"
+        else if (tv.editing_filter)
+            " enter apply · esc cancel"
+        else if (tv.fk_result != null)
+            (if (win.width >= 52) " ↑↓ fields · enter full value · y copy · f/esc close" else if (win.width >= 32) " ↑↓ fields · enter full · f close" else " ↑↓ fields · f close")
+        else if (tv.browse == null)
+            " / filter · s sort · c columns · y copy · e export · q back"
+        else if (win.width >= 70)
+            " f FK · / filter · s sort · c show/hide · y copy · e export · q back"
+        else if (win.width >= 48)
+            " f FK · / filter · s sort · c show/hide · q back"
+        else if (win.width >= 24)
+            " f FK · / filter · q back"
         else
-            " text · col:text · col=value · enter apply · esc cancel")
-    else if (tv.browse) |b| (if (b.kind == .clickhouse)
-        " enter cell · e export · / where · t count · s sort · c columns · x hide · n/p page · r/F5 refresh · q back"
-    else if (b.read_only)
-        " enter cell · e export · f follow FK · / where · t count · s sort · c columns · n/p page · q back"
-    else
-        " enter cell · e export · f follow FK · / where · t count · s sort · c columns · d delete · n/p page · q back") else " enter cell · e export · / filter · s sort · c columns · x hide · y/Y copy · q back";
-    _ = win.print(&.{.{ .text = hint, .style = theme.dim }}, .{ .row_offset = 1, .wrap = .none });
+            " f FK · q";
+        _ = win.print(&.{.{ .text = hint, .style = theme.plain }}, .{ .row_offset = 1, .wrap = .none });
+    }
 }
 
 fn drawDetail(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!void {
     const value = tv.currentValue();
+    const result = if (tv.fk_detail) tv.fk_result.? else tv.result;
+    const column = if (tv.fk_detail) tv.fk_field else tv.curCol();
     const w: u16 = @min(win.width -| 4, 100);
     var lines: std.ArrayList(Transcript.Line) = .empty;
     const segs: []const Segment = if (value) |v|
-        &.{.{ .text = if (tv.browse != null) displayValue(tv.result, tv.curCol(), v) else v }}
+        &.{.{ .text = if (tv.browse != null) displayValue(result, column, v) else v }}
     else
         &.{.{ .text = "NULL", .style = theme.null_value }};
     try Transcript.wrapWithPrefix(a, &lines, segs, w -| 2, .{ .text = "" }, "");
@@ -1414,7 +1606,7 @@ fn drawDetail(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!v
         .border = .{ .where = .all, .style = theme.border_focus },
     });
     box.clear();
-    const col_name = tv.result.columns[tv.curCol()];
+    const col_name = result.columns[column];
     _ = box.print(&.{
         .{ .text = col_name, .style = theme.accent_bold },
         .{ .text = "  esc close · y copy · ↑↓ scroll", .style = theme.dim },
@@ -1454,6 +1646,7 @@ fn drawChooser(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!
         .col_offset = box.width -| @as(u16, @intCast(counter.len + 1)),
         .wrap = .none,
     });
+    _ = box.print(&.{.{ .text = " space hide/show · enter jump", .style = theme.plain }}, .{ .row_offset = 1, .wrap = .none });
 
     if (ch.sel < ch.top) ch.top = ch.sel;
     if (ch.sel >= ch.top + visible) ch.top = ch.sel + 1 - visible;
@@ -1461,15 +1654,15 @@ fn drawChooser(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!
         const sel = ci == ch.sel;
         const row: u16 = @intCast(ci - ch.top + 2);
         const shown = !tv.hidden.items[ci];
-        const bg: vaxis.Color = if (sel) theme.selection_bg else .default;
+        const style: vaxis.Style = if (sel) theme.popup_selected else .{};
         if (sel) {
             var x: u16 = 0;
-            while (x < box.width) : (x += 1) box.writeCell(x, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = bg } });
+            while (x < box.width) : (x += 1) box.writeCell(x, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
         }
         _ = box.print(&.{
-            .{ .text = " ", .style = .{ .bg = bg } },
-            .{ .text = if (shown) "[x] " else "[ ] ", .style = .{ .fg = if (shown) theme.accent else theme.muted_color, .bg = bg, .bold = shown } },
-            .{ .text = render.fitWidth(name, box.width -| 6).text, .style = .{ .bg = bg, .fg = if (shown) .default else theme.muted_color, .bold = sel } },
+            .{ .text = " ", .style = style },
+            .{ .text = if (shown) "[x] " else "[ ] ", .style = .{ .fg = if (sel) .default else if (shown) theme.accent else theme.muted_color, .reverse = sel, .bold = shown } },
+            .{ .text = render.fitWidth(name, box.width -| 6).text, .style = .{ .fg = if (sel or shown) .default else theme.muted_color, .reverse = sel, .bold = sel } },
         }, .{ .row_offset = row, .wrap = .none });
     }
 }

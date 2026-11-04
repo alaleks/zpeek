@@ -2805,6 +2805,16 @@ fn processJob(app: *App, job: *Job) !void {
                         .result => |fk| try tv.setForeignKeys(fk.result),
                         else => {},
                     };
+                    if (job.outcomes.items.len > 3) switch (job.outcomes.items[3]) {
+                        .result => |uq| {
+                            var names: std.ArrayList([]const u8) = .empty;
+                            defer names.deinit(app.gpa);
+                            for (uq.result.rows) |row| if (row.len > 0) if (row[0]) |n| try names.append(app.gpa, n);
+                            try tv.setUniqueKeys(names.items);
+                        },
+                        else => {},
+                    };
+                    tv.fitKeyMarkers();
                     app.mode = .table;
                     try app.transcript.addMessage(.dim, "{s}: {d} rows loaded in {d} ms", .{ b.table, r.result.rows.len, r.ms });
                 },
@@ -3196,7 +3206,7 @@ test "choosing a table opens its SQLite browse view" {
     };
     defer app.deinit();
     app.loop = .init(app.io, &app.tty, &app.vx);
-    var setup = try conn.query(a, "create table people(id integer primary key, name text); insert into people values (1, 'Alice');");
+    var setup = try conn.query(a, "create table people(id integer primary key, name text, email text unique); insert into people values (1, 'Alice', 'a@example.com');");
     setup.deinit();
     var listed = try conn.query(a, schema.listSql(.sqlite, .tables).?);
     defer listed.deinit();
@@ -3208,6 +3218,8 @@ test "choosing a table opens its SQLite browse view" {
     try std.testing.expectEqual(Mode.table, app.mode);
     try std.testing.expectEqualStrings("people", app.table_view.?.browse.?.table);
     try std.testing.expectEqualStrings("Alice", app.table_view.?.result.rows[0][1].?);
+    try std.testing.expectEqualStrings("id", app.table_view.?.primary_key.items[0]);
+    try std.testing.expectEqualStrings("email", app.table_view.?.unique_keys.items[0]);
 }
 
 fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
@@ -3233,6 +3245,7 @@ fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
         try schema.browseSql(a, kind, b.table, b.filter, null, b.page_size, 0),
         try schema.primaryKeySql(a, kind, b.table),
         (try schema.foreignKeySql(a, kind, b.table)) orelse "select 1 where 0",
+        try schema.uniqueKeySql(a, kind, b.table),
     });
     job.stop_on_error = false;
     try app.startJob(job);
@@ -3414,16 +3427,15 @@ fn draw(app: *App) !void {
 
     const box = win.child(.{
         .x_off = 0,
-        .y_off = @intCast(trans_h + status_h),
+        .y_off = @intCast(trans_h + status_h + 1),
         .width = win.width,
-        .height = box_h,
-        .border = .{ .where = .all, .style = if (app.job == null) theme.border_focus else theme.border },
+        .height = input_h,
     });
     const cursor = app.drawInput(box);
 
     try app.drawFooter(a, win.child(.{ .y_off = @intCast(win.height - footer_h), .height = footer_h }));
 
-    if (app.popup) |*p| try app.drawPopup(a, win, p, @intCast(trans_h + status_h), cursor.col);
+    if (app.popup) |*p| try app.drawPopup(a, win, p, @intCast(trans_h + status_h + 1), cursor.col);
 
     if (app.mode == .picker) {
         if (app.picker) |pk| try pk.draw(win, a);
@@ -3563,8 +3575,8 @@ fn drawFooter(app: *App, a: Allocator, win: vaxis.Window) !void {
         if (app.conn_name.len > 0) {
             try left.append(a, .{ .text = try std.fmt.allocPrint(a, " {s} ", .{app.conn_name}), .style = TableView.databaseBadgeStyle(app.conn_color) });
         }
-        try left.append(a, .{ .text = try std.fmt.allocPrint(a, "  {s} {s}", .{ c.kind.label(), c.server_version }), .style = theme.dim });
-        if (!std.mem.eql(u8, desc, app.conn_name)) try left.append(a, .{ .text = try std.fmt.allocPrint(a, " · {s}", .{desc}), .style = theme.dim });
+        try left.append(a, .{ .text = try std.fmt.allocPrint(a, "  {s} {s}", .{ c.kind.label(), c.server_version }), .style = theme.plain });
+        if (!std.mem.eql(u8, desc, app.conn_name)) try left.append(a, .{ .text = try std.fmt.allocPrint(a, " · {s}", .{desc}), .style = theme.plain });
         if (app.readOnly()) try left.append(a, .{ .text = " · read-only", .style = theme.warn });
         if (app.conn_params) |params| {
             if (params.access == .read_delete) try left.append(a, .{ .text = " · read + delete", .style = theme.warn });
@@ -3575,7 +3587,7 @@ fn drawFooter(app: *App, a: Allocator, win: vaxis.Window) !void {
     }
     _ = win.print(left.items, .{ .row_offset = 0, .wrap = .none });
 
-    const hint = "ctrl+s save · ctrl+r queries · /help ";
+    const hint = "/help ";
     const hw: u16 = @intCast(render.displayWidth(hint));
     var lw: usize = 0;
     for (left.items) |s| lw += render.displayWidth(s.text);
@@ -3608,15 +3620,14 @@ fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16
     const x: u16 = @min(cursor_col -| @as(u16, @intCast(@min(p.completion.replace_len, cursor_col))), win.width -| w);
     const y: u16 = if (below) box_top + 1 else box_top - @as(u16, @intCast(visible));
     const pop = win.child(.{ .x_off = x, .y_off = y, .width = w, .height = @intCast(visible) });
-    pop.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .index = 0 } } });
+    pop.fill(.{ .char = .{ .grapheme = " ", .width = 1 } });
 
     for (cands[p.top .. p.top + visible], 0..) |c, i| {
         const sel = p.top + i == p.selected;
-        const bg: vaxis.Color = if (sel) theme.selection_bg else .{ .index = 0 };
-        const fg: vaxis.Color = if (sel) .{ .index = 15 } else .default;
+        const style: vaxis.Style = if (sel) theme.popup_selected else .{};
         if (sel) {
             var cx: u16 = 0;
-            while (cx < pop.width) : (cx += 1) pop.writeCell(cx, @intCast(i), .{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = bg } });
+            while (cx < pop.width) : (cx += 1) pop.writeCell(cx, @intCast(i), .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
         }
         const icon: []const u8 = switch (c.kind) {
             // Plain letters: decorative symbols are missing from many terminal fonts.
@@ -3638,12 +3649,12 @@ fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16
         else
             "";
         _ = pop.print(&.{
-            .{ .text = " ", .style = .{ .bg = bg } },
-            .{ .text = icon, .style = .{ .fg = if (sel) fg else theme.muted_color, .bg = bg } },
-            .{ .text = " ", .style = .{ .bg = bg } },
-            .{ .text = fit.text, .style = .{ .fg = fg, .bg = bg, .bold = sel } },
-            .{ .text = try Transcript.spaces(a, label_w - fit.width + 2), .style = .{ .bg = bg } },
-            .{ .text = shown_detail, .style = .{ .fg = if (sel) fg else theme.muted_color, .bg = bg } },
+            .{ .text = " ", .style = style },
+            .{ .text = icon, .style = if (sel) style else theme.dim },
+            .{ .text = " ", .style = style },
+            .{ .text = fit.text, .style = .{ .reverse = sel, .bold = sel } },
+            .{ .text = try Transcript.spaces(a, label_w - fit.width + 2), .style = style },
+            .{ .text = shown_detail, .style = if (sel) style else theme.dim },
         }, .{ .row_offset = @intCast(i), .wrap = .none });
     }
 }
