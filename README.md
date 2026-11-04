@@ -2,26 +2,21 @@
 
 <p align="center"><strong>Browse tables. Follow foreign keys. Run SQL.</strong></p>
 
-<p align="center">A keyboard-driven database browser and SQL client for your terminal.<br>PostgreSQL · MySQL/MariaDB · SQLite · ClickHouse</p>
+<p align="center">A keyboard-driven database client for your terminal.<br>PostgreSQL · MySQL/MariaDB · SQLite · ClickHouse</p>
 
 ![zpeek: browse orders, follow customer_id, run SQL with autocomplete, and switch between dev and prod demo databases](examples/demo.gif)
 
-## Features
+## What you can do
 
-- **Browse data:** filter, sort, page through rows, choose columns, and inspect full cell values.
-- **Follow foreign keys:** select an FK cell and preview its related record with `f`.
-- **Write SQL:** dialect-aware completion, searchable SQL history, and saved queries with previews.
-- **Export results:** CSV or JSON from a query or the current table view.
-- **Inspect queries:** an EXPLAIN viewer, execution duration, and affected-row counts.
-- **Inspect schema:** columns, indexes, and constraints; definitions of views, functions, triggers, and custom types.
-- **Keep connections handy:** named profiles, color badges, and a built-in TOML editor with completion.
-- **Choose access per connection:** read-only, read + row deletion, or full access with confirmation for dangerous SQL. See the [security limits](docs/security.md).
+- **Explore tables** in a readable TUI: filter and sort rows, choose columns, and inspect full values.
+- **Follow foreign keys** with `f` to see the related record without writing a join.
+- **Write SQL** with syntax highlighting and completion; reuse queries from history or saved files.
+- **Switch databases** with named connections and color badges, so you can tell environments apart.
+- **Inspect schemas and query plans**, export CSV/JSON, and choose access modes per connection.
 
 ## Quick start
 
-### Install
-
-Download a binary manually from [GitHub Releases](https://github.com/alaleks/zpeek/releases), or use an installer:
+Download a binary from [GitHub Releases](https://github.com/alaleks/zpeek/releases), or install it from the terminal:
 
 **macOS, Linux, WSL, Git Bash:**
 
@@ -35,23 +30,19 @@ curl -fsSL https://raw.githubusercontent.com/alaleks/zpeek/master/install.sh | b
 irm https://raw.githubusercontent.com/alaleks/zpeek/master/install.ps1 | iex
 ```
 
-Release builds target macOS, Linux, and Windows on x86_64 and arm64. The installers check SHA-256 checksums when `checksums.txt` is available and warn if it is unavailable. Run an installer again to update; use `ZPEEK_VERSION` to pin a release or `ZPEEK_INSTALL_DIR` to choose a destination.
-
 To build from source with Zig 0.17.0:
 
 ```sh
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
 ```
 
-### 1. Open an existing local SQLite database
+Open an existing SQLite database:
 
 ```sh
 zpeek ./data.sqlite
 ```
 
-Type `/tables`, pick a table, and press `enter`. Use `s` to sort the selected column and `q` to return to the SQL prompt.
-
-### 2. Connect to a database service
+Or connect to a database service:
 
 ```sh
 zpeek 'postgres://user@host:5432/db'
@@ -59,32 +50,20 @@ zpeek 'mysql://user@host:3306/db'
 zpeek 'clickhouse://user@host:8123/db'
 ```
 
-Passwords can come from `$PGPASSWORD`, `$MYSQL_PWD`, or `$CLICKHOUSE_PASSWORD`; URLs also accept a password, for example `postgres://user:pass@host:5432/db`. See [connections and TLS](docs/connections.md) for saved profiles and more options.
-
-Run SQL and exit with `-e`:
-
-```sh
-zpeek prod -e 'select count(*) from users'
-```
-
-Here `prod` is a [saved connection](docs/connections.md#saved-connections). Run `zpeek` without an argument to use your default connection or open the connection picker.
-
-### 3. Work on a remote host over SSH
-
-```sh
-ssh user@server
-zpeek ./database.sqlite
-```
-
-Install a zpeek binary built for the server's supported OS and architecture. The database file must be accessible on that server; for a database service, its network endpoint must be reachable from there.
+Inside zpeek, type `/tables`, pick a table, and press `enter`. Select an FK value and press `f` to follow it, or type SQL at the prompt. Use `/connect` to switch between [saved connections](docs/connections.md#saved-connections). See [connections and TLS](docs/connections.md) for passwords and other options.
 
 ## Why zpeek?
 
-My editor didn't have a database client, so checking data meant jumping between windows. I built zpeek as a lightweight database client I could run in my editor's terminal or on a server over SSH, keeping database work in the same place as everything else.
+I built zpeek to check data without leaving my editor's terminal. It also works over SSH: one binary with built-in drivers, with connections and saved SQL in ordinary files you can edit yourself.
 
-- One binary with built-in drivers and SQLite; no database client libraries to install.
-- A shared keyboard workflow for browsing data, inspecting schema, and running SQL.
-- Connections and saved SQL live in ordinary files you can edit yourself.
+## Benchmarks
+
+In November 2026, separate Linux x86_64 runs with PostgreSQL 18.6 on localhost and Zig 0.17.0 `ReleaseSafe` builds measured:
+
+- **10.27 MiB peak RSS** across 15 TUI cycles of querying, browsing, sorting, and clearing results ([TUI run](docs/benchmarks/linux-2026-11-03/REPORT.md)).
+- **1.56 s median wall time** for a 20-million-ID SQL response, including startup and connection, with **35.18 MiB peak RSS** ([full-response run](docs/benchmarks/linux-2026-11-03/OPTIMIZATION.md)).
+
+The large-result run read the full response but retained at most 16 MiB of row data. These were local, warm-cache measurements; the reports include the setup and raw results.
 
 ## Documentation
 
