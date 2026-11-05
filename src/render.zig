@@ -43,9 +43,20 @@ pub fn preview(a: Allocator, s: []const u8, max: usize) Allocator.Error![]const 
         pos += n;
     }
     const text = buffer[0..len];
-    const fit = fitWidth(text, max);
-    if (pos == s.len and fit.text.len == len) return if (changed) try a.dupe(u8, text) else s;
-    return std.mem.concat(a, u8, &.{ fitWidth(text, max - 1).text, "…" });
+    var width: usize = 0;
+    var cut: usize = 0;
+    var fits = true;
+    var graphemes = vaxis.unicode.graphemeIterator(text);
+    while (graphemes.next()) |g| {
+        width += vaxis.gwidth.gwidth(g.bytes(text), .unicode);
+        if (width > max) {
+            fits = false;
+            break;
+        }
+        if (width < max) cut = g.start + g.bytes(text).len;
+    }
+    if (pos == s.len and fits) return if (changed) try a.dupe(u8, text) else s;
+    return std.mem.concat(a, u8, &.{ text[0..cut], "…" });
 }
 
 pub fn displayWidth(s: []const u8) usize {
@@ -114,6 +125,7 @@ pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableO
     for (r.rows) |row| {
         if (row.len != ncols) return error.InvalidRow;
         for (row, 0..) |v, i| {
+            if (widths[i] >= opts.max_cell_width) continue;
             const cell = try prepareCell(arena.allocator(), v orelse null_text, opts.max_cell_width);
             widths[i] = @max(widths[i], cell.width);
             _ = arena.reset(.{ .retain_with_limit = scratch_limit });
@@ -175,6 +187,17 @@ test "fitWidth and singleLine" {
     try std.testing.expectEqualStrings("a¶b", try singleLine(arena.allocator(), "a\r\nb"));
 }
 
+test "saturated column widths preserve output and validate later rows" {
+    var r: db.Result = .{ .arena = .init(std.testing.allocator), .columns = &.{"x"}, .rows = &.{ &.{"abcd"}, &.{"日本"} } };
+    defer r.deinit();
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeResult(std.testing.allocator, &writer, r, .{ .max_cell_width = 2 });
+    try std.testing.expectEqualStrings("┌────┐\n│ x  │\n├────┤\n│ a… │\n│ …  │\n└────┘\nOK\n", writer.buffered());
+    r.rows = &.{ &.{"abcd"}, &.{} };
+    try std.testing.expectError(error.InvalidRow, writeResult(std.testing.allocator, &writer, r, .{ .max_cell_width = 2 }));
+}
+
 test "prepared cells preserve ASCII clipping, Unicode widths and controls" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -185,6 +208,9 @@ test "prepared cells preserve ASCII clipping, Unicode widths and controls" {
         .{ .input = "日本", .max = 4, .text = "日本", .width = 4 },
         .{ .input = "a\nb", .max = 3, .text = "a¶b", .width = 3 },
         .{ .input = "é", .max = 1, .text = "é", .width = 1 },
+        .{ .input = "é日本", .max = 3, .text = "é…", .width = 2 },
+        .{ .input = "日本語", .max = 4, .text = "日…", .width = 3 },
+        .{ .input = "日本語", .max = 6, .text = "日本語", .width = 6 },
     }) |case| {
         const cell = try prepareCell(arena.allocator(), case.input, case.max);
         try std.testing.expectEqualStrings(case.text, cell.text);

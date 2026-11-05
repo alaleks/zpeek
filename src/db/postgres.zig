@@ -676,3 +676,32 @@ test "discarded row messages allocate nothing and preserve following protocol me
     var invalid: Io.Reader = .fixed("D\xff\xff\xff\xff");
     try std.testing.expectError(error.StreamTooLong, receiveMessage(&invalid, &message, std.testing.allocator, true));
 }
+
+test "optional PostgreSQL transaction failure timeout and recovery" {
+    const a = std.testing.allocator;
+    var env = try std.testing.environ.createMap(a);
+    defer env.deinit();
+    const host = env.get("ZPEEK_TEST_PG_HOST") orelse return error.SkipZigTest;
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try connect(a, std.testing.io, .{ .kind = .postgres, .host = host, .database = env.get("ZPEEK_TEST_PG_DATABASE") orelse "zpeek", .user = env.get("ZPEEK_TEST_PG_USER") orelse "postgres", .password = env.get("ZPEEK_TEST_PG_PASSWORD") orelse "", .ssl = .disable }, &err);
+    defer conn.close();
+    var setup = try conn.query(a, "create temporary table zpeek_integration(id integer primary key); insert into zpeek_integration values(1)");
+    setup.deinit();
+    try std.testing.expectError(error.QueryFailed, conn.query(a, "begin; insert into zpeek_integration values(2); insert into zpeek_integration values(1); insert into zpeek_integration values(3); commit"));
+    try std.testing.expectError(error.QueryFailed, conn.query(a, "select 1"));
+    var rollback = try conn.query(a, "rollback");
+    rollback.deinit();
+    var count = try conn.query(a, "select count(*) from zpeek_integration");
+    defer count.deinit();
+    try std.testing.expectEqualStrings("1", count.rows[0][0].?);
+    var timeout = try conn.query(a, "set statement_timeout='50ms'");
+    timeout.deinit();
+    try std.testing.expectError(error.Canceled, conn.query(a, "select pg_sleep(10)"));
+    var recovered = try conn.query(a, "select 42");
+    defer recovered.deinit();
+    try std.testing.expectEqualStrings("42", recovered.rows[0][0].?);
+    try std.testing.expectError(error.ConnectionLost, conn.query(a, "select pg_terminate_backend(pg_backend_pid())"));
+    try std.testing.expectError(error.ConnectionLost, conn.query(a, "select 1"));
+    std.debug.print("\nPostgreSQL integration passed: rollback, timeout recovery, connection loss\n", .{});
+}

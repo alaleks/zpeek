@@ -416,3 +416,46 @@ test "foreign key metadata and composite row lookup on SQLite" {
     defer implicit.deinit();
     try std.testing.expectEqualStrings("id", implicit.rows[0][4].?);
 }
+
+test "failed SQLite batch stops and explicit rollback restores transaction" {
+    const a = std.testing.allocator;
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try connect(a, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    defer conn.close();
+    var setup = try conn.query(a, "create table t(id integer primary key); insert into t values(1)");
+    setup.deinit();
+    try std.testing.expectError(error.QueryFailed, conn.query(a, "begin; insert into t values(2); insert into t values(1); insert into t values(3); commit"));
+    var pending = try conn.query(a, "select count(*) from t");
+    defer pending.deinit();
+    try std.testing.expectEqualStrings("2", pending.rows[0][0].?);
+    var rollback = try conn.query(a, "rollback");
+    rollback.deinit();
+    var remaining = try conn.query(a, "select count(*) from t");
+    defer remaining.deinit();
+    try std.testing.expectEqualStrings("1", remaining.rows[0][0].?);
+    var success = try conn.query(a, "begin; insert into t values(4); commit; select sum(id) from t");
+    defer success.deinit();
+    try std.testing.expectEqualStrings("5", success.rows[0][0].?);
+}
+
+test "SQLite cancellation interrupts execution and connection remains usable" {
+    const a = std.testing.allocator;
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try connect(a, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    defer conn.close();
+    const self: *Sqlite = @ptrCast(@alignCast(conn.ptr));
+    const Progress = struct {
+        fn interrupt(context: ?*anyopaque) callconv(.c) c_int {
+            Sqlite.cancel(context.?);
+            return 0;
+        }
+    };
+    c.sqlite3_progress_handler(self.handle, 100, Progress.interrupt, conn.ptr);
+    try std.testing.expectError(error.Canceled, conn.query(a, "with recursive n(x) as (select 1 union all select x+1 from n where x<1000000) select sum(x) from n"));
+    c.sqlite3_progress_handler(self.handle, 0, null, null);
+    var result = try conn.query(a, "select 42");
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42", result.rows[0][0].?);
+}

@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
     const version = b.option([]const u8, "version", "Version string shown by --version") orelse "dev";
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
+    build_options.addOption(bool, "bench_tui", b.option(bool, "bench-tui", "Measure in-memory TUI frames during tests") orelse false);
 
     const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
     const sqlite_dep = b.dependency("sqlite", .{});

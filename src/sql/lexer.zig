@@ -57,22 +57,29 @@ pub const Iterator = struct {
                 tag = .whitespace;
                 while (i < s.len and std.ascii.isWhitespace(s[i])) i += 1;
             },
-            '-' => if (i < s.len and s[i] == '-') {
+            '-' => if (i < s.len and s[i] == '-' and (it.dialect != .mysql or i + 1 == s.len or s[i + 1] <= 0x20)) {
                 tag = .comment;
                 while (i < s.len and s[i] != '\n') i += 1;
             } else {
                 tag = .operator;
             },
             '#' => {
-                // MySQL line comment; harmless elsewhere since '#' is rare in SQL.
-                tag = .comment;
-                while (i < s.len and s[i] != '\n') i += 1;
+                tag = if (it.dialect == .mysql) .comment else .operator;
+                if (it.dialect == .mysql) while (i < s.len and s[i] != '\n') : (i += 1) {};
             },
             '/' => if (i < s.len and s[i] == '*') {
                 tag = .comment;
                 i += 1;
-                while (i < s.len and !(s[i] == '/' and s[i - 1] == '*' and i - 1 > start + 1)) i += 1;
-                if (i < s.len) i += 1;
+                var depth: usize = 1;
+                while (i < s.len and depth > 0) {
+                    if (i + 1 < s.len and s[i] == '*' and s[i + 1] == '/') {
+                        depth -= 1;
+                        i += 2;
+                    } else if (it.dialect == .postgres and i + 1 < s.len and s[i] == '/' and s[i + 1] == '*') {
+                        depth += 1;
+                        i += 2;
+                    } else i += 1;
+                }
             } else {
                 tag = .operator;
             },
@@ -89,7 +96,11 @@ pub const Iterator = struct {
                 i = scanQuoted(s, i, '`', it.dialect == .mysql);
             },
             '[' => {
-                tag = .punctuation;
+                if (it.dialect == .sqlite) {
+                    tag = .quoted_identifier;
+                    while (i < s.len and s[i] != ']') i += 1;
+                    if (i < s.len) i += 1;
+                }
             },
             '$' => {
                 if (i < s.len and std.ascii.isDigit(s[i])) {
@@ -462,33 +473,29 @@ test "read-only violation" {
 pub fn splitStatements(src: []const u8, dialect: Dialect, out: *std.ArrayList([]const u8), gpa: std.mem.Allocator) !void {
     // In MySQL, \' is ambiguous because NO_BACKSLASH_ESCAPES is session state.
     // Let the server parse the complete script instead of guessing that state.
-    if ((dialect == .mysql and std.mem.indexOf(u8, src, "\\'") != null) or containsCompoundDefinition(src, dialect)) {
+    if (dialect == .mysql and std.mem.indexOf(u8, src, "\\'") != null) {
         const stmt = std.mem.trim(u8, src, " \t\r\n;");
         if (stmt.len > 0) try out.append(gpa, stmt);
         return;
     }
     var it: Iterator = .initDialect(src, dialect);
     var start: usize = 0;
-    while (it.next()) |t| {
-        if (t.tag == .punctuation and src[t.start] == ';') {
-            const stmt = std.mem.trim(u8, src[start..t.start], " \t\r\n");
-            if (stmt.len > 0 and !isOnlyComments(stmt, dialect)) try out.append(gpa, stmt);
-            start = t.end;
-        }
-    }
-    const stmt = std.mem.trim(u8, src[start..], " \t\r\n");
-    if (stmt.len > 0 and !isOnlyComments(stmt, dialect)) try out.append(gpa, stmt);
-}
-
-/// Compound trigger and routine bodies contain semicolons that only the
-/// database parser can classify correctly. Keep such input as one query.
-fn containsCompoundDefinition(src: []const u8, dialect: Dialect) bool {
-    var it: Iterator = .initDialect(src, dialect);
+    const original_len = out.items.len;
+    var has_code = false;
     var saw_create = false;
     var saw_compound_kind = false;
     while (it.next()) |t| {
         if (t.tag == .whitespace or t.tag == .comment) continue;
-        if (t.tag == .punctuation and src[t.start] == ';') return false;
+        if (t.tag == .punctuation and src[t.start] == ';') {
+            const stmt = std.mem.trim(u8, src[start..t.start], " \t\r\n");
+            if (has_code) try out.append(gpa, stmt);
+            start = t.end;
+            has_code = false;
+            saw_create = false;
+            saw_compound_kind = false;
+            continue;
+        }
+        has_code = true;
         const word = t.text(src);
         if (!saw_create) {
             if (t.tag == .keyword and std.ascii.eqlIgnoreCase(word, "create")) saw_create = true;
@@ -498,22 +505,61 @@ fn containsCompoundDefinition(src: []const u8, dialect: Dialect) bool {
             for ([_][]const u8{ "trigger", "function", "procedure" }) |kind| {
                 if (std.ascii.eqlIgnoreCase(word, kind)) saw_compound_kind = true;
             }
-            if (saw_compound_kind and std.ascii.eqlIgnoreCase(word, "begin")) return true;
+            if (saw_compound_kind and std.ascii.eqlIgnoreCase(word, "begin")) {
+                // Only the database parser can split compound routine bodies.
+                out.items.len = original_len;
+                try out.append(gpa, std.mem.trim(u8, src, " \t\r\n;"));
+                return;
+            }
         }
     }
-    return false;
-}
-
-fn isOnlyComments(s: []const u8, dialect: Dialect) bool {
-    var it: Iterator = .initDialect(s, dialect);
-    while (it.next()) |t| switch (t.tag) {
-        .whitespace, .comment => {},
-        else => return false,
-    };
-    return true;
+    const stmt = std.mem.trim(u8, src[start..], " \t\r\n");
+    if (has_code) try out.append(gpa, stmt);
 }
 
 const testing = std.testing;
+
+test "splitting skips empty statements and preserves a later compound body" {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(testing.allocator);
+    try parts.append(testing.allocator, "previous");
+    const sql = "select 1; create trigger x after insert on t begin select 2; select 3; end;";
+    try splitStatements(sql, .sqlite, &parts, testing.allocator);
+    try testing.expectEqual(@as(usize, 2), parts.items.len);
+    try testing.expectEqualStrings("previous", parts.items[0]);
+    try testing.expectEqualStrings(sql[0 .. sql.len - 1], parts.items[1]);
+    parts.clearRetainingCapacity();
+    try splitStatements("; /* nothing */ ; -- end", .postgres, &parts, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), parts.items.len);
+}
+
+test "dialect comment rules preserve statement boundaries and write checks" {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(testing.allocator);
+    try splitStatements("select 1 # 2; delete from t where id=1", .postgres, &parts, testing.allocator);
+    try testing.expectEqual(@as(usize, 2), parts.items.len);
+    try testing.expect(dangerousStatement("select 1 # 2; delete from t where id=1", .postgres) != null);
+    parts.clearRetainingCapacity();
+    try splitStatements("select 5--2; select 3", .mysql, &parts, testing.allocator);
+    try testing.expectEqual(@as(usize, 2), parts.items.len);
+    parts.clearRetainingCapacity();
+    try splitStatements("select 1 /* outer /* inner */ ; delete from t */; select 2", .postgres, &parts, testing.allocator);
+    try testing.expectEqual(@as(usize, 2), parts.items.len);
+    try testing.expect(dangerousStatement("select 1 /* outer /* inner */ delete from t */", .postgres) == null);
+    parts.clearRetainingCapacity();
+    try splitStatements("select 1 # ; delete from t\n; select 2 -- ; delete from t", .mysql, &parts, testing.allocator);
+    try testing.expectEqual(@as(usize, 2), parts.items.len);
+}
+
+test "SQLite bracket identifiers hide semicolons and keywords" {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(testing.allocator);
+    const sql = "select [delete], [a;b] from [table]; select 2";
+    try splitStatements(sql, .sqlite, &parts, testing.allocator);
+    try testing.expectEqual(@as(usize, 2), parts.items.len);
+    try testing.expect(dangerousStatement(sql, .sqlite) == null);
+    try testing.expect(dangerousStatement("select [delete] from t; delete from t where id=1", .sqlite) != null);
+}
 
 test "tokens" {
     const src = "SELECT u.name, 'it''s' AS x -- hi\nFROM \"Users\" u WHERE id = $1 AND n > 3.5";

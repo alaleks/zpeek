@@ -1235,20 +1235,17 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
         grid.writeCell(0, 1, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = theme.border });
         for (columns) |ci| {
             const w = @min(tv.widths.items[ci], grid.width -| col_x -| 3);
-            var name: []const u8 = r.columns[ci];
+            const name = r.columns[ci];
             const marker: []const u8 = blk: {
                 if (tv.browse) |b| if (b.order) |o| if (std.mem.eql(u8, o.column, name)) break :blk if (o.descending) " ↓" else " ↑";
                 if (tv.local_sort) |s| if (s.col == ci) break :blk if (s.desc) " ↓" else " ↑";
                 break :blk "";
             };
-            const keys = tv.keyMarkers(ci);
-            if (keys.len > 0) name = try std.mem.concat(a, u8, &.{ name, keys });
-            if (marker.len > 0) name = try std.mem.concat(a, u8, &.{ name, marker });
             const style: vaxis.Style = if (ci == cur_col) theme.accent_bold else theme.header;
-            drawCell(grid, col_x, 1, w, name, style);
-            if (keys.len > 0 and render.displayWidth(r.columns[ci]) + render.displayWidth(keys) <= w) {
-                var labels: [3]Segment = undefined;
-                var count: usize = 0;
+            var labels: [5]Segment = undefined;
+            labels[0] = .{ .text = name, .style = style };
+            var count: usize = 1;
+            if (tv.browse != null) {
                 if (hasColumn(tv.primary_key.items, r.columns[ci])) {
                     labels[count] = .{ .text = " PK", .style = .{ .fg = theme.warn_color, .bold = true } };
                     count += 1;
@@ -1261,8 +1258,14 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
                     labels[count] = .{ .text = " ↗", .style = .{ .fg = theme.fk_color, .bold = true } };
                     count += 1;
                 }
-                _ = grid.print(labels[0..count], .{ .row_offset = 1, .col_offset = col_x + 1 + @as(u16, @intCast(render.displayWidth(r.columns[ci]))), .wrap = .none });
             }
+            labels[count] = .{ .text = marker, .style = style };
+            count += 1;
+            const header = grid.child(.{ .x_off = col_x + 1, .y_off = 1, .width = w, .height = 1 });
+            _ = header.print(labels[0..count], .{ .wrap = .none });
+            var label_width: usize = 0;
+            for (labels[0..count]) |label| label_width += render.displayWidth(label.text);
+            if (label_width > w and w > 0) header.writeCell(w - 1, 0, .{ .char = .{ .grapheme = "…", .width = 1 }, .style = theme.dim });
             grid.writeCell(col_x + w + 2, 1, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = theme.border });
             col_x += w + 3;
         }
@@ -1271,26 +1274,27 @@ pub fn draw(tv: *TableView, win: vaxis.Window) Allocator.Error!void {
 
     // Body
     const end_row = @min(tv.top + body_h, tv.view.items.len);
-    for (tv.top..end_row, 0..) |vi, screen_row| {
-        const row = r.rows[tv.view.items[vi]];
-        const y: u16 = @intCast(screen_row + 3);
-        const is_cur_row = vi == tv.row;
-        var col_x: u16 = 1;
-        grid.writeCell(0, y, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = theme.border });
-        for (columns, 0..) |ci, column_index| {
-            const w = @min(tv.widths.items[ci], grid.width -| col_x -| 3);
+    var col_x: u16 = 1;
+    for (columns, 0..) |ci, column_index| {
+        const w = @min(tv.widths.items[ci], grid.width -| col_x -| 3);
+        const key_style = if (tv.browse != null) browseCellStyle("", tv.isForeignKeyColumn(ci), hasColumn(tv.primary_key.items, r.columns[ci]), hasColumn(tv.unique_keys.items, r.columns[ci])) else vaxis.Style{};
+        for (tv.top..end_row, 0..) |vi, screen_row| {
+            const row = r.rows[tv.view.items[vi]];
+            const y: u16 = @intCast(screen_row + 3);
+            const is_cur_row = vi == tv.row;
+            if (column_index == 0) grid.writeCell(0, y, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = theme.border });
             const v = row[ci];
-            const text = try render.preview(a, if (tv.browse != null) displayValue(r, ci, v) else v orelse render.null_text, w);
+            const text = try cellPreview(a, if (tv.browse != null) displayValue(r, ci, v) else v orelse render.null_text, w);
             const selected = is_cur_row and ci == cur_col;
             var style: vaxis.Style = if (tv.browse != null)
-                (if (selected) vaxis.Style{ .fg = theme.accent, .reverse = true, .bold = true } else if (is_cur_row) theme.selected else browseCellStyle(v, tv.isForeignKeyColumn(ci), hasColumn(tv.primary_key.items, r.columns[ci]), hasColumn(tv.unique_keys.items, r.columns[ci])))
+                (if (selected) vaxis.Style{ .fg = theme.accent, .reverse = true, .bold = true } else if (is_cur_row) theme.selected else if (v == null) vaxis.Style{ .italic = true } else key_style)
             else if (v == null) theme.null_value else .{};
             if (tv.browse == null and selected) style = theme.selected_cell;
             if (selected or (tv.browse != null and is_cur_row)) fillRow(grid, col_x, y, w + 2, style);
             drawCell(grid, col_x, y, w, text, style);
             grid.writeCell(col_x + w + 2, y, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = if (tv.browse != null and is_cur_row and column_index + 1 < columns.len) theme.selected else theme.border });
-            col_x += w + 3;
         }
+        col_x += w + 3;
     }
     tv.drawRule(grid, columns, @intCast(3 + end_row - tv.top), "└", "┴", "┘");
 
@@ -1429,13 +1433,42 @@ test "FK preview and its controls remain visible on a short terminal" {
     try std.testing.expectEqualStrings("↑", screen.readCell(1, 7).?.char.grapheme);
 }
 
+// drawCell supplies the ellipsis, so printable ASCII needs no owned preview.
+fn cellPreview(a: Allocator, text: []const u8, width: u16) Allocator.Error![]const u8 {
+    const prefix = text[0..@min(text.len, @as(usize, width) + 1)];
+    for (prefix) |byte| {
+        if (byte < 0x20 or byte >= 0x7f) return render.preview(a, text, width);
+    }
+    return prefix;
+}
+
+test "ASCII table previews borrow truncated values without allocating" {
+    var fixed: std.heap.FixedBufferAllocator = .init(&.{});
+    const input = "a long cell value";
+    const preview = try cellPreview(fixed.allocator(), input, 4);
+    try std.testing.expectEqual(input.ptr, preview.ptr);
+    try std.testing.expectEqualStrings("a lon", preview);
+    try std.testing.expectEqualStrings("short", try cellPreview(fixed.allocator(), "short", 10));
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("a¶b", try cellPreview(arena.allocator(), "a\nb", 3));
+    try std.testing.expectEqualStrings("日…", try cellPreview(arena.allocator(), "日本", 3));
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{ .cols = 6, .rows = 1, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(std.testing.allocator);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 6, .height = 1, .screen = &screen };
+    const selected: vaxis.Style = .{ .reverse = true, .fg = theme.accent, .bold = true };
+    drawCell(win, 0, 0, 4, preview, selected);
+    try std.testing.expectEqualStrings("…", screen.readCell(4, 0).?.char.grapheme);
+    try std.testing.expectEqual(selected, screen.readCell(4, 0).?.style);
+}
+
 fn drawCell(win: vaxis.Window, x: u16, y: u16, width: u16, text: []const u8, style: vaxis.Style) void {
     const fit = render.fitWidth(text, width);
     var segs = [_]Segment{.{ .text = fit.text, .style = style }};
     _ = win.print(&segs, .{ .row_offset = y, .col_offset = x + 1, .wrap = .none });
     if (fit.text.len < text.len and width > 0) {
         // mark truncation in the last column of the cell
-        win.writeCell(x + width, y, .{ .char = .{ .grapheme = "…", .width = 1 }, .style = .{ .reverse = style.reverse, .fg = if (style.reverse) .default else theme.muted_color } });
+        win.writeCell(x + width, y, .{ .char = .{ .grapheme = "…", .width = 1 }, .style = style });
     }
 }
 
@@ -1664,5 +1697,36 @@ fn drawChooser(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!
             .{ .text = if (shown) "[x] " else "[ ] ", .style = .{ .fg = if (sel) .default else if (shown) theme.accent else theme.muted_color, .reverse = sel, .bold = shown } },
             .{ .text = render.fitWidth(name, box.width -| 6).text, .style = .{ .fg = if (sel or shown) .default else theme.muted_color, .reverse = sel, .bold = sel } },
         }, .{ .row_offset = row, .wrap = .none });
+    }
+}
+
+test "optional TUI frame benchmark" {
+    if (!@import("build_options").bench_tui) return error.SkipZigTest;
+    for ([_][]const u8{ "short", "a long ASCII value that is deliberately wider than the fifty character cell limit", "日本語の顧客情報とデータベース 日本語の顧客情報とデータベース 日本語の顧客情報とデータベース" }) |value| {
+        var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const a = counted.allocator();
+        const row: [8]?[]const u8 = @splat(value);
+        const rows: [200][]const ?[]const u8 = @splat(&row);
+        var result: db.Result = .{ .arena = .init(a), .columns = &.{ "id", "name", "city", "email", "notes", "status", "created", "updated" }, .rows = &rows };
+        defer result.deinit();
+        const tv = try TableView.init(a, &result, false, "bench", .{ .table = "bench" }, "", null);
+        defer tv.deinit();
+        var screen = try vaxis.Screen.init(a, .{ .cols = 120, .rows = 40, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 120, .height = 40, .screen = &screen };
+        for (0..200) |i| {
+            tv.row = i;
+            tv.col = i % 8;
+            try tv.draw(win);
+        }
+        const before = counted.allocations;
+        const start = std.Io.Timestamp.now(std.testing.io, .awake);
+        for (0..2000) |i| {
+            tv.row = i % 200;
+            tv.col = i % 8;
+            try tv.draw(win);
+        }
+        const elapsed = start.untilNow(std.testing.io, .awake).toMicroseconds();
+        std.debug.print("\nTUI {s}: 2000 frames, {d} us, {d} backing allocations, {d} scratch bytes\n", .{ value[0..@min(value.len, 12)], elapsed, counted.allocations - before, tv.frame_arena.queryCapacity() });
     }
 }
