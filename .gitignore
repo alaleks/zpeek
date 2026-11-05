@@ -24,7 +24,6 @@ zpeek-*.zip
 config.toml
 
 # Editor and OS files
-.claude/
 .idea/
 .vscode/
 .DS_Store
