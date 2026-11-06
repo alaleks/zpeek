@@ -46,6 +46,12 @@ class BenchmarkTests(unittest.TestCase):
             report = json.loads(next(Path(tmp).glob("*.json")).read_text())
             self.assertEqual(report["cleanup"], "failed")
 
+    def test_defaults_to_twenty_million_rows(self) -> None:
+        argv = ["run.py", "--zpeek", "fake-zpeek", "--driver", "postgres", "--connection", "test"]
+        with patch("sys.argv", argv), patch.object(run, "benchmark") as benchmark:
+            run.main()
+        self.assertEqual(benchmark.call_args.args[0].rows, 20_000_000)
+
     def test_generators_bound_rows(self) -> None:
         self.assertIn("generate_series(11, 20)", run.insert_sql("postgres", "test", 11, 10))
         self.assertIn("numbers(10)", run.insert_sql("clickhouse", "test", 11, 10))
@@ -74,10 +80,10 @@ class BenchmarkTests(unittest.TestCase):
                             run.main()
                     else:
                         run.main()
-                self.assertTrue(commands[-1][-1].startswith("DROP TABLE IF EXISTS events_"))
                 report = json.loads(next(Path(tmp).glob("*.json")).read_text())
-                self.assertIn(report["database"], commands[-1])
-                self.assertFalse(any(command[-1].startswith("DROP DATABASE") for command in commands))
+                self.assertEqual(commands[-1][-1], f"DROP DATABASE IF EXISTS {report['database']}")
+                self.assertNotIn("--database", commands[-1])
+                self.assertFalse(any(command[-1].startswith("DROP TABLE") for command in commands))
                 self.assertEqual(report["cleanup"], "complete")
                 self.assertEqual(len(report["summary"]), 0 if fail_load else 5)
 

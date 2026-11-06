@@ -80,8 +80,8 @@ These local, warm-cache results came from Linux x86_64 with PostgreSQL 18.6 and 
 
 To measure your own setup, use the [benchmark script](benchmarks/README.md).
 It downloads the latest zpeek release and creates a test database on your server.
-After measuring client CPU and memory with millions of rows, it drops the tables
-it created. The empty test database stays on the server.
+After measuring client CPU and memory with millions of rows, it drops the test database
+it created.
 
 ## Documentation
 

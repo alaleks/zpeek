@@ -2,11 +2,11 @@
 
 `run.py` downloads the latest zpeek release and checks its SHA-256 checksum.
 It creates a new database for the run, then fills a table in that database and
-measures the queries below. When finished, it drops only that table. The empty
-database stays on the server, and its name is saved in the report.
+measures the queries below. When finished, it drops the database it created.
+The database name and cleanup state are saved in the report.
 
-Make sure the server has enough disk space: one million rows contain
-512 MB of payload before indexes and storage overhead. Repeated payload compresses
+Make sure the server has enough disk space: the default twenty million rows contain
+10 GB of payload before indexes and storage overhead. Repeated payload compresses
 well in ClickHouse, so these fixtures are not a model of arbitrary production data.
 
 Requirements: Python 3.10+, internet access to GitHub Releases, and GNU `/usr/bin/time` on
@@ -15,15 +15,15 @@ or database client libraries are required. Run the script on the server if you
 want server-local client measurements; remote connections include network time.
 
 Configure a named zpeek connection with full access. Its account needs permission
-to create databases and manage tables in the database it creates. Keep passwords
+to create and drop databases and manage tables in the database it creates. Keep passwords
 in config/environment. The profile must connect to an existing database, such as
 `postgres` for PostgreSQL or `default` for ClickHouse. That database is used only
-to issue CREATE DATABASE; test data goes into the new database.
+to issue CREATE DATABASE and DROP DATABASE; test data goes into the new database.
 
 ```sh
-python3 benchmarks/run.py --driver postgres --connection bench_pg --rows 1000000
-python3 benchmarks/run.py --driver mysql --connection bench_mysql --rows 1000000
-python3 benchmarks/run.py --driver clickhouse --connection bench_ch --rows 1000000
+python3 benchmarks/run.py --driver postgres --connection bench_pg
+python3 benchmarks/run.py --driver mysql --connection bench_mysql
+python3 benchmarks/run.py --driver clickhouse --connection bench_ch
 ```
 
 Use `--config path/to/config.toml` for a separate configuration, `--rows 20000000`
@@ -59,10 +59,9 @@ This script measures CLI scenarios. For in-memory TUI frame measurements, run
 
 Cleanup is attempted on success, query failure, timeout, Ctrl+C and SIGTERM.
 SIGKILL, machine failure, or loss of database access can prevent cleanup. The JSON
-report is written before setup and records the exact table name and cleanup state;
-if cleanup fails, connect to the database named in the report and drop that
-specific table after connectivity returns. A disconnected
-server may still be finishing a request, so verify the table is gone afterward.
+report is written before setup and records the exact database name and cleanup state;
+if cleanup fails, drop that specific database after connectivity returns. A disconnected
+server may still be finishing a request, so verify the database is gone afterward.
 
 Run script checks without a database:
 

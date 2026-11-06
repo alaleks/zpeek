@@ -22,6 +22,7 @@ zpeek-*.zip
 .env.*
 !.env.example
 config.toml
+local/
 
 # Editor and OS files
 .idea/

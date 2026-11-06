@@ -148,7 +148,7 @@ def main() -> None:
     parser.add_argument("--connection", required=True, help="saved zpeek profile; keep passwords in config/environment")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--zpeek", help="use a local binary instead of downloading the latest release")
-    parser.add_argument("--rows", type=positive, default=1_000_000)
+    parser.add_argument("--rows", type=positive, default=20_000_000)
     parser.add_argument("--runs", type=positive, default=5)
     parser.add_argument("--timeout", type=positive, default=600, help="seconds per command")
     parser.add_argument("--time", default="/usr/bin/time", help="GNU time on Linux, system time on macOS")
@@ -172,6 +172,7 @@ def benchmark(args: argparse.Namespace) -> None:
     if args.config:
         base += ["--config", str(args.config)]
     base += [args.connection, "--driver", args.driver]
+    admin_base = [*base]
 
     def query(sql: str, output: str = "table") -> str:
         return run_process([*base, "--allow-dangerous", "--format", output, "-e", sql], args.timeout)[0]
@@ -225,11 +226,11 @@ def benchmark(args: argparse.Namespace) -> None:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         if attempted:
             try:
-                query(f"DROP TABLE IF EXISTS {table}")
+                run_process([*admin_base, "--allow-dangerous", "--format", "table", "-e", f"DROP DATABASE IF EXISTS {database}"], args.timeout)
                 report["cleanup"] = "complete"
             except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
                 report["cleanup"] = "failed"
-                LOG.error("Cleanup failed for %s; retry DROP TABLE manually: %s", table, error)
+                LOG.error("Cleanup failed for %s; retry DROP DATABASE manually: %s", database, error)
                 raise
             finally:
                 save()
