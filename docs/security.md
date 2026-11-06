@@ -4,9 +4,9 @@
 
 ## Security boundary
 
-**Client-side SQL checks are not a security boundary.** On server databases, functions and triggers can have side effects, including through routines with elevated privileges. A client cannot turn a broadly privileged database account into a reliably restricted one simply by inspecting SQL text.
+**Use database permissions to control what an account can do.** zpeek checks SQL before sending it, but those checks cannot catch every side effect of a function or trigger. Some routines also run with privileges that the calling account does not normally have.
 
-For hard guarantees, use database permissions: a role with only the required `SELECT` and, when needed, `DELETE` grants, without schema ownership or DDL privileges. Review callable routines and triggers with elevated privileges too. The configured modes below provide additional safeguards within zpeek.
+For a restricted account, grant only the required `SELECT` permissions and add `DELETE` if needed. Avoid schema ownership and DDL privileges. Review callable routines and triggers with elevated privileges as well. zpeek's access modes add checks on top of those permissions.
 
 ## Access modes
 
@@ -35,7 +35,9 @@ zpeek checks an entire SQL script before executing it. A forbidden statement pre
 
 ## Confirmation in full mode
 
-Interactive SQL containing `DROP`, `TRUNCATE`, `UPDATE`, or `DELETE` opens a review dialog before anything runs. Cancel is selected by default; select **Run SQL** and press `enter` to approve the exact script. A canceled batch executes no statements. All UPDATE/DELETE statements require confirmation because a WHERE clause alone does not guarantee a small change. `DO`, `CALL`, `EXECUTE`, and executable MySQL comments also request confirmation because they can hide other actions.
+SQL containing `DROP`, `TRUNCATE`, `UPDATE`, or `DELETE` opens a confirmation dialog. **Cancel** is selected by default. Choose **Run SQL** and press `enter` to run the script shown. Canceling runs none of it.
+
+Even an UPDATE or DELETE with a WHERE clause needs confirmation: the condition could match every row. Commands that can hide other actions also need approval, including `DO`, `CALL`, `EXECUTE` and executable MySQL comments.
 
 For CLI execution, approval is explicit:
 
@@ -43,7 +45,9 @@ For CLI execution, approval is explicit:
 zpeek prod -e 'update users set active = false where last_seen < current_date - 365' --allow-dangerous
 ```
 
-Without `--allow-dangerous`, these scripts are refused. The flag does not bypass `read_only`/`read_delete` restrictions or the DELETE-without-WHERE safeguard. Selected-row deletion in `/browse` retains its own confirmation. `/explain` generates a plan without ANALYZE; it does not use confirmation to execute the underlying write.
+Without `--allow-dangerous`, zpeek refuses these scripts. The flag does not override a restricted access mode or allow DELETE without WHERE. Deleting a row in `/browse` still asks for confirmation.
+
+`/explain` asks for a plan without ANALYZE. It does not execute the write to obtain runtime statistics.
 
 These safeguards do not discover arbitrary side effects in database functions; the [security boundary](#security-boundary) still applies.
 
@@ -63,7 +67,7 @@ In `read_delete`, SQLite additionally uses its authorizer to reject other writes
 
 ## Deleting rows
 
-zpeek refuses `DELETE` without a top-level `WHERE` clause. A `WHERE` inside a subquery, string, or comment does not satisfy the safeguard. `WHERE true` explicitly deletes every row; this check is protection against accidental omission, not a promise that a deletion affects only a few rows.
+zpeek refuses `DELETE` without a top-level `WHERE` clause. A WHERE inside a subquery does not count; neither does one in quoted text or a comment. This catches a missing condition, but it cannot judge the condition itself. `WHERE true` still deletes every row.
 
 In `/browse`, `d` prepares deletion of the selected row for confirmation. It requires a primary key and is unavailable for ClickHouse or `read_only` connections.
 

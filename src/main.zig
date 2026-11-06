@@ -137,7 +137,10 @@ fn applyFields(arena: Allocator, cli: Cli, base: ?config.Entry, stderr: *Io.Writ
             return error.InvalidArgs;
         } };
     };
-    if (cli.driver) |d| p.kind = conninfo.Kind.fromName(d) orelse p.kind;
+    if (cli.driver) |d| p.kind = conninfo.Kind.fromName(d) orelse {
+        try stderr.print("zpeek: unknown driver '{s}'\n", .{d});
+        return error.InvalidArgs;
+    };
     if (cli.host) |v| p.host = v;
     if (cli.port) |v| p.port = std.fmt.parseInt(u16, v, 10) catch {
         try stderr.print("zpeek: invalid port '{s}'\n", .{v});
@@ -413,4 +416,14 @@ test {
     _ = @import("ui/TableView.zig");
     _ = @import("ui/complete.zig");
     _ = @import("queries.zig");
+}
+
+test "unknown driver rejects saved and new connections" {
+    var buffer: [256]u8 = undefined;
+    var stderr: Io.Writer = .fixed(&buffer);
+    const saved: config.Entry = .{ .name = "local", .params = .{ .kind = .sqlite, .database = ":memory:" } };
+    for ([_]?config.Entry{ null, saved }) |base| {
+        try std.testing.expectError(error.InvalidArgs, applyFields(std.testing.allocator, .{ .driver = "definitely_invalid" }, base, &stderr));
+    }
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "unknown driver") != null);
 }

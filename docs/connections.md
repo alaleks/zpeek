@@ -25,9 +25,9 @@ PostgreSQL also accepts `postgresql://` and libpq-style parameters:
 zpeek 'host=localhost port=5432 user=postgres dbname=app'
 ```
 
-In the console, `/connect <name|url>` switches connections; `/connect` opens the picker and `/disconnect` closes the current connection. URLs and paths passed to `/connect` are redacted in the transcript and history.
+Use `/connect` to choose a connection. If you know its name or URL, enter `/connect <name|url>` directly. `/disconnect` closes the current connection. zpeek hides connection URLs and paths in its transcript and history.
 
-Connecting directly by URL creates an ad-hoc connection with `full` access. To use a saved entry's restrictions, connect by its name. The active access mode is shown in the connection message and footer. See [access modes](security.md#access-modes).
+A direct URL connection uses `full` access. Connect by a saved name to use that profile's restrictions. You can check the active mode in the footer. See [access modes](security.md#access-modes).
 
 ## Saved connections
 
@@ -62,7 +62,7 @@ zpeek shop
 zpeek shop -e 'select count(*) from users'
 ```
 
-With no argument, zpeek uses `default`, selects the only saved connection if there is just one, or opens the connection picker. Named connections and the picker reload the config before connecting, so external edits are picked up.
+Running `zpeek` without an argument opens your `default` connection. Without a default, it opens the only saved connection if there is one; otherwise it asks you to choose. The config is read again before connecting to a saved profile, so you can edit it outside zpeek.
 
 Connection fields such as `host`, `port`, `user`, `password`, and `database` override values from `url`. See the [complete field reference](configuration.md#toml-fields) and [in-app editor](configuration.md#edit-the-file-inside-zpeek).
 
@@ -80,7 +80,7 @@ Saved queries live in a `queries` directory beside the selected config file.
 
 ## Passwords and environment variables
 
-For a saved connection, `password_env = "SHOP_DB_PASSWORD"` reads the password from the named environment variable. If that variable is missing, it does not prevent loading the rest of the configuration.
+Set `password_env = "SHOP_DB_PASSWORD"` to read a saved connection's password from that variable. It takes precedence over the URL password and the `password` field. If the variable is missing, the password is cleared and the rest of the config still loads.
 
 An empty connection password can also be filled from the driver-specific variable:
 
@@ -100,7 +100,7 @@ Connection URLs accept `sslmode=disable|prefer|require|verify-ca|verify-full`; t
 zpeek 'postgres://user@host:5432/db?sslmode=verify-full'
 ```
 
-Saved entries can use a separate `sslmode = "verify-full"` field. ClickHouse uses HTTP on port 8123 or HTTPS on 8443. Select the TLS mode appropriate for your deployment rather than assuming the default guarantees an encrypted connection.
+Saved entries can use a separate `sslmode = "verify-full"` field. ClickHouse uses HTTP on port 8123 or HTTPS on 8443. The default `prefer` mode does not guarantee encryption. Set the mode explicitly when your connection requires TLS.
 
 ## CLI connection fields
 
@@ -110,4 +110,4 @@ You can supply or override connection fields with `--driver`, `--host`, `--port`
 zpeek --driver postgres --host localhost --port 5432 --user postgres --database app
 ```
 
-`--driver` accepts `postgres`, `mysql`, `mariadb`, `sqlite`, or `clickhouse`. See `zpeek --help` for the full CLI reference.
+`--driver` accepts `postgres`, `mysql`, `mariadb`, `sqlite`, or `clickhouse`. An unknown name is an argument error, including when overriding a saved profile. Run `zpeek --help` for all CLI options.

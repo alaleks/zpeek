@@ -30,4 +30,3 @@ config.toml
 *.swp
 *.swo
 *~
-benchmarks

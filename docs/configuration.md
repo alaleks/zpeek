@@ -2,7 +2,7 @@
 
 [← README](../README.md) · [Connections](connections.md) · [Security](security.md) · [Usage](usage.md)
 
-The configuration is TOML. Run `zpeek --init-config` to create an example, or `/config edit` to edit the active file inside zpeek. See [configuration location](connections.md#configuration-location) for path selection.
+zpeek stores connections in a TOML file. Run `zpeek --init-config` to create an example. To change it inside zpeek, use `/config edit`. See [where the file lives](connections.md#configuration-location).
 
 ## TOML fields
 
@@ -33,7 +33,9 @@ access = "read_only"
 | `access` | `"full"` (default), `"read_only"`, or `"read_delete"`; see [security](security.md) |
 | `read_only` | Legacy boolean: `true` means `"read_only"`, `false` means `"full"`; prefer `access` |
 
-Explicit connection fields override values parsed from `url`. Do not put `access` or `read_only` at the top level: they belong inside a connection section. Conflicting `access` and `read_only` values are rejected. Excessive TOML nesting is rejected with a diagnostic rather than parsed without a depth limit.
+Fields such as `host` override the corresponding part of `url`. If you set `password_env`, its value replaces any password from the URL or `password` field. A missing variable leaves that password empty; see [password fallback](connections.md#passwords-and-environment-variables).
+
+Put `access` and `read_only` inside a connection section. zpeek reports an error if they conflict or appear at the top level. It also rejects TOML that exceeds its nesting limit.
 
 ## Save and remove connections
 
@@ -43,11 +45,11 @@ Explicit connection fields override values parsed from `url`. Do not put `access
 /config remove local
 ```
 
-`/config` lists saved connections and shows examples. `add` requires a name, a color, and a URL or SQLite path. The URL/path is the rest of the line, so SQLite paths may contain spaces; do not add quotes around it.
+`/config` lists your connections and shows command examples. The `add` syntax is `/config add <name> <color> <url-or-path>`. The path takes up the rest of the line, so spaces are allowed. Do not put quotes around it.
 
 Existing names are rejected; remove an entry before adding it again, or edit it through `/config edit`. `/config remove local` removes the entry and its `default` reference without closing an open connection. These commands use the active config path, including `--config`, and update the connection picker immediately.
 
-Changes replace the file atomically. Settings and `password_env` references are retained, but `add` and `remove` rewrite comments and formatting. New or replaced files are private to the user on Unix. `/config add` arguments are redacted in the transcript and command history.
+zpeek writes a replacement file before swapping it into place. The `add` and `remove` commands keep your settings, including `password_env`, but rewrite comments and formatting. Use `/config edit` if you want to keep those too. New or replaced files are private to your user on Unix. The transcript and history hide `/config add` arguments.
 
 ## Edit the file inside zpeek
 
@@ -64,7 +66,7 @@ Open the editor with `/config edit`:
 
 Your SQL input is restored when the editor closes. Invalid TOML or connection settings stay in the editor with an error message; the file is unchanged. Comments and formatting are preserved when editing this way. Saving refuses to overwrite a file changed outside zpeek since it was opened. Config text is not added to command history.
 
-The parameter reference shows supported keys, examples, and allowed values. It sits beside the editor in a wide terminal or below it otherwise. A divider and padding separate the panels. Long connection strings wrap with indented continuation lines, and reference text wraps within its panel; visual wraps do not change the file.
+Press `F1` to see help for the settings. In a wide terminal, help appears beside the editor; in a narrow one, it appears below. Long lines wrap on screen without adding line breaks to the file.
 
 The connection list updates immediately after saving. Changing the active connection's access mode, or removing its entry through the editor, closes the old session. Use `/connect <name>` to apply the saved settings. Other connection parameter changes require reconnecting as well.
 
@@ -78,4 +80,6 @@ Setting names complete while typing or with `tab`. Value lists are available for
 - `read_only`: `true`, `false`.
 - `default`: saved connection names.
 
-Use arrows to select, `enter`/`tab` to accept, and `esc` to dismiss the list. Completion preserves quotes and trailing comments, including when editing the middle of a value. Color, connection strings, passwords, and other free-form values are entered manually. Completion supports ordinary fields in TOML sections; inline tables and multiline values are left alone.
+Move through suggestions with the arrow keys and accept one with `enter` or `tab`. Press `esc` to close the list. Completion keeps existing quotes and trailing comments, even when you edit the middle of a value.
+
+Enter free-form values such as passwords yourself. Completion works on ordinary fields in TOML sections. It does not change inline tables or multiline values.

@@ -197,7 +197,7 @@ fn entryParams(arena: Allocator, env: *const std.process.Environ.Map, t: *const 
     if (try getString(t, "password_env")) |name| {
         // A missing variable must not break the whole config: the password
         // stays empty and only this connection fails to authenticate.
-        if (env.get(name)) |pw| params.password = pw;
+        params.password = env.get(name) orelse "";
     }
     if (try getString(t, "database")) |v| params.database = v;
     if (t.get("read_only")) |v| switch (v) {
@@ -535,4 +535,21 @@ test "config errors" {
     try testing.expectError(error.InvalidConfig, parse(a, &env, "c", "default = \"nope\"\n", &diag));
     try testing.expectError(error.InvalidConfig, parse(a, &env, "c", "[connections.x]\nurl = \"postgres://h/db\"\ncolor = \"green\"\n", &diag));
     try testing.expectError(error.InvalidConfig, parse(a, &env, "c", "[connections.x]\nurl = \"postgres://h/db\"\nread_only = \"yes\"\n", &diag));
+}
+
+test "password_env overrides URL and explicit password even when absent" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    const src = "[connections.pg]\nurl='postgres://user:old@localhost/db'\npassword='explicit'\npassword_env='ZPEEK_TEST_PASSWORD'\n";
+    var diag: Diagnostic = .{};
+    const missing = try parse(a, &env, "test.toml", src, &diag);
+    try testing.expectEqualStrings("", missing.find("pg").?.params.password);
+    try env.put("ZPEEK_TEST_PASSWORD", "replacement");
+    const present = try parse(a, &env, "test.toml", src, &diag);
+    try testing.expectEqualStrings("replacement", present.find("pg").?.params.password);
+    try env.put("ZPEEK_TEST_PASSWORD", "");
+    const empty = try parse(a, &env, "test.toml", src, &diag);
+    try testing.expectEqualStrings("", empty.find("pg").?.params.password);
 }

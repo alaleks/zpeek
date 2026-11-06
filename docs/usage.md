@@ -2,7 +2,7 @@
 
 [← README](../README.md) · [Connections](connections.md) · [Configuration](configuration.md) · [Security](security.md)
 
-Type SQL or a `/command` at the prompt. SQL completion uses the connected database's dialect and schema; `tab` accepts a suggestion. `/help` lists commands and keys inside the app.
+Type SQL at the prompt, or start a command with `/`. Press `tab` to accept a completion suggestion. Suggestions use the connected database's dialect and schema. Type `/help` when you need a reminder of the keys.
 
 ## Commands
 
@@ -52,7 +52,9 @@ After selecting a view in `/views`, use `/copy` or `ctrl+y` with empty input to 
 
 ## Browse tables
 
-In browse, key columns are marked `PK`, `UQ`, or `↗` (foreign key). Key values use color and bold; ordinary values keep the terminal's text color, and `NULL` is italic. The selected row uses the terminal's reverse style, with the current cell emphasized in color. `UQ` marks a column participating in a unique index; a column in a composite index may not be unique on its own.
+Open `/tables` and choose a table to browse its rows. The current row is highlighted across the table, and the active cell has its own color.
+
+Headers identify key columns: `PK` means primary key, `UQ` means a column belongs to a unique index, and `↗` marks a foreign key. A column in a composite unique index may still contain duplicates on its own. Ordinary values use your terminal's text color; `NULL` appears in italics.
 
 | Key | Action |
 | --- | --- |
@@ -74,19 +76,19 @@ In browse, key columns are marked `PK`, `UQ`, or `↗` (foreign key). Key values
 
 Row deletion requires a primary key and is unavailable for ClickHouse or read-only connections. See [deletion safeguards](security.md#deleting-rows).
 
-In the standalone query-result viewer, local sorting prepares numeric keys once. Ascending order puts numbers before text and NULLs; descending order reverses this. Signed 64-bit integers are compared exactly, including values above the exact-integer range of `f64`. Non-finite values such as NaN are sorted as text. Browse mode uses database-side sorting.
+Browse mode asks the database to sort rows. The query-result viewer sorts its saved rows locally. In ascending order, numbers come first, followed by text, with NULLs last. Descending order reverses that order. Large signed 64-bit integers keep their exact order; values such as NaN are treated as text.
 
 ## Save and select SQL
 
 Press `ctrl+s` to save SQL from the editor without executing it. With empty input, zpeek saves the last executed SQL instead. Type a name and press `enter`; `tab` selects an existing name. Replacing an existing query requires confirmation. `esc` cancels without changing your input.
 
-Press `ctrl+r` or run `/queries` to search by name or SQL text and preview the selected query. `enter` loads it into the editor for review. Loading replaces current input and **does not execute SQL**. `/queries <name>` loads a query directly; `/save <name>` saves without the naming dialog.
+Press `ctrl+r` or run `/queries` to find a saved query by name or SQL text. You can preview it before pressing `enter` to load it. This replaces your current input without running the query. `/queries <name>` loads a known query directly; `/save <name>` skips the naming dialog.
 
 Queries are ordinary `<name>.sql` files in the `queries` directory beside the active config. Names use letters, digits, `_`, `-`, and `.`; queries can also be edited outside zpeek.
 
 ## SQL history
 
-Press `alt+r` or run `/history [search]` to search SQL inputs, including multiline SQL. The list shows newest inputs first with a SQL preview. `enter` loads the selection into the editor without executing it; `esc` preserves your draft. Slash commands are excluded from this picker. Canceled or refused SQL inputs may still appear: history records input, not proof of execution.
+Press `alt+r` or run `/history [search]` to find earlier SQL, including multiline queries. The newest entries appear first. Press `enter` to load an entry without running it, or `esc` to keep your draft. Slash commands do not appear here. An entry may have been canceled or refused, so its presence does not mean it ran successfully.
 
 History retains at most 1,000 console entries and 16 MiB. It is streamed to a temporary file and atomically replaced on exit at `$XDG_STATE_HOME/zpeek/history`, otherwise `$HOME/.local/state/zpeek/history`, or `%LOCALAPPDATA%\zpeek\history` on Windows without `HOME`. Connection commands remain redacted.
 
@@ -101,7 +103,9 @@ Export the last retained query result:
 
 Omit the path to enter it in a dialog. In a table or plan viewer, press `e`, choose CSV or JSON, and enter a new file path. Table export includes the current visible columns and retained rows in their displayed sort/filter order. In `/browse`, that means the current page, not the entire database table.
 
-Export writes through a fixed-size buffer to an atomic file and refuses to overwrite an existing path. Files created this way are private to the user on Unix. CSV includes headers, quotes text fields, preserves embedded newlines and quotes, and represents SQL NULL as an empty field. JSON is an array of objects: non-NULL database values remain strings, preserving numeric precision, and SQL NULL becomes JSON `null`. JSON requires unique column names; use SQL aliases for duplicate names.
+The export command refuses to overwrite an existing file. It writes a temporary file and moves it into place when complete. On Unix, the new file is private to your user.
+
+CSV includes a header row and preserves quotes and newlines inside values. SQL NULL becomes an empty field. JSON exports an array of objects, with ordinary values stored as strings so numeric precision is preserved. SQL NULL becomes JSON `null`. Use SQL aliases if your result has duplicate column names: JSON export requires unique names.
 
 For scripts, CSV/JSON go to stdout while timing and status go to stderr:
 
@@ -116,7 +120,9 @@ Shell redirection controls these files and can overwrite them. Export uses retai
 
 Interactive statement results show elapsed milliseconds and the affected-row count when the driver reports it, including zero affected rows. Table and plan viewers also show the query duration in their footer. CLI table output shows these metrics; `--format csv`/`json` sends them to stderr so exported data stays parseable.
 
-Duration measures the client-observed query call, including transfer and decoding, rather than server-only CPU time. Each interactive statement gets its own metrics. For a CLI script with multiple statements, the displayed result and affected count describe the driver's final result. SQLite `RETURNING` writes are finished even when retained rows are capped, so their affected count remains accurate.
+The duration includes transferring and decoding the response. It is not a measurement of server CPU time. In the console, each statement gets its own timing. For a CLI script with several statements, the displayed result and affected count come from the driver's final result.
+
+SQLite finishes a `RETURNING` write even if zpeek has reached its row limit. The affected-row count therefore includes all rows changed by that statement.
 
 ## Query plans
 
@@ -125,7 +131,7 @@ Duration measures the client-observed query call, including transfer and decodin
 /explain
 ```
 
-The second form uses the last submitted query. One SELECT or DML statement is accepted; multiple statements, PRAGMAs, and nested EXPLAIN commands are refused. Connection access checks still apply, and individual databases determine which statement types they can explain.
+The second form uses your last submitted query. Supply one SELECT or DML statement. PRAGMAs are not supported here, and an existing EXPLAIN command cannot be wrapped in another one. Your connection's access checks still apply. The database decides which statements it can explain.
 
 Plans open in the full-screen table viewer. Move between steps and columns, use `enter` to read a full step, `y` to copy a cell, `e` to export, and `q` to return. zpeek uses `EXPLAIN QUERY PLAN` for SQLite, `EXPLAIN PLAN` for ClickHouse, and `EXPLAIN` for PostgreSQL/MySQL. It never adds `ANALYZE`; normal EXPLAIN plans a statement rather than executing it. See the official [SQLite](https://www.sqlite.org/eqp.html), [PostgreSQL](https://www.postgresql.org/docs/18/sql-explain.html), [MySQL](https://dev.mysql.com/doc/refman/8.4/en/explain.html), and [ClickHouse](https://clickhouse.com/docs/reference/statements/explain) references.
 
@@ -135,7 +141,9 @@ The console shows 50 rows. `ctrl+o` opens the retained result in the full-screen
 
 Once a newer result arrives, older results keep only cell previews for the first 50 rows. Full cell values, viewing and export remain available for the newest retained result.
 
-An interactive SQL batch retains at most 32 MiB of result arena and row-index capacity across its statements. Each query also respects the remaining row-data budget. If the returned storage exceeds that budget, its result is discarded and subsequent statements are skipped with an explicit error. The statement that produced that result has already executed; earlier changes are not rolled back. This is a retained-result limit, not a process memory limit: an in-flight result, SQL text, driver buffers and UI state consume additional memory.
+An interactive SQL batch has a 32 MiB budget for saved results, including their row indexes and allocated capacity. Each query also has to fit within the remaining row-data budget. If a returned result exceeds the budget, zpeek discards it, reports an error and skips the remaining statements.
+
+The statement that produced that result has already run. Earlier changes are not rolled back. The process can use more than 32 MiB because active queries and the interface need memory too.
 
 Cell previews inspect at most 4 KiB of each value before normalization and clipping. Full retained values remain available in the detail viewer and exports. Temporary rendering and completion arenas retain at most 256 KiB on reset; a larger individual frame can still allocate more. CLI table rendering keeps column widths and one normalized cell at a time.
 
@@ -149,7 +157,7 @@ sqlite3 /tmp/zpeek-demo.db < examples/demo.sql
 ./zig-out/bin/zpeek /tmp/zpeek-demo.db
 ```
 
-The sample script recreates its `customers` and `orders` tables; use a disposable database file. The [40-second video shot list](../examples/demo-video.md) focuses on browsing, FK navigation, SQL completion, and switching between two local SQLite profiles. Its [VHS tape](../examples/demo.tape) produces the terminal segment as a GIF and silent MP4. Regenerate them from the repository root with VHS and its recording dependencies installed:
+Use a disposable database file: the sample script recreates `customers` and `orders`. The [video shot list](../examples/demo-video.md) describes the full demo. The [VHS tape](../examples/demo.tape) records its terminal portion as a GIF and silent MP4. To record it again, install VHS and its dependencies, then run this from the repository root:
 
 ```sh
 vhs examples/demo.tape

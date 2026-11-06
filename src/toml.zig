@@ -349,6 +349,15 @@ const Parser = struct {
                 const next = if (p.pos + 1 < p.src.len) p.src[p.pos + 1] else 0;
                 if (next == '\n' or next == '\r' or next == ' ' or next == '\t') {
                     p.advance();
+                    while (p.peek()) |w| {
+                        if (w != ' ' and w != '\t') break;
+                        p.advance();
+                    }
+                    if (p.startsWith("\r\n")) {
+                        p.pos += 2;
+                    } else if (p.startsWith("\n")) {
+                        p.advance();
+                    } else return p.fail("line continuation requires a newline");
                     while (p.peek()) |w| switch (w) {
                         ' ', '\t', '\r', '\n' => p.advance(),
                         else => break,
@@ -452,4 +461,19 @@ test "syntax error reports line" {
     var diag: Diagnostic = .{};
     try testing.expectError(error.SyntaxError, parse(arena.allocator(), "a = 1\nb = \"x\n", &diag));
     try testing.expectEqual(@as(usize, 2), diag.line);
+}
+
+test "multiline continuation requires LF or CRLF after optional spaces" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ " ", "\t", "\r", " \r" }) |gap| {
+        const src = try std.mem.concat(a, u8, &.{ "value = \"\"\"a\\", gap, "b\"\"\"" });
+        try testing.expectError(error.SyntaxError, parse(a, src, null));
+    }
+    for ([_][]const u8{ "\n", " \t\n  ", "\r\n", " \t\r\n  \n  " }) |gap| {
+        const src = try std.mem.concat(a, u8, &.{ "value = \"\"\"a\\", gap, "b\"\"\"" });
+        const root = try parse(a, src, null);
+        try testing.expectEqualStrings("ab", root.get("value").?.string);
+    }
 }

@@ -1,20 +1,24 @@
 <h1 align="center"><img src="src/zpeek-icon-v2.png" alt="" width="48"> zpeek</h1>
 
-<p align="center"><strong>Browse tables. Follow foreign keys. Run SQL.</strong></p>
+<p align="center"><strong>Browse tables. Follow foreign keys. Keep working.</strong></p>
 
 <p align="center">A keyboard-driven database client for your terminal.<br>PostgreSQL · MySQL/MariaDB · SQLite · ClickHouse</p>
 
 ![zpeek: browse orders, follow customer_id, run SQL with autocomplete, and switch between dev and prod demo databases](examples/demo.gif)
 
-## What you can do
+## Less setup, more time with your data
 
-- **Explore tables** in a readable TUI: filter and sort rows, choose columns, and inspect full values.
-- **Follow foreign keys** with `f` to see the related record without writing a join.
-- **Write SQL** with syntax highlighting and completion; reuse queries from history or saved files.
-- **Switch databases** with named connections and color badges, so you can tell environments apart.
-- **Inspect schemas and query plans**, export CSV/JSON, and choose access modes per connection.
+Sometimes you just want to check a row, follow a foreign key, or run a quick query. zpeek lets you do that without leaving your editor's terminal, and it works over SSH when the database is on a remote server.
+
+- Filter and sort rows, choose which columns to show, and inspect full values in a readable TUI.
+- Select a foreign-key value and press `f` to jump to the related record instead of writing a join by hand.
+- Write SQL with built-in syntax highlighting, autocomplete, query history, and saved queries.
+- Tell environments apart with named connections and color badges for dev and prod.
+- Inspect schemas and query plans, export results as CSV or JSON, and set an access mode for each connection.
 
 ## Quick start
+
+### 1. Install zpeek
 
 Download a binary from [GitHub Releases](https://github.com/alaleks/zpeek/releases), or install it from the terminal:
 
@@ -30,13 +34,15 @@ curl -fsSL https://raw.githubusercontent.com/alaleks/zpeek/master/install.sh | b
 irm https://raw.githubusercontent.com/alaleks/zpeek/master/install.ps1 | iex
 ```
 
-To build from source with Zig 0.17.0:
+Prefer to build it yourself? With Zig 0.17.0:
 
 ```sh
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
 ```
 
-Open an existing SQLite database:
+### 2. Open a database
+
+Already have a SQLite file? That is enough:
 
 ```sh
 zpeek ./data.sqlite
@@ -50,30 +56,49 @@ zpeek 'mysql://user@host:3306/db'
 zpeek 'clickhouse://user@host:8123/db'
 ```
 
-Inside zpeek, type `/tables`, pick a table, and press `enter`. Select an FK value and press `f` to follow it, or type SQL at the prompt. Use `/connect` to switch between [saved connections](docs/connections.md#saved-connections). See [connections and TLS](docs/connections.md) for passwords and other options.
+See [connections and TLS](docs/connections.md) for passwords, connection options, and setup details.
 
-## Why zpeek?
+### 3. Find your way around
 
-I built zpeek to check data without leaving my editor's terminal. It also works over SSH: one binary with built-in drivers, with connections and saved SQL in ordinary files you can edit yourself.
+A typical first session looks like this:
+
+1. Type `/tables`, choose a table, and press `enter`.
+2. Filter or sort the rows until you find something interesting.
+3. Select a foreign-key value and press `f` to see the related record.
+4. Press `q` to return to the prompt and run SQL.
+5. Use `/connect` to jump between [saved connections](docs/connections.md#saved-connections).
+
+## Why I built zpeek
+
+My editor didn't have a database client, and I was tired of switching between windows just to connect to a database. The tools I used also consumed more system resources than I liked, even while sitting in the background.
+
+I wanted to open a table, follow a relationship, and get back to work from the same terminal. I chose Zig because it had worked well for me before, and built zpeek around that workflow.
+
+The result is a single binary with built-in drivers that also works over SSH. Connections and saved SQL live in ordinary files you can edit yourself, so your setup stays yours.
 
 ## Benchmarks
 
-In November 2026, separate Linux x86_64 runs with PostgreSQL 18.6 on localhost and Zig 0.17.0 `ReleaseSafe` builds measured:
+Here are two results from local PostgreSQL benchmarks:
 
-- **10.27 MiB peak RSS** across 15 TUI cycles of querying, browsing, sorting, and clearing results ([TUI run](docs/benchmarks/linux-2026-11-03/REPORT.md)).
-- **1.56 s median wall time** for a 20-million-ID SQL response, including startup and connection, with **35.18 MiB peak RSS** ([full-response run](docs/benchmarks/linux-2026-11-03/OPTIMIZATION.md)).
+- **10.27 MiB peak RSS** after 15 rounds of querying, browsing, sorting, and clearing results in the TUI.
+- **1.56 s median** to read a 20-million-ID SQL response, including startup and connection, with **35.18 MiB peak RSS**.
 
-The large-result run read the full response but retained at most 16 MiB of row data. These were local, warm-cache measurements; the reports include the setup and raw results.
+These local, warm-cache results came from Linux x86_64 with PostgreSQL 18.6 and Zig 0.17.0 `ReleaseSafe`, so your numbers may differ. The large-result test retained at most 16 MiB of row data.
+
+To measure your own setup, use the [benchmark script](benchmarks/README.md).
+It downloads the latest zpeek release and creates a test database on your server.
+After measuring client CPU and memory with millions of rows, it drops the tables
+it created. The empty test database stays on the server.
 
 ## Documentation
 
-| Guide | Covers |
+| Guide | What you will find |
 | --- | --- |
 | [Connections](docs/connections.md) | URLs, saved profiles, TLS, environment variables, supported databases |
 | [Configuration](docs/configuration.md) | TOML fields, `/config` commands, editor, help panel, autocomplete |
 | [Security](docs/security.md) | Access modes, SQL checks, deletion safeguards, server-side permissions |
 | [Usage](docs/usage.md) | Commands, keys, table browsing, saved queries, result limits, demo reproduction |
 
-Client-side SQL checks **are not a security boundary**. Use database permissions for hard guarantees; [read the limitations](docs/security.md#security-boundary).
+One important caveat: client-side SQL checks **are not a security boundary**. Use database permissions for hard guarantees, and [read the limitations](docs/security.md#security-boundary) before relying on access modes.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) to build and contribute. Licensed under [MIT](LICENSE).
+Want to hack on zpeek? See [CONTRIBUTING.md](CONTRIBUTING.md). Licensed under [MIT](LICENSE).

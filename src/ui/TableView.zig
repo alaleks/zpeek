@@ -594,8 +594,9 @@ fn handleFilterKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
         tv.editing_filter = false;
         const text = std.mem.trim(u8, e.text(), " \t");
         if (tv.browse) |*b| {
+            const filter = try tv.gpa.dupe(u8, text);
             tv.gpa.free(b.filter);
-            b.filter = try tv.gpa.dupe(u8, text);
+            b.filter = filter;
             b.offset = 0;
             b.total = null;
             return .reload;
@@ -1099,8 +1100,16 @@ fn toggleSort(tv: *TableView) Allocator.Error!Action {
         // asc -> desc -> none
         if (b.order) |o| {
             const same = std.mem.eql(u8, o.column, name);
-            tv.gpa.free(o.column);
-            b.order = if (same and !o.descending) .{ .column = try tv.gpa.dupe(u8, name), .descending = true } else if (same) null else .{ .column = try tv.gpa.dupe(u8, name) };
+            if (same and !o.descending) {
+                b.order.?.descending = true;
+            } else if (same) {
+                b.order = null;
+                tv.gpa.free(o.column);
+            } else {
+                const column = try tv.gpa.dupe(u8, name);
+                b.order = .{ .column = column };
+                tv.gpa.free(o.column);
+            }
         } else {
             b.order = .{ .column = try tv.gpa.dupe(u8, name) };
         }
@@ -1729,4 +1738,27 @@ test "optional TUI frame benchmark" {
         const elapsed = start.untilNow(std.testing.io, .awake).toMicroseconds();
         std.debug.print("\nTUI {s}: 2000 frames, {d} us, {d} backing allocations, {d} scratch bytes\n", .{ value[0..@min(value.len, 12)], elapsed, counted.allocations - before, tv.frame_arena.queryCapacity() });
     }
+}
+
+test "browse allocation failures preserve owned filter and sort" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const a = failing.allocator();
+    var result: db.Result = .{ .arena = .init(a), .columns = &.{ "id", "name" }, .rows = &.{&.{ "1", "Ada" }} };
+    defer result.deinit();
+    const tv = try TableView.init(a, &result, false, "t", .{ .table = "t", .filter = "id=1", .order = .{ .column = "id" } }, "", null);
+    defer tv.deinit();
+    try tv.filter_editor.setText("id=2");
+    tv.editing_filter = true;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, tv.handleFilterKey(.{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expectEqualStrings("id=1", tv.browse.?.filter);
+    tv.col = 1;
+    try std.testing.expectError(error.OutOfMemory, tv.toggleSort());
+    try std.testing.expectEqualStrings("id", tv.browse.?.order.?.column);
+    try std.testing.expect(!tv.browse.?.order.?.descending);
+    tv.col = 0;
+    _ = try tv.toggleSort();
+    try std.testing.expect(tv.browse.?.order.?.descending);
+    _ = try tv.toggleSort();
+    try std.testing.expect(tv.browse.?.order == null);
 }
