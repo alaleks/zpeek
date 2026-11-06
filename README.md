@@ -1,20 +1,18 @@
 <h1 align="center"><img src="src/zpeek-icon-v2.png" alt="" width="48"> zpeek</h1>
 
-<p align="center"><strong>Browse tables. Follow foreign keys. Keep working.</strong></p>
+<p align="center"><strong>Your databases, one terminal.</strong></p>
 
-<p align="center">A keyboard-driven database client for your terminal.<br>PostgreSQL · MySQL/MariaDB · SQLite · ClickHouse</p>
+<p align="center">PostgreSQL · MySQL/MariaDB · SQLite · ClickHouse</p>
 
 ![zpeek: browse orders, follow customer_id, run SQL with autocomplete, and switch between dev and prod demo databases](examples/demo.gif)
 
 ## Less setup, more time with your data
 
-Sometimes you just want to check a row, follow a foreign key, or run a quick query. zpeek lets you do that without leaving your editor's terminal, and it works over SSH when the database is on a remote server.
+zpeek lets you work with a database without leaving your editor's terminal. Open a table and browse its rows with the keyboard. You can filter the results, hide columns you don't need, or open a cell to read its full value. When a value points to another table, press `f` to see the related record without writing a join.
 
-- Filter and sort rows, choose which columns to show, and inspect full values in a readable TUI.
-- Select a foreign-key value and press `f` to jump to the related record instead of writing a join by hand.
-- Write SQL with built-in syntax highlighting, autocomplete, query history, and saved queries.
-- Tell environments apart with named connections and color badges for dev and prod.
-- Inspect schemas and query plans, export results as CSV or JSON, and set an access mode for each connection.
+For questions that need SQL, the editor provides syntax highlighting and autocomplete. Query history makes it easy to return to earlier work, and you can save queries you use often. Results can be exported as CSV or JSON. Schema inspection and query plans help when you need to understand how a query works.
+
+Saved connections keep your databases close at hand. Each connection can have an access mode, while color badges help you tell dev from prod. zpeek also works over SSH, so you can use the same interface on a remote server.
 
 ## Quick start
 
@@ -60,28 +58,23 @@ See [connections and TLS](docs/connections.md) for passwords, connection options
 
 ### 3. Find your way around
 
-A typical first session looks like this:
+Type `/tables` to choose a table, then press `enter` to open it. Filter or sort the rows to find what you need. If a cell contains a foreign key, select it and press `f` to open the related record.
 
-1. Type `/tables`, choose a table, and press `enter`.
-2. Filter or sort the rows until you find something interesting.
-3. Select a foreign-key value and press `f` to see the related record.
-4. Press `q` to return to the prompt and run SQL.
-5. Use `/connect` to jump between [saved connections](docs/connections.md#saved-connections).
+Press `q` to return to the SQL prompt. When you need another database, use `/connect` to switch between [saved connections](docs/connections.md#saved-connections).
 
 ## Why I built zpeek
 
 My editor didn't have a database client, and I was tired of switching between windows just to connect to a database. The tools I used also consumed more system resources than I liked, even while sitting in the background.
 
-I wanted to open a table, follow a relationship, and get back to work from the same terminal. I chose Zig because it had worked well for me before, and built zpeek around that workflow.
+I wanted to look up data from the terminal I already had open, including records in related tables. I chose Zig because it had worked well for me before, and built zpeek around that workflow.
 
 The result is a single binary with built-in drivers that also works over SSH. Connections and saved SQL live in ordinary files you can edit yourself, so your setup stays yours.
 
 ## Benchmarks
 
-Here are two results from local PostgreSQL benchmarks:
+In a local PostgreSQL benchmark, zpeek reached **10.27 MiB peak RSS** after 15 rounds of working with query results in the TUI. Each round included browsing and sorting before clearing the results.
 
-- **10.27 MiB peak RSS** after 15 rounds of querying, browsing, sorting, and clearing results in the TUI.
-- **1.56 s median** to read a 20-million-ID SQL response, including startup and connection, with **35.18 MiB peak RSS**.
+Reading a SQL response containing 20 million IDs took **1.56 s median**, including startup and connection, with **35.18 MiB peak RSS**.
 
 These local, warm-cache results came from Linux x86_64 with PostgreSQL 18.6 and Zig 0.17.0 `ReleaseSafe`, so your numbers may differ. The large-result test retained at most 16 MiB of row data.
 
@@ -92,12 +85,9 @@ it created. The empty test database stays on the server.
 
 ## Documentation
 
-| Guide | What you will find |
-| --- | --- |
-| [Connections](docs/connections.md) | URLs, saved profiles, TLS, environment variables, supported databases |
-| [Configuration](docs/configuration.md) | TOML fields, `/config` commands, editor, help panel, autocomplete |
-| [Security](docs/security.md) | Access modes, SQL checks, deletion safeguards, server-side permissions |
-| [Usage](docs/usage.md) | Commands, keys, table browsing, saved queries, result limits, demo reproduction |
+Start with [Connections](docs/connections.md) to set up database access and save a profile. [Configuration](docs/configuration.md) explains how to adjust zpeek to the way you work.
+
+The [Usage guide](docs/usage.md) covers everyday work in the TUI and serves as a reference for commands and keys. Read [Security](docs/security.md) to understand access modes and their limits.
 
 One important caveat: client-side SQL checks **are not a security boundary**. Use database permissions for hard guarantees, and [read the limitations](docs/security.md#security-boundary) before relying on access modes.
 
