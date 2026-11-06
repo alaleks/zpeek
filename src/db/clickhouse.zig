@@ -46,11 +46,9 @@ const BodySink = struct {
 
     fn rawRow(s: *BodySink, line: []const u8) !void {
         const b = s.builder.?;
-        if (!b.acceptsRow(@sizeOf(?[]const u8) +| line.len, s.opts)) return;
-        const a = b.allocator();
-        const row = try a.alloc(?[]const u8, 1);
-        row[0] = try a.dupe(u8, line);
-        try b.addRow(row, s.opts);
+        var row = (try b.allocRow(1, line.len, s.opts)) orelse return;
+        row.put(0, line);
+        try b.addRow(row.row, s.opts);
     }
 
     fn consumeLine(s: *BodySink, line: []const u8) !void {
@@ -72,15 +70,23 @@ const BodySink = struct {
             return b.setColumns(names.items);
         }
         const ncols = b.result.columns.len;
-        var row_bytes = ncols *| @sizeOf(?[]const u8);
-        for (0..ncols) |_| row_bytes +|= decodedSize(fields.next() orelse "");
-        if (!b.acceptsRow(row_bytes, s.opts)) return;
-        const row = try a.alloc(?[]const u8, ncols);
+        var value_bytes: usize = 0;
+        for (0..ncols) |_| value_bytes +|= decodedSize(fields.next() orelse "");
+        var row = (try b.allocRow(ncols, value_bytes, s.opts)) orelse return;
         fields.reset();
-        for (row) |*cell| cell.* = try ownedField(a, fields.next() orelse "");
-        try b.addRow(row, s.opts);
+        for (0..ncols) |i| putField(&row, i, fields.next() orelse "");
+        try b.addRow(row.row, s.opts);
     }
 };
+
+fn putField(row: *db.RowBuffer, index: usize, field: []const u8) void {
+    if (std.mem.eql(u8, field, "\\N")) {
+        row.put(index, null);
+        return;
+    }
+    const dest = row.reserve(index, decodedSize(field));
+    unescapeInto(dest, field);
+}
 
 fn decodedSize(field: []const u8) usize {
     if (std.mem.eql(u8, field, "\\N")) return 0;
@@ -454,6 +460,11 @@ fn unescape(a: Allocator, field: []const u8) Allocator.Error!?[]const u8 {
     if (std.mem.eql(u8, field, "\\N")) return null;
     if (std.mem.indexOfScalar(u8, field, '\\') == null) return field;
     const out = try a.alloc(u8, decodedSize(field));
+    unescapeInto(out, field);
+    return out;
+}
+
+fn unescapeInto(out: []u8, field: []const u8) void {
     var written: usize = 0;
     var i: usize = 0;
     while (i < field.len) : (i += 1) {
@@ -474,7 +485,6 @@ fn unescape(a: Allocator, field: []const u8) Allocator.Error!?[]const u8 {
         };
         written += 1;
     }
-    return out;
 }
 
 pub fn connect(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *db.ErrorText) db.ConnectError!db.Connection {

@@ -76,22 +76,18 @@ const Sqlite = struct {
                 if (dml) continue;
                 break;
             }
-            var row_bytes = ncols *| @sizeOf(?[]const u8);
+            var value_bytes: usize = 0;
             for (0..ncols) |i| {
                 const index: c_int = @intCast(i);
                 const size: usize = @intCast(c.sqlite3_column_bytes(s, index));
-                row_bytes +|= if (c.sqlite3_column_type(s, index) == c.SQLITE_BLOB)
-                    3 + @as(usize, @min(size, 64)) * 2 + (if (size > 64) std.fmt.count("… ({d} bytes)", .{size}) else @as(usize, 0))
-                else
-                    size;
+                value_bytes +|= if (c.sqlite3_column_type(s, index) == c.SQLITE_BLOB) hexBlobLen(size) else size;
             }
-            if (!b.acceptsRow(row_bytes, opts)) {
+            var row = (try b.allocRow(ncols, value_bytes, opts)) orelse {
                 if (dml) continue;
                 break;
-            }
-            const row = try a.alloc(?[]const u8, ncols);
-            for (row, 0..) |*cell, i| cell.* = try columnText(a, s, @intCast(i));
-            try b.addRow(row, opts);
+            };
+            for (0..ncols) |i| putColumn(&row, s, i);
+            try b.addRow(row.row, opts);
         }
 
         if (ncols > 0) {
@@ -114,18 +110,25 @@ const Sqlite = struct {
         }
     }
 
-    fn columnText(a: Allocator, s: *c.sqlite3_stmt, i: c_int) Allocator.Error!?[]const u8 {
-        switch (c.sqlite3_column_type(s, i)) {
-            c.SQLITE_NULL => return null,
+    fn putColumn(row: *db.RowBuffer, s: *c.sqlite3_stmt, i: usize) void {
+        const index: c_int = @intCast(i);
+        switch (c.sqlite3_column_type(s, index)) {
+            c.SQLITE_NULL => row.put(i, null),
             c.SQLITE_BLOB => {
-                const len: usize = @intCast(c.sqlite3_column_bytes(s, i));
-                const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(s, i) orelse return "");
-                return try hexBlob(a, ptr[0..len]);
+                const len: usize = @intCast(c.sqlite3_column_bytes(s, index));
+                const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(s, index) orelse {
+                    row.put(i, "");
+                    return;
+                });
+                hexBlobInto(row.reserve(i, hexBlobLen(len)), ptr[0..len]);
             },
             else => {
-                const ptr = c.sqlite3_column_text(s, i) orelse return "";
-                const len: usize = @intCast(c.sqlite3_column_bytes(s, i));
-                return try a.dupe(u8, ptr[0..len]);
+                const ptr = c.sqlite3_column_text(s, index) orelse {
+                    row.put(i, "");
+                    return;
+                };
+                const len: usize = @intCast(c.sqlite3_column_bytes(s, index));
+                row.put(i, ptr[0..len]);
             },
         }
     }
@@ -200,14 +203,25 @@ fn authorizeReadDelete(_: ?*anyopaque, action: c_int, first: [*c]const u8, _: [*
     };
 }
 
-fn hexBlob(a: Allocator, bytes: []const u8) Allocator.Error![]const u8 {
+fn hexBlobLen(len: usize) usize {
+    return 3 + @as(usize, @min(len, 64)) * 2 + (if (len > 64) std.fmt.count("… ({d} bytes)", .{len}) else @as(usize, 0));
+}
+
+fn hexBlobInto(out: []u8, bytes: []const u8) void {
+    const digits = "0123456789abcdef";
     const shown = @min(bytes.len, 64);
-    var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(a, "x'");
-    for (bytes[0..shown]) |byte| try out.print(a, "{x:0>2}", .{byte});
-    try out.append(a, '\'');
-    if (shown < bytes.len) try out.print(a, "… ({d} bytes)", .{bytes.len});
-    return out.items;
+    var pos: usize = 0;
+    out[pos] = 'x';
+    out[pos + 1] = '\'';
+    pos += 2;
+    for (bytes[0..shown]) |byte| {
+        out[pos] = digits[byte >> 4];
+        out[pos + 1] = digits[byte & 0x0f];
+        pos += 2;
+    }
+    out[pos] = '\'';
+    pos += 1;
+    if (shown < bytes.len) _ = std.fmt.bufPrint(out[pos..], "… ({d} bytes)", .{bytes.len}) catch unreachable;
 }
 
 fn firstWord(sql: []const u8) []const u8 {

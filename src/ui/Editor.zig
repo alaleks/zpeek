@@ -69,18 +69,26 @@ pub fn insert(e: *Editor, s: []const u8) Allocator.Error!void {
 
 /// Inserts pasted text, normalizing CRLF/CR to LF.
 pub fn insertPaste(e: *Editor, s: []const u8) Allocator.Error!void {
+    if (std.mem.indexOfAny(u8, s, "\r\t") == null) return e.insert(s);
+
+    var normalized: std.ArrayList(u8) = .empty;
+    defer normalized.deinit(e.gpa);
+    const extra = std.math.mul(usize, std.mem.count(u8, s, "\t"), 3) catch return error.OutOfMemory;
+    const capacity = std.math.add(usize, s.len, extra) catch return error.OutOfMemory;
+    try normalized.ensureTotalCapacity(e.gpa, capacity);
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         const c = s[i];
         if (c == '\r') {
             if (i + 1 < s.len and s[i + 1] == '\n') continue;
-            try e.insert("\n");
+            try normalized.append(e.gpa, '\n');
         } else if (c == '\t') {
-            try e.insert("    ");
+            try normalized.appendSlice(e.gpa, "    ");
         } else {
-            try e.insert(s[i .. i + 1]);
+            try normalized.append(e.gpa, c);
         }
     }
+    return e.insert(normalized.items);
 }
 
 fn prevCharStart(s: []const u8, pos: usize) usize {
@@ -284,6 +292,18 @@ pub fn commitHistoryText(e: *Editor, text_value: []const u8) Allocator.Error!voi
 
 pub fn historyLen(e: *const Editor) usize {
     return e.history_count;
+}
+
+test "paste normalization inserts once without changing the surrounding text" {
+    var editor: Editor = .init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.setText("ab");
+    editor.left();
+    try editor.insertPaste("x\r\ny\tz\rq");
+    try std.testing.expectEqualStrings("ax\ny    z\nqb", editor.text());
+    try std.testing.expectEqual(@as(usize, 11), editor.cursor);
+    try editor.insertPaste("!");
+    try std.testing.expectEqualStrings("ax\ny    z\nq!b", editor.text());
 }
 
 test "history ring wraps repeatedly and preserves navigation and drafts" {

@@ -40,7 +40,7 @@ pub const SchemaCache = struct {
         var tables: std.ArrayList([]const u8) = .empty;
         var columns: std.ArrayList([]const []const u8) = .empty;
         var current: std.ArrayList([]const u8) = .empty;
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var interned: std.StringHashMapUnmanaged([]const u8) = .empty;
         var all: std.ArrayList([]const u8) = .empty;
         for (r.rows) |row| {
             const t = row[0] orelse continue;
@@ -50,10 +50,14 @@ pub const SchemaCache = struct {
                 try tables.append(a, try a.dupe(u8, t));
             }
             if (row.len > 1) if (row[1]) |col| {
-                const owned = try a.dupe(u8, col);
-                try current.append(a, owned);
-                const gop = try seen.getOrPut(a, owned);
-                if (!gop.found_existing) try all.append(a, owned);
+                const gop = try interned.getOrPut(a, col);
+                if (!gop.found_existing) {
+                    const owned = try a.dupe(u8, col);
+                    gop.key_ptr.* = owned;
+                    gop.value_ptr.* = owned;
+                    try all.append(a, owned);
+                }
+                try current.append(a, gop.value_ptr.*);
             };
         }
         if (tables.items.len > 0) try columns.append(a, current.items);
@@ -434,7 +438,7 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
         if (operatorPrefix(stmt.text, relative_cursor, false)) |prefix| {
             const upper = prefix.len == 0 or std.ascii.isUpper(prefix[0]);
             for (operators(kind)) |op| {
-                try list.addIfMatch(try caseLike(a, op.text, upper), prefix, .operator, op.detail);
+                try list.addIfMatchCase(op.text, prefix, .operator, op.detail, upper);
             }
             // Typing e.g. "a" after a column may also mean AND/AS: fall through.
             if (list.items.items.len > 0) return .{ .replace_len = prefix.len, .candidates = list.items.items, .exact_match = list.exact };
@@ -469,14 +473,14 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
 
     // 1. Start of a statement: only statements valid for this dialect.
     if (prev_token == null) {
-        for (statementKeywords(kind)) |k| try list.addIfMatch(try caseLike(a, k, upper), word, .keyword, "");
+        for (statementKeywords(kind)) |k| try list.addIfMatchCase(k, word, .keyword, "", upper);
         return .{ .replace_len = word.len, .candidates = list.items.items, .exact_match = list.exact, .auto = word.len > 0 };
     }
     const prev_text = prev_token.?.text(before_word);
 
     // 2. Keywords that must follow the previous one (DELETE -> FROM, ORDER -> BY).
     if (prev_token.?.tag == .keyword) {
-        for (followUps(prev_text)) |k| try list.addIfMatch(try caseLike(a, k, upper or prev_text.len > 0 and std.ascii.isUpper(prev_text[0])), word, .keyword, "");
+        for (followUps(prev_text)) |k| try list.addIfMatchCase(k, word, .keyword, "", upper or prev_text.len > 0 and std.ascii.isUpper(prev_text[0]));
         if (list.items.items.len > 0 and word.len == 0) return .{ .replace_len = 0, .candidates = list.items.items, .exact_match = list.exact };
     }
 
@@ -496,7 +500,7 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
 
     if (after_expression) {
         // 4. "SELECT * F" -> FROM, "WHERE a = 1 A" -> AND: clause keywords first.
-        for (clauseKeywords(kind)) |k| try list.addIfMatch(try caseLike(a, k, prefer_upper), word, .keyword, "");
+        for (clauseKeywords(kind)) |k| try list.addIfMatchCase(k, word, .keyword, "", prefer_upper);
         if (word.len == 0) return .{ .replace_len = 0, .candidates = list.items.items, .exact_match = list.exact, .auto = false };
     }
 
@@ -514,11 +518,11 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
         }
     }
     if (word.len > 0) {
-        for (expressionKeywords) |k| try list.addIfMatch(try caseLike(a, k, upper), word, .keyword, "");
-        for (lexer.builtins) |k| try list.addIfMatch(try caseLike(a, k, upper), word, .function, "");
-        if (!after_expression) for (clauseKeywords(kind)) |k| try list.addIfMatch(try caseLike(a, k, upper), word, .keyword, "");
+        for (expressionKeywords) |k| try list.addIfMatchCase(k, word, .keyword, "", upper);
+        for (lexer.builtins) |k| try list.addIfMatchCase(k, word, .function, "", upper);
+        if (!after_expression) for (clauseKeywords(kind)) |k| try list.addIfMatchCase(k, word, .keyword, "", upper);
         for (lexer.keywords) |k| {
-            if (keywordAllowed(kind, k)) try list.addIfMatch(try caseLike(a, k, upper), word, .keyword, "");
+            if (keywordAllowed(kind, k)) try list.addIfMatchCase(k, word, .keyword, "", upper);
         }
     }
     return .{ .replace_len = word.len, .candidates = list.items.items, .exact_match = list.exact };
@@ -658,6 +662,18 @@ const List = struct {
         }
         for (l.items.items) |c| if (std.mem.eql(u8, c.text, text)) return;
         try l.items.append(l.a, .{ .text = text, .kind = kind, .detail = detail });
+    }
+
+    fn addIfMatchCase(l: *List, text: []const u8, prefix: []const u8, kind: Kind, detail: []const u8, upper: bool) Allocator.Error!void {
+        if (l.items.items.len >= max_candidates) return;
+        if (!std.ascii.startsWithIgnoreCase(text, unquote(prefix))) return;
+        if (text.len == prefix.len and std.ascii.eqlIgnoreCase(text, prefix)) {
+            l.exact = true;
+            return;
+        }
+        const cased = try caseLike(l.a, text, upper);
+        for (l.items.items) |c| if (std.mem.eql(u8, c.text, cased)) return;
+        try l.items.append(l.a, .{ .text = cased, .kind = kind, .detail = detail });
     }
 };
 
@@ -841,6 +857,23 @@ fn testCache(a: Allocator) !SchemaCache {
     const r: db.Result = .{ .arena = arena, .columns = &.{ "t", "c" }, .rows = rows };
     defer arena.deinit();
     return SchemaCache.fromResult(a, r);
+}
+
+test "schema cache interns repeated column names" {
+    var cache = try testCache(testing.allocator);
+    defer cache.deinit();
+    const orders = cache.columnsOf("orders").?;
+    const users = cache.columnsOf("users").?;
+    try testing.expect(orders[0].ptr == users[0].ptr);
+    try testing.expectEqual(@as(usize, 3), cache.all_columns.len);
+}
+
+test "completion filters candidates before allocating case conversions" {
+    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    const text = "select name zzz";
+    const result = try complete(counting.allocator(), .{ .text = text, .cursor = text.len, .cache = null, .connections = &.{}, .commands = &.{} });
+    try testing.expectEqual(@as(usize, 0), result.candidates.len);
+    try testing.expectEqual(@as(usize, 0), counting.allocations);
 }
 
 test "table after FROM" {

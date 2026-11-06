@@ -13,13 +13,25 @@ fn printableAscii(s: []const u8) bool {
     return true;
 }
 
+pub const Measured = struct {
+    text: []const u8,
+    width: usize,
+};
+
 /// Bound both scanning and allocation, including values made entirely of zero-width characters.
 pub fn preview(a: Allocator, s: []const u8, max: usize) Allocator.Error![]const u8 {
-    if (max == 0) return "";
+    return (try previewMeasured(a, s, max)).text;
+}
+
+pub fn previewMeasured(a: Allocator, s: []const u8, max: usize) Allocator.Error!Measured {
+    if (max == 0) return .{ .text = "", .width = 0 };
     const probe = s[0..@min(s.len, @min(4096, max +| 1))];
     if (printableAscii(probe)) {
-        if (probe.len == s.len and s.len <= max) return s;
-        if (probe.len > max) return std.mem.concat(a, u8, &.{ s[0 .. max - 1], "…" });
+        if (probe.len == s.len and s.len <= max) return .{ .text = s, .width = s.len };
+        if (probe.len > max) return .{
+            .text = try std.mem.concat(a, u8, &.{ s[0 .. max - 1], "…" }),
+            .width = max,
+        };
     }
     var buffer: [4096]u8 = undefined;
     const limit = @min(buffer.len, max *| 16 +| 16);
@@ -45,6 +57,7 @@ pub fn preview(a: Allocator, s: []const u8, max: usize) Allocator.Error![]const 
     const text = buffer[0..len];
     var width: usize = 0;
     var cut: usize = 0;
+    var cut_width: usize = 0;
     var fits = true;
     var graphemes = vaxis.unicode.graphemeIterator(text);
     while (graphemes.next()) |g| {
@@ -53,10 +66,19 @@ pub fn preview(a: Allocator, s: []const u8, max: usize) Allocator.Error![]const 
             fits = false;
             break;
         }
-        if (width < max) cut = g.start + g.bytes(text).len;
+        if (width < max) {
+            cut = g.start + g.bytes(text).len;
+            cut_width = width;
+        }
     }
-    if (pos == s.len and fits) return if (changed) try a.dupe(u8, text) else s;
-    return std.mem.concat(a, u8, &.{ text[0..cut], "…" });
+    if (pos == s.len and fits) return .{
+        .text = if (changed) try a.dupe(u8, text) else s,
+        .width = width,
+    };
+    return .{
+        .text = try std.mem.concat(a, u8, &.{ text[0..cut], "…" }),
+        .width = cut_width + 1,
+    };
 }
 
 pub fn displayWidth(s: []const u8) usize {
@@ -167,8 +189,8 @@ fn rule(w: *std.Io.Writer, widths: []const usize, left: []const u8, mid: []const
 const Cell = struct { text: []const u8, width: usize };
 
 fn prepareCell(a: Allocator, value: []const u8, max: usize) !Cell {
-    const text = try preview(a, value, max);
-    return .{ .text = text, .width = displayWidth(text) };
+    const measured = try previewMeasured(a, value, max);
+    return .{ .text = measured.text, .width = measured.width };
 }
 
 fn writeCell(w: *std.Io.Writer, cell: Cell, width: usize) !void {
@@ -225,6 +247,18 @@ test "status explicitly shows zero affected rows and duration" {
     var writer: std.Io.Writer = .fixed(&buffer);
     try writeStatus(&writer, r, 12);
     try std.testing.expectEqualStrings("UPDATE · 0 rows affected · 12 ms", writer.buffered());
+}
+
+test "measured previews agree with displayed width" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "", "hello", "日本", "é", "👩‍💻", "a\r\nb\t", "\r\r", "\xff" }) |text| {
+        for (0..8) |limit| {
+            const measured = try previewMeasured(arena.allocator(), text, limit);
+            try std.testing.expectEqual(displayWidth(measured.text), measured.width);
+            try std.testing.expect(measured.width <= limit);
+        }
+    }
 }
 
 test "previews bound work and allocation before normalizing large values" {

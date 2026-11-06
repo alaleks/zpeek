@@ -382,20 +382,19 @@ const My = struct {
                             continue;
                         }
                         var rr: Io.Reader = .fixed(p);
-                        const row_bytes = try dataRowBytes(rr, ncols);
-                        if (!b.acceptsRow(row_bytes, opts)) continue;
-                        const row = try a.alloc(?[]const u8, ncols);
-                        for (row) |*cell| {
+                        const value_bytes = try dataRowBytes(rr, ncols);
+                        var row = (try b.allocRow(ncols, value_bytes, opts)) orelse continue;
+                        for (0..ncols) |i| {
                             const lead = try rr.peekByte();
                             if (lead == 0xFB) {
                                 rr.toss(1);
-                                cell.* = null;
+                                row.put(i, null);
                             } else {
                                 const len: usize = @intCast(try readLenenc(&rr));
-                                cell.* = try a.dupe(u8, try rr.take(len));
+                                row.put(i, try rr.take(len));
                             }
                         }
-                        try b.addRow(row, opts);
+                        try b.addRow(row.row, opts);
                     }
                     const n = b.rows.items.len;
                     b.result.status = try std.fmt.allocPrint(a, "{d}{s} row{s}", .{ n, if (b.result.truncated) "+" else "", if (n == 1) "" else "s" });
@@ -722,20 +721,20 @@ test "lenenc" {
 
 fn dataRowBytes(reader: Io.Reader, ncols: usize) !usize {
     var sizes = reader;
-    var row_bytes = ncols *| @sizeOf(?[]const u8);
+    var value_bytes: usize = 0;
     for (0..ncols) |_| {
         if (try sizes.peekByte() == 0xFB) {
             sizes.toss(1);
         } else {
             const len: usize = @intCast(try readLenenc(&sizes));
-            row_bytes +|= len;
+            value_bytes +|= len;
             _ = try sizes.take(len);
         }
     }
-    return row_bytes;
+    return value_bytes;
 }
 
 test "row preflight counts nulls and rejects incomplete values" {
-    try std.testing.expectEqual(@as(usize, 2 * @sizeOf(?[]const u8) + 3), try dataRowBytes(.fixed("\x03abc\xfb"), 2));
+    try std.testing.expectEqual(@as(usize, 3), try dataRowBytes(.fixed("\x03abc\xfb"), 2));
     try std.testing.expectError(error.EndOfStream, dataRowBytes(.fixed("\x03"), 2));
 }

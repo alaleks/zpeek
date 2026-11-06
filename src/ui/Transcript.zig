@@ -290,6 +290,22 @@ test "layout rebuild releases oversized scratch capacity" {
     try std.testing.expect(entry.layout.len > 0);
 }
 
+test "narrow result layout clips measured cells to the forced width" {
+    const a = std.testing.allocator;
+    var transcript: Transcript = .init(a);
+    defer transcript.deinit();
+    var builder = db.ResultBuilder.init(a);
+    errdefer builder.deinit();
+    try builder.setColumns(&.{"value"});
+    const row = try builder.allocator().alloc(?[]const u8, 1);
+    row[0] = "abc";
+    try builder.addRow(row, .{});
+    try transcript.add(.{ .result = .{ .result = builder.finish(), .elapsed_ms = 0 } });
+    const entry = transcript.entries.items[0];
+    try ensureLayout(entry, 8);
+    try std.testing.expectEqualStrings("a", entry.layout[3][2].text);
+}
+
 test "prune old transcript entries" {
     var transcript: Transcript = .init(std.testing.allocator);
     defer transcript.deinit();
@@ -461,7 +477,7 @@ pub fn wrapWithPrefix(
             }
             const take = if (fit.text.len == 0) firstGrapheme(piece) else fit.text;
             try line.append(a, .{ .text = take, .style = seg.style });
-            col += render.displayWidth(take);
+            col += if (fit.text.len == 0) render.displayWidth(take) else fit.width;
             rest = rest[take.len..];
             if (rest.len > 0 and rest[0] != '\n' and col >= avail) {
                 try out.append(a, line.items);
@@ -512,12 +528,12 @@ fn layoutResult(
         header[i] = try render.singleLine(a, name); // names are never truncated
         widths[i] = render.displayWidth(header[i]);
     }
-    const cells = try a.alloc(?[]const u8, ncols * shown_rows);
+    const cells = try a.alloc(?render.Measured, ncols * shown_rows);
     for (r.rows[0..shown_rows], 0..) |row, ri| {
         for (row, 0..) |v, i| {
-            const t = if (v) |s| try cellText(a, s) else null;
-            cells[ri * ncols + i] = t;
-            widths[i] = @max(widths[i], render.displayWidth(t orelse render.null_text));
+            const cell = if (v) |s| try cellText(a, s) else null;
+            cells[ri * ncols + i] = cell;
+            widths[i] = @max(widths[i], if (cell) |c| c.width else render.null_text.len);
         }
     }
 
@@ -549,8 +565,16 @@ fn layoutResult(
         var line: std.ArrayList(Segment) = .empty;
         try line.append(a, .{ .text = "  │", .style = theme.border });
         for (0..visible) |i| {
-            const v = cells[ri * ncols + i];
-            try appendCell(a, &line, v orelse render.null_text, widths[i], if (v == null) theme.null_value else theme.plain);
+            const cell = cells[ri * ncols + i];
+            if (cell) |c| {
+                if (c.width > widths[i]) {
+                    try appendCell(a, &line, c.text, widths[i], theme.plain);
+                } else {
+                    try appendMeasuredCell(a, &line, c, widths[i], theme.plain);
+                }
+            } else {
+                try appendCell(a, &line, render.null_text, widths[i], theme.null_value);
+            }
         }
         if (hidden > 0) try line.append(a, .{ .text = " …", .style = theme.dim });
         try out.append(a, line.items);
@@ -574,17 +598,22 @@ fn layoutResult(
     }));
 }
 
-fn cellText(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-    return render.preview(a, s, max_col_width);
+fn cellText(a: Allocator, s: []const u8) Allocator.Error!render.Measured {
+    return render.previewMeasured(a, s, max_col_width);
+}
+
+fn appendMeasuredCell(a: Allocator, line: *std.ArrayList(Segment), cell: render.Measured, width: usize, style: Style) Allocator.Error!void {
+    std.debug.assert(cell.width <= width);
+    const pad = width - cell.width;
+    try line.append(a, .{ .text = " " });
+    try line.append(a, .{ .text = cell.text, .style = style });
+    if (pad > 0) try line.append(a, .{ .text = try spaces(a, pad) });
+    try line.append(a, .{ .text = " │", .style = theme.border });
 }
 
 fn appendCell(a: Allocator, line: *std.ArrayList(Segment), text: []const u8, width: usize, style: Style) Allocator.Error!void {
     const fit = render.fitWidth(text, width);
-    const pad = width - fit.width;
-    try line.append(a, .{ .text = " " });
-    try line.append(a, .{ .text = fit.text, .style = style });
-    if (pad > 0) try line.append(a, .{ .text = try spaces(a, pad) });
-    try line.append(a, .{ .text = " │", .style = theme.border });
+    try appendMeasuredCell(a, line, .{ .text = fit.text, .width = fit.width }, width, style);
 }
 
 fn ruleLine(a: Allocator, widths: []const usize, l: []const u8, m: []const u8, r: []const u8, more: bool) Allocator.Error!Line {

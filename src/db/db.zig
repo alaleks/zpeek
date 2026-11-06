@@ -45,6 +45,28 @@ pub const Result = struct {
     }
 };
 
+/// A row pointer array and one contiguous buffer for its non-null values.
+pub const RowBuffer = struct {
+    row: []?[]const u8,
+    remaining: []u8,
+
+    pub fn put(r: *RowBuffer, index: usize, value: ?[]const u8) void {
+        const v = value orelse {
+            r.row[index] = null;
+            return;
+        };
+        const dest = r.reserve(index, v.len);
+        @memcpy(dest, v);
+    }
+
+    pub fn reserve(r: *RowBuffer, index: usize, len: usize) []u8 {
+        const dest = r.remaining[0..len];
+        r.row[index] = dest;
+        r.remaining = r.remaining[len..];
+        return dest;
+    }
+};
+
 /// Helper used by drivers to accumulate rows into a Result.
 pub const ResultBuilder = struct {
     result: Result,
@@ -58,6 +80,17 @@ pub const ResultBuilder = struct {
 
     pub fn allocator(b: *ResultBuilder) Allocator {
         return b.result.arena.allocator();
+    }
+
+    pub fn allocRow(b: *ResultBuilder, ncols: usize, value_bytes: usize, opts: QueryOptions) Allocator.Error!?RowBuffer {
+        const pointer_bytes = std.math.mul(usize, ncols, @sizeOf(?[]const u8)) catch return error.OutOfMemory;
+        const row_bytes = std.math.add(usize, pointer_bytes, value_bytes) catch return error.OutOfMemory;
+        if (!b.acceptsRow(row_bytes, opts)) return null;
+        const a = b.allocator();
+        const block = try a.alignedAlloc(u8, .of(?[]const u8), row_bytes);
+        const row = std.mem.bytesAsSlice(?[]const u8, block[0..pointer_bytes]);
+        const data = block[pointer_bytes..];
+        return .{ .row = row, .remaining = data };
     }
 
     pub fn setColumns(b: *ResultBuilder, names: []const []const u8) Allocator.Error!void {
@@ -102,6 +135,25 @@ pub const ResultBuilder = struct {
         b.result.deinit();
     }
 };
+
+test "packed rows preserve nulls and empty values and respect the byte budget" {
+    var builder = ResultBuilder.init(std.testing.allocator);
+    defer builder.deinit();
+    var row = (try builder.allocRow(4, 3, .{})).?;
+    row.put(0, "ab");
+    row.put(1, null);
+    row.put(2, "");
+    row.put(3, "c");
+    try std.testing.expectEqualStrings("ab", row.row[0].?);
+    try std.testing.expect(row.row[1] == null);
+    try std.testing.expectEqualStrings("", row.row[2].?);
+    try std.testing.expectEqualStrings("c", row.row[3].?);
+    try std.testing.expectEqual(@intFromPtr(row.row.ptr) + 4 * @sizeOf(?[]const u8), @intFromPtr(row.row[0].?.ptr));
+    try std.testing.expectEqual(@as(usize, 0), row.remaining.len);
+    try builder.addRow(row.row, .{});
+    try std.testing.expect((try builder.allocRow(1, 1, .{ .max_bytes = builder.stored_bytes })) == null);
+    try std.testing.expectError(error.OutOfMemory, builder.allocRow(std.math.maxInt(usize), 1, .{}));
+}
 
 pub const QueryOptions = struct {
     max_rows: usize = std.math.maxInt(usize),
@@ -320,9 +372,9 @@ fn buildOwnedRows(a: Allocator) !void {
     errdefer builder.deinit();
     try builder.setColumns(&.{"id"});
     for (0..1000) |_| {
-        const row = try builder.allocator().alloc(?[]const u8, 1);
-        row[0] = try builder.allocator().dupe(u8, "123");
-        try builder.addRow(row, .{});
+        var row = (try builder.allocRow(1, 3, .{})).?;
+        row.put(0, "123");
+        try builder.addRow(row.row, .{});
     }
     var result = builder.finish();
     defer result.deinit();

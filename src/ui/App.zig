@@ -253,9 +253,6 @@ pub fn run(opts: Options) !void {
     // the parameters as text and shift the layout.
     app.vx.sgr = .legacy;
 
-    app.ticker = try app.io.concurrent(tickerTask, .{app});
-    defer if (app.ticker) |*t| t.cancel(app.io);
-
     try app.welcome();
     if (opts.initial) |e| {
         try app.startConnect(e.name, e.params);
@@ -2143,6 +2140,9 @@ fn newJob(app: *App, kind: JobKind) !*Job {
 /// Takes ownership only on success; the caller cleans up a failed start.
 fn startJob(app: *App, job: *Job) !void {
     std.debug.assert(app.job == null);
+    std.debug.assert(app.ticker == null);
+    app.ticker = try app.io.concurrent(tickerTask, .{app});
+    errdefer app.stopTicker();
     app.job = job;
     app.busy.store(true, .release);
     job.started = .now(app.io, .awake);
@@ -2172,6 +2172,7 @@ fn destroyJob(app: *App, job: *Job) void {
 }
 
 fn stopJob(app: *App) void {
+    app.stopTicker();
     const job = app.job orelse return;
     // A worker may be blocked posting completion to a full event queue.
     app.loop.queue.close(error.Closed);
@@ -2180,6 +2181,11 @@ fn stopJob(app: *App) void {
     app.job = null;
     app.busy.store(false, .release);
     app.destroyJob(job);
+}
+
+fn stopTicker(app: *App) void {
+    if (app.ticker) |*ticker| ticker.cancel(app.io);
+    app.ticker = null;
 }
 
 /// Runs on a background task. Only touches `job` and the connection.
@@ -2603,7 +2609,9 @@ test "shutdown joins a worker even when the event queue is full" {
         app.conn = .{ .ptr = &fake, .vtable = &Fake.vtable, .kind = .postgres };
         try app.startJob(job);
         try fake.started.wait(app.io);
+        try std.testing.expect(app.ticker != null);
         app.stopJob();
+        try std.testing.expect(app.ticker == null);
         try std.testing.expect(app.job == null);
         try std.testing.expect(!app.busy.load(.acquire));
         try std.testing.expect(!fake.closed);
@@ -2657,6 +2665,7 @@ test "SQL batch budgets include retained arenas and skip subsequent writes" {
 
 fn finishJob(app: *App) void {
     const job = app.job orelse return;
+    app.stopTicker();
     job.future.await(app.io);
     app.job = null;
     app.busy.store(false, .release);

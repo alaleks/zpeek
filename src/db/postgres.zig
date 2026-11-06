@@ -287,14 +287,13 @@ const Pg = struct {
                     }
                     var r: Io.Reader = .fixed(m);
                     const n = try r.takeInt(u16, .big);
-                    const row_bytes = try dataRowBytes(r, n);
-                    if (!b.acceptsRow(row_bytes, opts)) continue;
-                    const row = try a.alloc(?[]const u8, n);
-                    for (row) |*cell| {
+                    const value_bytes = try dataRowBytes(r, n);
+                    var row = (try b.allocRow(n, value_bytes, opts)) orelse continue;
+                    for (0..n) |i| {
                         const len = try r.takeInt(i32, .big);
-                        cell.* = if (len < 0) null else try a.dupe(u8, try r.take(@intCast(len)));
+                        row.put(i, if (len < 0) null else try r.take(@intCast(len)));
                     }
-                    try b.addRow(row, opts);
+                    try b.addRow(row.row, opts);
                 },
                 'C' => {
                     const tag = std.mem.sliceTo(m, 0);
@@ -334,10 +333,9 @@ const Pg = struct {
                 },
                 'd' => if (copy_out and !b.full(opts)) {
                     const value = std.mem.trimEnd(u8, m, "\r\n");
-                    if (!b.acceptsRow(value.len +| @sizeOf(?[]const u8), opts)) continue;
-                    const row = try a.alloc(?[]const u8, 1);
-                    row[0] = try a.dupe(u8, value);
-                    try b.addRow(row, opts);
+                    var row = (try b.allocRow(1, value.len, opts)) orelse continue;
+                    row.put(0, value);
+                    try b.addRow(row.row, opts);
                 } else if (copy_out) {
                     b.result.truncated = true;
                 },
@@ -630,19 +628,19 @@ test "scram matches RFC 7677 example" {
 
 fn dataRowBytes(reader: Io.Reader, ncols: usize) !usize {
     var sizes = reader;
-    var row_bytes = ncols *| @sizeOf(?[]const u8);
+    var value_bytes: usize = 0;
     for (0..ncols) |_| {
         const len = try sizes.takeInt(i32, .big);
         if (len >= 0) {
-            row_bytes +|= @as(usize, @intCast(len));
+            value_bytes +|= @as(usize, @intCast(len));
             _ = try sizes.take(@intCast(len));
         }
     }
-    return row_bytes;
+    return value_bytes;
 }
 
 test "row preflight counts nulls and rejects incomplete values" {
-    try std.testing.expectEqual(@as(usize, 2 * @sizeOf(?[]const u8) + 3), try dataRowBytes(.fixed("\x00\x00\x00\x03abc\xff\xff\xff\xff"), 2));
+    try std.testing.expectEqual(@as(usize, 3), try dataRowBytes(.fixed("\x00\x00\x00\x03abc\xff\xff\xff\xff"), 2));
     try std.testing.expectError(error.EndOfStream, dataRowBytes(.fixed("\x03"), 2));
 }
 
