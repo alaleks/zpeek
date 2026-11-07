@@ -22,6 +22,24 @@ import uuid
 LOG = logging.getLogger("benchmark")
 
 
+def system_hardware() -> tuple[str, int]:
+    if platform.system() == "Darwin":
+        try:
+            cpu = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+        except subprocess.CalledProcessError:
+            cpu = subprocess.check_output(["sysctl", "-n", "hw.model"], text=True).strip()
+        ram = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True))
+    else:
+        cpu = platform.machine()
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() in ("model name", "Hardware", "Processor") and value.strip():
+                cpu = value.strip()
+                break
+        ram = next(int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemTotal:"))
+    return cpu, ram
+
+
 def download_latest(directory: Path, timeout: float) -> Path:
     machine = platform.machine().lower()
     arch = {"aarch64": "aarch64", "arm64": "aarch64", "amd64": "x86_64", "x86_64": "x86_64"}.get(machine)
@@ -163,6 +181,7 @@ def main() -> None:
 
 
 def benchmark(args: argparse.Namespace) -> None:
+    cpu_model, ram_bytes = system_hardware()
     suffix = uuid.uuid4().hex
     database = "zpeek_bench_" + suffix
     table = "events_" + suffix
@@ -178,6 +197,7 @@ def benchmark(args: argparse.Namespace) -> None:
         return run_process([*base, "--allow-dangerous", "--format", output, "-e", sql], args.timeout)[0]
 
     report = {"driver": args.driver, "database": database, "table": table, "rows": args.rows, "platform": platform.platform(),
+              "cpu_model": cpu_model, "ram_bytes": ram_bytes,
               "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
               "cleanup": "pending", "samples": {}, "summary": {}}
 

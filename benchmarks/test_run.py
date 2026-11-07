@@ -11,6 +11,14 @@ import run
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_system_hardware_linux(self) -> None:
+        with patch.object(run.platform, "system", return_value="Linux"), patch.object(run.Path, "read_text", side_effect=["model name : Example CPU\n", "MemTotal: 8192 kB\n"]):
+            self.assertEqual(run.system_hardware(), ("Example CPU", 8192 * 1024))
+
+    def test_system_hardware_darwin(self) -> None:
+        with patch.object(run.platform, "system", return_value="Darwin"), patch.object(run.subprocess, "check_output", side_effect=["Example CPU\n", "17179869184\n"]):
+            self.assertEqual(run.system_hardware(), ("Example CPU", 17179869184))
+
     def test_release_download_checks_hash_and_extracts_only_binary(self) -> None:
         data = b"test binary"
         archive = io.BytesIO()
@@ -40,7 +48,7 @@ class BenchmarkTests(unittest.TestCase):
                 return "version", ""
 
             argv = ["run.py", "--zpeek", "fake-zpeek", "--driver", "mysql", "--connection", "test", "--output", tmp]
-            with patch("sys.argv", argv), patch.object(run, "run_process", side_effect=execute), patch.object(run.signal, "signal"), self.assertLogs("benchmark", level="ERROR"):
+            with patch("sys.argv", argv), patch.object(run, "run_process", side_effect=execute), patch.object(run, "system_hardware", return_value=("Test CPU", 8192)), patch.object(run.signal, "signal"), self.assertLogs("benchmark", level="ERROR"):
                 with self.assertRaisesRegex(RuntimeError, "cleanup unavailable"):
                     run.main()
             report = json.loads(next(Path(tmp).glob("*.json")).read_text())
@@ -74,13 +82,15 @@ class BenchmarkTests(unittest.TestCase):
                     return "test version", ""
 
                 argv = ["run.py", "--zpeek", "fake-zpeek", "--driver", "postgres", "--connection", "test", "--rows", "10", "--runs", "1", "--output", tmp]
-                with patch("sys.argv", argv), patch.object(run, "run_process", side_effect=execute), patch.object(run, "timed", return_value={"wall_s": 1.0, "cpu_s": 0.5, "cpu_percent_one_core": 50.0, "peak_rss_mib": 2.0}), patch.object(run.signal, "signal"):
+                with patch("sys.argv", argv), patch.object(run, "run_process", side_effect=execute), patch.object(run, "timed", return_value={"wall_s": 1.0, "cpu_s": 0.5, "cpu_percent_one_core": 50.0, "peak_rss_mib": 2.0}), patch.object(run, "system_hardware", return_value=("Test CPU", 8192)), patch.object(run.signal, "signal"):
                     if fail_load:
                         with self.assertRaisesRegex(RuntimeError, "injected"):
                             run.main()
                     else:
                         run.main()
                 report = json.loads(next(Path(tmp).glob("*.json")).read_text())
+                self.assertEqual(report["cpu_model"], "Test CPU")
+                self.assertEqual(report["ram_bytes"], 8192)
                 self.assertEqual(commands[-1][-1], f"DROP DATABASE IF EXISTS {report['database']}")
                 self.assertNotIn("--database", commands[-1])
                 self.assertFalse(any(command[-1].startswith("DROP TABLE") for command in commands))
