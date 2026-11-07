@@ -24,7 +24,7 @@ const BodySink = struct {
     pending_empty: usize = 0,
 
     fn feed(s: *BodySink, bytes: []const u8) !void {
-        if (bytes.len > s.opts.max_bytes -| s.response.body_bytes) return error.ResponseTooLarge;
+        if (s.builder == null and bytes.len > s.opts.max_bytes -| s.response.body_bytes) return error.ResponseTooLarge;
         s.response.body_bytes += bytes.len;
         if (s.builder == null) return s.response.body.appendSlice(s.gpa, bytes);
         var remaining = bytes;
@@ -122,7 +122,7 @@ fn readBody(gpa: Allocator, r: *Io.Reader, response: *Ch.Response, builder: ?*db
                 while (std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n").len != 0) {}
                 break;
             }
-            if (remaining > opts.max_bytes -| response.body_bytes) return error.ResponseTooLarge;
+            if (sink.builder == null and remaining > opts.max_bytes -| response.body_bytes) return error.ResponseTooLarge;
             while (remaining > 0) {
                 const part = buffer[0..@min(remaining, buffer.len)];
                 try r.readSliceAll(part);
@@ -132,7 +132,7 @@ fn readBody(gpa: Allocator, r: *Io.Reader, response: *Ch.Response, builder: ?*db
             if (!std.mem.eql(u8, try r.take(2), "\r\n")) return error.ProtocolError;
         }
     } else if (content_length) |length| {
-        if (length > opts.max_bytes) return error.ResponseTooLarge;
+        if (sink.builder == null and length > opts.max_bytes) return error.ResponseTooLarge;
         var remaining = length;
         while (remaining > 0) {
             const part = buffer[0..@min(remaining, buffer.len)];
@@ -573,6 +573,22 @@ test "streamed result does not retain the HTTP body or borrowed input" {
     try std.testing.expectEqualStrings("value", builder.result.columns[0]);
     try std.testing.expect(builder.result.arena.queryCapacity() < 8192);
     try std.testing.expectEqual(@as(usize, 0), response.body.capacity);
+}
+
+test "streamed results may exceed the stored byte limit" {
+    const a = std.testing.allocator;
+    const body = "value\nfirst\nsecond\n";
+    for ([_]bool{ false, true }) |chunked| {
+        var response: Ch.Response = .{ .status = 200 };
+        defer response.deinit(a);
+        var builder: db.ResultBuilder = .init(a);
+        defer builder.deinit();
+        var reader: Io.Reader = .fixed(if (chunked) "13\r\nvalue\nfirst\nsecond\n\r\n0\r\n\r\n" else body);
+        try readBody(a, &reader, &response, &builder, .{ .max_bytes = 6 }, if (chunked) null else body.len, chunked);
+        try std.testing.expectEqual(@as(usize, 0), builder.rows.items.len);
+        try std.testing.expect(builder.result.truncated);
+        try std.testing.expectEqual(@as(usize, body.len), response.body_bytes);
+    }
 }
 
 test "HTTP streaming handles EOF bodies, raw formats, errors and incomplete framing" {
