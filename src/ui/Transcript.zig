@@ -524,6 +524,60 @@ test "expanded schema results show rows beyond the console preview" {
     }
 }
 
+test "wide result layout retains only screen-sized previews" {
+    const a = std.testing.allocator;
+    const payload: [512]u8 = @splat('x');
+    for ([_]usize{ 8, 128, 1024 }) |ncols| {
+        var input = std.heap.ArenaAllocator.init(a);
+        defer input.deinit();
+        const columns = try input.allocator().alloc([]const u8, ncols);
+        for (columns, 0..) |*column, i| column.* = try std.fmt.allocPrint(input.allocator(), "column_{d}", .{i});
+        const values = try input.allocator().alloc(?[]const u8, ncols);
+        @memset(values, &payload);
+        values[0] = null;
+        values[2] = "日本\n語";
+        const rows: [inline_rows][]const ?[]const u8 = @splat(values);
+        var counted = std.testing.FailingAllocator.init(std.heap.c_allocator, .{});
+        {
+            var transcript = Transcript.init(a);
+            defer transcript.deinit();
+            try transcript.add(.{ .result = .{
+                .result = .{ .arena = .init(a), .columns = columns, .rows = &rows },
+                .elapsed_ms = 0,
+            } });
+            const entry = transcript.entries.items[0];
+            entry.layout_arena.child_allocator = counted.allocator();
+            const start = std.Io.Timestamp.now(std.testing.io, .awake);
+            try ensureLayout(entry, 120);
+            const elapsed = start.untilNow(std.testing.io, .awake).toMicroseconds();
+            var hash = std.hash.Wyhash.init(0);
+            for (entry.layout) |line| {
+                for (line) |segment| hash.update(segment.text);
+                hash.update("\n");
+            }
+            const text_hash = hash.final();
+            if (@import("build_options").bench_tui) std.debug.print("\nUI layout: {d} columns, {d} rows, {d} allocations, {d} cached bytes, {d} us, text hash {x}\n", .{
+                ncols, rows.len, counted.allocations, entry.layout_arena.queryCapacity(), elapsed, text_hash,
+            });
+            try std.testing.expect(entry.layout_arena.queryCapacity() < 512 * 1024);
+            try std.testing.expectEqual(ncols, entry.content.result.result.columns.len);
+            try std.testing.expectEqualStrings(&payload, entry.content.result.result.rows[0][ncols - 1].?);
+            const allocations = counted.allocations;
+            try ensureLayout(entry, 120);
+            try std.testing.expectEqual(allocations, counted.allocations);
+            try ensureLayout(entry, 40);
+            try ensureLayout(entry, 120);
+            var resized_hash = std.hash.Wyhash.init(0);
+            for (entry.layout) |line| {
+                for (line) |segment| resized_hash.update(segment.text);
+                resized_hash.update("\n");
+            }
+            try std.testing.expectEqual(text_hash, resized_hash.final());
+        }
+        try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+    }
+}
+
 fn layoutResult(
     a: Allocator,
     out: *std.ArrayList(Line),
@@ -551,28 +605,25 @@ fn layoutResult(
 
     const shown_rows = if (expanded) r.rows.len else @min(r.rows.len, inline_rows);
     const ncols = r.columns.len;
-    const widths = try a.alloc(usize, ncols);
-    const header = try a.alloc([]const u8, ncols);
-    for (r.columns, 0..) |name, i| {
-        header[i] = try render.singleLine(a, name); // names are never truncated
-        widths[i] = render.displayWidth(header[i]);
-    }
-    const cells = try a.alloc(?render.Measured, ncols * shown_rows);
-    for (r.rows[0..shown_rows], 0..) |row, ri| {
-        for (row, 0..) |v, i| {
-            const cell = if (v) |s| try cellText(a, s) else null;
-            cells[ri * ncols + i] = cell;
-            widths[i] = @max(widths[i], if (cell) |c| c.width else render.null_text.len);
-        }
-    }
-
-    // Fit columns into the width: indent(2) + "│" + per column (w + 3).
     const avail: usize = @as(usize, width) -| 3;
+    // Each column needs at least three screen cells; always keep the first.
+    const column_limit = @min(ncols, @max(1, (avail -| 1) / 3));
+    const widths = try a.alloc(usize, column_limit);
+    const header = try a.alloc([]const u8, column_limit);
+    const cells = try a.alloc(?render.Measured, column_limit * shown_rows);
     var used: usize = 1;
     var visible: usize = 0;
-    for (widths) |w| {
-        if (used + w + 3 > avail) break;
-        used += w + 3;
+    for (r.columns[0..column_limit], 0..) |name, i| {
+        header[i] = try render.singleLine(a, name); // names are never truncated
+        widths[i] = render.displayWidth(header[i]);
+        for (r.rows[0..shown_rows], 0..) |row, ri| {
+            const v = row[i];
+            const cell = if (v) |s| try cellText(a, s) else null;
+            cells[ri * column_limit + i] = cell;
+            widths[i] = @max(widths[i], if (cell) |c| c.width else render.null_text.len);
+        }
+        if (used + widths[i] + 3 > avail) break;
+        used += widths[i] + 3;
         visible += 1;
     }
     if (visible == 0) {
@@ -594,7 +645,7 @@ fn layoutResult(
         var line: std.ArrayList(Segment) = .empty;
         try line.append(a, .{ .text = "  │", .style = theme.border });
         for (0..visible) |i| {
-            const cell = cells[ri * ncols + i];
+            const cell = cells[ri * column_limit + i];
             if (cell) |c| {
                 if (c.width > widths[i]) {
                     try appendCell(a, &line, c.text, widths[i], theme.plain);
