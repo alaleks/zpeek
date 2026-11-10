@@ -26,6 +26,8 @@ pub const Content = union(enum) {
         title: ?[]const u8 = null,
         /// Row count before `compact` dropped the rows the feed never shows.
         total_rows: ?usize = null,
+        /// Full-screen schema views show every retained row.
+        expanded: bool = false,
     },
     message: struct { kind: MessageKind, text: []const u8 },
     /// SQL source shown with highlighting (function/view definitions).
@@ -103,6 +105,8 @@ pub fn add(t: *Transcript, content: Content) Allocator.Error!void {
             .result = r.result,
             .elapsed_ms = r.elapsed_ms,
             .title = if (r.title) |s| try a.dupe(u8, s) else null,
+            .total_rows = r.total_rows,
+            .expanded = r.expanded,
         } },
         .message => |m| .{ .message = .{ .kind = m.kind, .text = try a.dupe(u8, m.text) } },
         .code => |s| .{ .code = try a.dupe(u8, s) },
@@ -431,7 +435,7 @@ fn ensureLayout(e: *Entry, width: u16) Allocator.Error!void {
         .lines => |ls| {
             for (ls) |line| try lines.append(a, line);
         },
-        .result => |r| try layoutResult(a, &lines, r.result, r.total_rows orelse r.result.rows.len, r.elapsed_ms, r.title, width),
+        .result => |r| try layoutResult(a, &lines, r.result, r.total_rows orelse r.result.rows.len, r.elapsed_ms, r.title, width, r.expanded),
     }
     e.layout = lines.items;
     e.layout_width = width;
@@ -496,6 +500,30 @@ fn firstGrapheme(s: []const u8) []const u8 {
     return g.bytes(s);
 }
 
+test "expanded schema results show rows beyond the console preview" {
+    const a = std.testing.allocator;
+    var rows: [inline_rows + 1][]const ?[]const u8 = @splat(&.{"value"});
+    rows[inline_rows] = &.{"last_column"};
+    for ([_]bool{ false, true }) |expanded| {
+        var transcript = Transcript.init(a);
+        defer transcript.deinit();
+        try transcript.add(.{ .result = .{
+            .result = .{ .arena = .init(a), .columns = &.{"column"}, .rows = &rows },
+            .elapsed_ms = 0,
+            .expanded = expanded,
+        } });
+        const entry = transcript.entries.items[0];
+        try ensureLayout(entry, 80);
+        var found = false;
+        for (entry.layout) |line| {
+            for (line) |segment| {
+                if (std.mem.indexOf(u8, segment.text, "last_column") != null) found = true;
+            }
+        }
+        try std.testing.expectEqual(expanded, found);
+    }
+}
+
 fn layoutResult(
     a: Allocator,
     out: *std.ArrayList(Line),
@@ -504,6 +532,7 @@ fn layoutResult(
     elapsed_ms: i64,
     title: ?[]const u8,
     width: u16,
+    expanded: bool,
 ) Allocator.Error!void {
     if (title) |t| try out.append(a, try a.dupe(Segment, &.{
         .{ .text = "  " },
@@ -520,7 +549,7 @@ fn layoutResult(
         return;
     }
 
-    const shown_rows = @min(r.rows.len, inline_rows);
+    const shown_rows = if (expanded) r.rows.len else @min(r.rows.len, inline_rows);
     const ncols = r.columns.len;
     const widths = try a.alloc(usize, ncols);
     const header = try a.alloc([]const u8, ncols);
@@ -590,7 +619,7 @@ fn layoutResult(
         if (shown_rows < total_rows) try status.print(a, "showing {d} of {d} rows", .{ shown_rows, total_rows });
         if (shown_rows < total_rows and hidden > 0) try status.appendSlice(a, ", ");
         if (hidden > 0) try status.print(a, "{d} column{s} hidden", .{ hidden, if (hidden == 1) "" else "s" });
-        try status.appendSlice(a, " — ctrl+o to open");
+        try status.appendSlice(a, if (expanded) " — widen terminal to see all columns" else " — ctrl+o to open");
     }
     try out.append(a, try a.dupe(Segment, &.{
         .{ .text = "  └ ", .style = theme.dim },

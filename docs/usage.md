@@ -2,7 +2,7 @@
 
 [← README](../README.md) · [Connections](connections.md) · [Configuration](configuration.md) · [Security](security.md)
 
-Type SQL at the prompt, or start a command with `/`. Press `tab` to accept a completion suggestion. Suggestions use the connected database's dialect and schema. Type `/help` when you need a reminder of the keys.
+Type SQL at the prompt, or start a command with `/`. Press `tab` to accept a completion suggestion. Suggestions use the connected database's dialect and schema; exact matches remain visible, followed by prefixes and substrings. Type `/help` when you need a reminder of the keys.
 
 ## Commands
 
@@ -62,6 +62,7 @@ Headers identify key columns: `PK` means primary key, `UQ` means a column belong
 | `s` | Cycle sorting on the selected column: ascending, descending, off |
 | `/` | Filter with a SQL `WHERE` condition |
 | `t` | Count matching rows |
+| `w` | Show the table's columns, indexes and constraints, as in `/describe`; `esc` returns to the same browse view |
 | `n` / `p` | Next / previous page |
 | `enter` | Show the full cell value |
 | `f` on an FK cell | Preview the referenced row below the table |

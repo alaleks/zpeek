@@ -91,8 +91,8 @@ pub const Completion = struct {
     /// False for long generic lists (e.g. all clause keywords after a space)
     /// that should only appear on Tab, not while typing.
     auto: bool = true,
-    /// The typed word already equals a known name/keyword; the popup is then
-    /// not shown while typing so Enter runs the query.
+    /// The typed word equals a known name/keyword; Enter can run it without
+    /// first accepting the unchanged suggestion.
     exact_match: bool = false,
 };
 
@@ -654,26 +654,33 @@ const List = struct {
     exact: bool = false,
 
     fn addIfMatch(l: *List, text: []const u8, prefix: []const u8, kind: Kind, detail: []const u8) Allocator.Error!void {
-        if (l.items.items.len >= max_candidates) return;
-        if (!std.ascii.startsWithIgnoreCase(text, unquote(prefix))) return;
-        if (text.len == prefix.len and std.ascii.eqlIgnoreCase(text, prefix)) {
-            l.exact = true; // already complete
-            return;
+        const needle = unquote(prefix);
+        if (std.ascii.findIgnoreCase(text, needle) == null) return;
+        const exact = std.ascii.eqlIgnoreCase(text, needle);
+        const is_prefix = std.ascii.startsWithIgnoreCase(text, needle);
+        l.exact = l.exact or exact;
+        if (l.items.items.len >= max_candidates) {
+            const replaces_substring = is_prefix and !std.ascii.startsWithIgnoreCase(l.items.items[l.items.items.len - 1].text, needle);
+            if (!exact and !replaces_substring) return;
         }
         for (l.items.items) |c| if (std.mem.eql(u8, c.text, text)) return;
-        try l.items.append(l.a, .{ .text = text, .kind = kind, .detail = detail });
+        if (l.items.items.len >= max_candidates) _ = l.items.pop();
+        var index = if (exact) @as(usize, 0) else l.items.items.len;
+        if (!exact and is_prefix) {
+            for (l.items.items, 0..) |c, i| {
+                if (!std.ascii.startsWithIgnoreCase(c.text, needle)) {
+                    index = i;
+                    break;
+                }
+            }
+        }
+        try l.items.insert(l.a, index, .{ .text = text, .kind = kind, .detail = detail });
     }
 
     fn addIfMatchCase(l: *List, text: []const u8, prefix: []const u8, kind: Kind, detail: []const u8, upper: bool) Allocator.Error!void {
-        if (l.items.items.len >= max_candidates) return;
-        if (!std.ascii.startsWithIgnoreCase(text, unquote(prefix))) return;
-        if (text.len == prefix.len and std.ascii.eqlIgnoreCase(text, prefix)) {
-            l.exact = true;
-            return;
-        }
+        if (std.ascii.findIgnoreCase(text, unquote(prefix)) == null) return;
         const cased = try caseLike(l.a, text, upper);
-        for (l.items.items) |c| if (std.mem.eql(u8, c.text, cased)) return;
-        try l.items.append(l.a, .{ .text = cased, .kind = kind, .detail = detail });
+        try l.addIfMatch(cased, prefix, kind, detail);
     }
 };
 
@@ -886,6 +893,44 @@ test "table after FROM" {
     try testing.expectEqual(@as(usize, 2), c.replace_len);
     try testing.expectEqual(@as(usize, 1), c.candidates.len);
     try testing.expectEqualStrings("users", c.candidates[0].text);
+}
+
+test "completion ranks exact names then prefixes then substrings" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]Kind{ .table, .column, .command, .connection, .query }) |kind| {
+        var list: List = .{ .a = arena.allocator() };
+        try list.addIfMatch("some_ne", "ne", kind, "");
+        try list.addIfMatch("networks", "ne", kind, "");
+        try list.addIfMatch("ne", "ne", kind, "");
+        try testing.expect(list.exact);
+        try testing.expectEqual(@as(usize, 3), list.items.items.len);
+        try testing.expectEqualStrings("ne", list.items.items[0].text);
+        try testing.expectEqualStrings("networks", list.items.items[1].text);
+        try testing.expectEqualStrings("some_ne", list.items.items[2].text);
+    }
+    var quoted: List = .{ .a = arena.allocator() };
+    try quoted.addIfMatch("ne", "\"ne\"", .column, "");
+    try testing.expect(quoted.exact);
+    try testing.expectEqualStrings("ne", quoted.items.items[0].text);
+    var keyword: List = .{ .a = arena.allocator() };
+    try keyword.addIfMatchCase("SELECT", "SELECT", .keyword, "", true);
+    try testing.expect(keyword.exact);
+    try testing.expectEqualStrings("SELECT", keyword.items.items[0].text);
+}
+
+test "exact and prefix names survive a full completion list" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var list: List = .{ .a = arena.allocator() };
+    for (0..max_candidates) |i| {
+        try list.addIfMatch(try std.fmt.allocPrint(arena.allocator(), "some_ne_{d}", .{i}), "ne", .table, "");
+    }
+    try list.addIfMatch("networks", "ne", .table, "");
+    try testing.expectEqualStrings("networks", list.items.items[0].text);
+    try list.addIfMatch("ne", "ne", .table, "");
+    try testing.expectEqualStrings("ne", list.items.items[0].text);
+    try testing.expectEqual(@as(usize, max_candidates), list.items.items.len);
 }
 
 test "alias columns" {

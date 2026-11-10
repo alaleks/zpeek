@@ -61,16 +61,14 @@ pub fn deinit(p: *Picker) void {
 fn refilter(p: *Picker) Allocator.Error!void {
     p.matches.clearRetainingCapacity();
     const q = p.query.items;
-    // Prefix matches first, then substring matches.
-    for (p.items, 0..) |it, i| {
-        if (q.len == 0 or std.ascii.startsWithIgnoreCase(it.label, q)) try p.matches.append(p.gpa, i);
-    }
-    if (q.len > 0) {
+    const Match = enum { exact, prefix, substring };
+    for ([_]Match{ .exact, .prefix, .substring }) |pass| {
         for (p.items, 0..) |it, i| {
-            if (!std.ascii.startsWithIgnoreCase(it.label, q) and
-                (std.ascii.findIgnoreCase(it.label, q) != null or std.ascii.findIgnoreCase(it.detail, q) != null or
-                    ((p.purpose == .query or p.purpose == .history) and std.ascii.findIgnoreCase(it.value, q) != null)))
-                try p.matches.append(p.gpa, i);
+            const match: Match = if (q.len > 0 and std.ascii.eqlIgnoreCase(it.label, q)) .exact else if (std.ascii.startsWithIgnoreCase(it.label, q)) .prefix else .substring;
+            if (match != pass) continue;
+            if (match == .substring and std.ascii.findIgnoreCase(it.label, q) == null and std.ascii.findIgnoreCase(it.detail, q) == null and
+                !((p.purpose == .query or p.purpose == .history) and std.ascii.findIgnoreCase(it.value, q) != null)) continue;
+            try p.matches.append(p.gpa, i);
         }
     }
     p.selected = 0;
@@ -203,4 +201,14 @@ test "picker initialization cleans up every allocation failure" {
             _ = try p.handleKey(.{ .codepoint = 'x', .text = "x" });
         }
     }.run, .{});
+}
+
+test "picker keeps exact and substring table matches" {
+    const p = try Picker.init(std.testing.allocator, .browse, "Tables", &.{ .{ .label = "networks" }, .{ .label = "ne" }, .{ .label = "some_ne" } }, false);
+    defer p.deinit();
+    for ([_][]const u8{ "n", "e" }) |text| {
+        _ = try p.handleKey(.{ .codepoint = text[0], .text = text });
+        try std.testing.expectEqual(@as(usize, 3), p.matches.items.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), p.matches.items[0]);
 }

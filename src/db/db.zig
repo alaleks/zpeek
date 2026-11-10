@@ -72,6 +72,7 @@ pub const ResultBuilder = struct {
     result: Result,
     gpa: Allocator,
     rows: std.ArrayList([]const ?[]const u8) = .empty,
+    row_chunk: []align(@alignOf(?[]const u8)) u8 = &.{},
     stored_bytes: usize = 0,
 
     pub fn init(gpa: Allocator) ResultBuilder {
@@ -87,7 +88,15 @@ pub const ResultBuilder = struct {
         const row_bytes = std.math.add(usize, pointer_bytes, value_bytes) catch return error.OutOfMemory;
         if (!b.acceptsRow(row_bytes, opts)) return null;
         const a = b.allocator();
-        const block = try a.alignedAlloc(u8, .of(?[]const u8), row_bytes);
+        const alignment = @alignOf(?[]const u8);
+        const padded_bytes = std.math.add(usize, row_bytes, alignment - 1) catch return error.OutOfMemory;
+        const stride = std.mem.alignBackward(usize, padded_bytes, alignment);
+        if (b.row_chunk.len < stride) {
+            const chunk_bytes = @max(stride, @min(64 * 1024, opts.max_bytes - b.stored_bytes, stride *| (opts.max_rows - b.rows.items.len)));
+            b.row_chunk = try a.alignedAlloc(u8, .of(?[]const u8), std.mem.alignBackward(usize, chunk_bytes, alignment));
+        }
+        const block = b.row_chunk[0..row_bytes];
+        b.row_chunk = @alignCast(b.row_chunk[stride..]);
         const row = std.mem.bytesAsSlice(?[]const u8, block[0..pointer_bytes]);
         const data = block[pointer_bytes..];
         return .{ .row = row, .remaining = data };
@@ -159,6 +168,49 @@ pub const QueryOptions = struct {
     max_rows: usize = std.math.maxInt(usize),
     max_bytes: usize = 16 * 1024 * 1024,
 };
+
+test "row chunks bound backing allocations and preserve earlier values" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    var builder = ResultBuilder.init(std.testing.allocator);
+    builder.result.arena.child_allocator = counted.allocator();
+    defer builder.deinit();
+    try builder.setColumns(&.{"id"});
+    for (0..5000) |i| {
+        const value: [3]u8 = @splat(@intCast(i % 251));
+        var row = (try builder.allocRow(1, value.len, .{})).?;
+        row.put(0, &value);
+        try builder.addRow(row.row, .{});
+    }
+    // Count row data separately from growth of the array of row references.
+    try std.testing.expect(counted.allocations <= 2);
+    counted.fail_index = counted.alloc_index;
+    try std.testing.expect(builder.result.arena.queryCapacity() < 1024 * 1024);
+    try std.testing.expectError(error.OutOfMemory, builder.allocRow(1, 1024 * 1024, .{}));
+    for (builder.rows.items, 0..) |row, i| {
+        const value: [3]u8 = @splat(@intCast(i % 251));
+        try std.testing.expectEqualStrings(&value, row[0].?);
+    }
+}
+
+test "row chunks respect small limits and accept values larger than a chunk" {
+    for ([_]QueryOptions{ .{ .max_rows = 1 }, .{ .max_bytes = @sizeOf(?[]const u8) + 1 } }) |opts| {
+        var memory: [256]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&memory);
+        var builder = ResultBuilder.init(fixed.allocator());
+        defer builder.deinit();
+        var row = (try builder.allocRow(1, 1, opts)).?;
+        row.put(0, "x");
+        try builder.addRow(row.row, opts);
+        try std.testing.expect((try builder.allocRow(1, 1, opts)) == null);
+    }
+    var builder = ResultBuilder.init(std.testing.allocator);
+    defer builder.deinit();
+    const value: [64 * 1024 + 1]u8 = @splat('x');
+    var row = (try builder.allocRow(1, value.len, .{})).?;
+    row.put(0, &value);
+    try builder.addRow(row.row, .{});
+    try std.testing.expectEqualStrings(&value, builder.rows.items[0][0].?);
+}
 
 pub const QueryError = error{
     /// The server rejected the statement; see `Connection.lastError`.

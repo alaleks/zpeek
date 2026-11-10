@@ -52,6 +52,7 @@ pub const Action = union(enum) {
     reload,
     /// Count rows matching the current browse filter on demand.
     count,
+    describe,
     follow_fk: []const u8,
     copy: []const u8,
     /// Show a short message in the status bar.
@@ -108,6 +109,7 @@ editing_filter: bool = false,
 /// Column and SQL-operator completion while editing the filter.
 completion: std.ArrayList(complete.Candidate) = .empty,
 completion_sel: usize = 0,
+completion_navigated: bool = false,
 /// Bytes before the cursor replaced by the chosen candidate.
 completion_len: usize = 0,
 detail: bool = false,
@@ -558,6 +560,8 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
         }
     } else if (key.matches('t', .{})) {
         if (tv.browse != null) return .count;
+    } else if (key.matches('w', .{})) {
+        if (tv.browse != null) return .describe;
     } else if (key.matches('y', .{})) {
         return .{ .copy = tv.currentValue() orelse "" };
     } else if (key.matches('Y', .{}) or key.matches('y', .{ .shift = true })) {
@@ -572,15 +576,25 @@ fn handleFilterKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
         const n = tv.completion.items.len;
         if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
             tv.completion_sel = (tv.completion_sel + 1) % n;
+            tv.completion_navigated = true;
             return .none;
         }
         if (key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true })) {
             tv.completion_sel = (tv.completion_sel + n - 1) % n;
+            tv.completion_navigated = true;
             return .none;
         }
         if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.enter, .{})) {
-            try tv.acceptCompletion();
-            return .none;
+            const word = std.mem.trim(u8, e.text()[e.cursor - tv.completion_len .. e.cursor], "\"`");
+            const exact = for (tv.completion.items) |candidate| {
+                if (std.ascii.eqlIgnoreCase(candidate.text, word)) break true;
+            } else false;
+            if (key.matches(vaxis.Key.enter, .{}) and exact and !tv.completion_navigated) {
+                tv.completion.clearRetainingCapacity();
+            } else {
+                try tv.acceptCompletion();
+                return .none;
+            }
         }
         if (key.matches(vaxis.Key.escape, .{})) {
             tv.completion.clearRetainingCapacity();
@@ -705,6 +719,7 @@ fn completionWord(tv: *const TableView) ?[]const u8 {
 fn updateCompletion(tv: *TableView) Allocator.Error!void {
     tv.completion.clearRetainingCapacity();
     tv.completion_sel = 0;
+    tv.completion_navigated = false;
     if (!tv.editing_filter) return;
     if (tv.browse) |b| {
         if (complete.operatorPrefix(tv.filter_editor.text(), tv.filter_editor.cursor, true)) |prefix| {
@@ -712,7 +727,6 @@ fn updateCompletion(tv: *TableView) Allocator.Error!void {
             for (complete.operators(b.kind)) |candidate| {
                 if (tv.completion.items.len >= max_completions) return;
                 if (!std.ascii.startsWithIgnoreCase(candidate.text, prefix)) continue;
-                if (std.ascii.eqlIgnoreCase(candidate.text, prefix)) continue;
                 try tv.completion.append(tv.gpa, candidate);
             }
             return;
@@ -723,15 +737,16 @@ fn updateCompletion(tv: *TableView) Allocator.Error!void {
     const needle = std.mem.trimStart(u8, word, "\"`");
     if (needle.len == 0) return;
     const cols = tv.result.columns;
-    // Prefix matches first, then other substring matches; hidden columns are skipped.
-    for ([_]bool{ true, false }) |prefix_pass| {
+    // Exact names first, then prefixes and substrings; hidden columns are skipped.
+    const Match = enum { exact, prefix, substring };
+    for ([_]Match{ .exact, .prefix, .substring }) |pass| {
         for (tv.visible.items) |ci| {
             if (tv.completion.items.len >= max_completions) return;
             const name = cols[ci];
             const is_prefix = std.ascii.startsWithIgnoreCase(name, needle);
-            if (is_prefix != prefix_pass) continue;
-            if (!is_prefix and std.ascii.findIgnoreCase(name, needle) == null) continue;
-            if (std.mem.eql(u8, name, needle)) continue; // already complete
+            const match: Match = if (std.ascii.eqlIgnoreCase(name, needle)) .exact else if (is_prefix) .prefix else .substring;
+            if (match != pass) continue;
+            if (match == .substring and std.ascii.findIgnoreCase(name, needle) == null) continue;
             try tv.completion.append(tv.gpa, .{ .text = name, .kind = .column });
         }
     }
@@ -974,6 +989,8 @@ test "browse controls reload pages and require confirmation to delete" {
     };
     defer tv.deinit();
 
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 'w' })) == .describe);
+
     try std.testing.expect((try tv.handleKey(.{ .codepoint = 'n' })) == .reload);
     try std.testing.expectEqual(@as(usize, 2), tv.browse.?.offset);
     try std.testing.expect((try tv.handleKey(.{ .codepoint = 'n' })) == .notice);
@@ -1008,6 +1025,28 @@ test "browse controls reload pages and require confirmation to delete" {
 
     try tv.setPrimaryKey(&.{});
     try std.testing.expect((try tv.handleKey(.{ .codepoint = 'd' })) == .notice);
+}
+
+test "filter completion keeps exact column names and substrings" {
+    const a = std.testing.allocator;
+    var result: db.Result = .{ .arena = .init(a), .columns = &.{ "ne", "name", "some_ne" } };
+    defer result.deinit();
+    const tv = try TableView.init(a, &result, false, "table", .{ .table = "table" }, "", null);
+    defer tv.deinit();
+    _ = try tv.handleKey(.{ .codepoint = '/' });
+    for ([_][]const u8{ "n", "e" }) |text| {
+        _ = try tv.handleKey(.{ .codepoint = text[0], .text = text });
+        const found = for (tv.completion.items) |candidate| {
+            if (std.mem.eql(u8, candidate.text, "ne")) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = vaxis.Key.enter })) == .reload);
+    try std.testing.expectEqualStrings("ne", tv.browse.?.filter);
+    _ = try tv.handleKey(.{ .codepoint = '/' });
+    try tv.filter_editor.setText("e");
+    try tv.updateCompletion();
+    try std.testing.expectEqual(@as(usize, 3), tv.completion.items.len);
 }
 
 test "browse follows a composite foreign key and handles null values" {
@@ -1616,13 +1655,13 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
         else if (tv.browse == null)
             " / filter · s sort · c columns · y copy · e export · q back"
         else if (win.width >= 70)
-            " f FK · / filter · s sort · c show/hide · y copy · e export · q back"
+            " w schema · f FK · / filter · s sort · c cols · y copy · e export · q"
         else if (win.width >= 48)
-            " f FK · / filter · s sort · c show/hide · q back"
+            " w schema · f FK · / filter · s sort · q back"
         else if (win.width >= 24)
-            " f FK · / filter · q back"
+            " w schema · / filter · q"
         else
-            " f FK · q";
+            " w schema · q";
         _ = win.print(&.{.{ .text = hint, .style = theme.plain }}, .{ .row_offset = 1, .wrap = .none });
     }
 }

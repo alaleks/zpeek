@@ -7,6 +7,7 @@ const db = @import("db/db.zig");
 
 pub const null_text = "NULL";
 pub const scratch_limit = 256 * 1024;
+const preview_bytes = 4096;
 
 fn printableAscii(s: []const u8) bool {
     for (s) |byte| if (byte < 0x20 or byte >= 0x7f) return false;
@@ -25,7 +26,7 @@ pub fn preview(a: Allocator, s: []const u8, max: usize) Allocator.Error![]const 
 
 pub fn previewMeasured(a: Allocator, s: []const u8, max: usize) Allocator.Error!Measured {
     if (max == 0) return .{ .text = "", .width = 0 };
-    const probe = s[0..@min(s.len, @min(4096, max +| 1))];
+    const probe = s[0..@min(s.len, @min(preview_bytes, max +| 1))];
     if (printableAscii(probe)) {
         if (probe.len == s.len and s.len <= max) return .{ .text = s, .width = s.len };
         if (probe.len > max) return .{
@@ -33,7 +34,7 @@ pub fn previewMeasured(a: Allocator, s: []const u8, max: usize) Allocator.Error!
             .width = max,
         };
     }
-    var buffer: [4096]u8 = undefined;
+    var buffer: [preview_bytes]u8 = undefined;
     const limit = @min(buffer.len, max *| 16 +| 16);
     var pos: usize = 0;
     var len: usize = 0;
@@ -137,6 +138,8 @@ pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableO
     }
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
+    var cell_memory: [preview_bytes + "…".len]u8 = undefined;
+    var scratch: std.heap.FixedBufferAllocator = .init(&cell_memory);
     const ncols = r.columns.len;
     const widths = try gpa.alloc(usize, ncols);
     defer gpa.free(widths);
@@ -148,9 +151,8 @@ pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableO
         if (row.len != ncols) return error.InvalidRow;
         for (row, 0..) |v, i| {
             if (widths[i] >= opts.max_cell_width) continue;
-            const cell = try prepareCell(arena.allocator(), v orelse null_text, opts.max_cell_width);
+            const cell = try prepareCell(&scratch, v orelse null_text, opts.max_cell_width);
             widths[i] = @max(widths[i], cell.width);
-            _ = arena.reset(.{ .retain_with_limit = scratch_limit });
         }
     }
 
@@ -166,8 +168,7 @@ pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableO
     for (r.rows) |row| {
         try w.writeAll("│");
         for (row, widths) |v, width| {
-            try writeCell(w, try prepareCell(arena.allocator(), v orelse null_text, opts.max_cell_width), width);
-            _ = arena.reset(.{ .retain_with_limit = scratch_limit });
+            try writeCell(w, try prepareCell(&scratch, v orelse null_text, opts.max_cell_width), width);
         }
         try w.writeByte('\n');
     }
@@ -188,8 +189,9 @@ fn rule(w: *std.Io.Writer, widths: []const usize, left: []const u8, mid: []const
 
 const Cell = struct { text: []const u8, width: usize };
 
-fn prepareCell(a: Allocator, value: []const u8, max: usize) !Cell {
-    const measured = try previewMeasured(a, value, max);
+fn prepareCell(scratch: *std.heap.FixedBufferAllocator, value: []const u8, max: usize) !Cell {
+    scratch.reset();
+    const measured = try previewMeasured(scratch.allocator(), value, max);
     return .{ .text = measured.text, .width = measured.width };
 }
 
@@ -221,8 +223,8 @@ test "saturated column widths preserve output and validate later rows" {
 }
 
 test "prepared cells preserve ASCII clipping, Unicode widths and controls" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    var memory: [preview_bytes + "…".len]u8 = undefined;
+    var scratch: std.heap.FixedBufferAllocator = .init(&memory);
     for ([_]struct { input: []const u8, max: usize, text: []const u8, width: usize }{
         .{ .input = "12345", .max = 4, .text = "123…", .width = 4 },
         .{ .input = "12345", .max = 1, .text = "…", .width = 1 },
@@ -234,10 +236,37 @@ test "prepared cells preserve ASCII clipping, Unicode widths and controls" {
         .{ .input = "日本語", .max = 4, .text = "日…", .width = 3 },
         .{ .input = "日本語", .max = 6, .text = "日本語", .width = 6 },
     }) |case| {
-        const cell = try prepareCell(arena.allocator(), case.input, case.max);
+        const cell = try prepareCell(&scratch, case.input, case.max);
         try std.testing.expectEqualStrings(case.text, cell.text);
         try std.testing.expectEqual(case.width, cell.width);
     }
+}
+
+test "reusable cell scratch handles repeated previews and oversized ASCII" {
+    var memory: [preview_bytes + "…".len]u8 = undefined;
+    var scratch: std.heap.FixedBufferAllocator = .init(&memory);
+    for (0..2000) |_| {
+        try std.testing.expectEqualStrings("a¶b", (try prepareCell(&scratch, "a\nb", 3)).text);
+    }
+    var large: [8192]u8 = @splat('x');
+    const cell = try prepareCell(&scratch, &large, 8000);
+    try std.testing.expectEqual(@as(usize, preview_bytes + 1), cell.width);
+    try std.testing.expectEqual(@as(usize, preview_bytes + "…".len), cell.text.len);
+    try std.testing.expect(std.mem.endsWith(u8, cell.text, "…"));
+}
+
+test "CLI cell scratch avoids heap allocation across repeated cells" {
+    const payload: [512]u8 = @splat('x');
+    const cells = [_]?[]const u8{ "a\nb", "日本", null, &payload };
+    const rows: [5000][]const ?[]const u8 = @splat(&cells);
+    var result: db.Result = .{ .arena = .init(std.testing.allocator), .columns = &.{ "a", "b", "c", "d" }, .rows = &rows };
+    defer result.deinit();
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var memory: [256]u8 = undefined;
+    var output = std.Io.Writer.Discarding.init(&memory);
+    try writeResult(counted.allocator(), &output.writer, result, .{});
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
 }
 
 test "status explicitly shows zero affected rows and duration" {

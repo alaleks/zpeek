@@ -121,6 +121,7 @@ const JobKind = union(enum) {
     explain,
     list: schema.Object,
     describe: []const u8,
+    browse_describe,
     definition: []const u8,
     browse_open: TableView.Browse,
     browse_reload,
@@ -173,6 +174,8 @@ mode: Mode = .console,
 editor: Editor,
 transcript: Transcript,
 table_view: ?*TableView = null,
+table_description: ?Transcript = null,
+table_description_height: u16 = 0,
 picker: ?*Picker = null,
 
 conn: ?db.Connection = null,
@@ -277,6 +280,7 @@ pub fn run(opts: Options) !void {
 
 fn deinit(app: *App) void {
     app.stopJob();
+    app.closeTableDescription();
     if (app.table_view) |tv| tv.deinit();
     if (app.picker) |p| p.deinit();
     if (app.conn) |c| c.close();
@@ -525,7 +529,9 @@ fn handleMouse(app: *App, m: vaxis.Mouse) !void {
     switch (app.mode) {
         .console => app.transcript.scrollBy(-delta, app.transcriptHeight()),
         .table => if (app.table_view) |tv| {
-            if (delta < 0) tv.row -|= 3 else tv.row = @min(tv.row + 3, tv.view.items.len -| 1);
+            if (app.table_description) |*description| {
+                if (!description.layout_dirty) description.scrollBy(-delta, app.table_description_height);
+            } else if (delta < 0) tv.row -|= 3 else tv.row = @min(tv.row + 3, tv.view.items.len -| 1);
         },
         .picker, .config => {},
     }
@@ -721,7 +727,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 // tables after FROM, columns after WHERE, operators).
                 try app.openCompletion(false);
                 if (app.popup) |p| {
-                    if (!p.completion.auto or p.completion.exact_match) app.closePopup();
+                    if (!p.completion.auto) app.closePopup();
                 }
             }
         }
@@ -745,14 +751,12 @@ fn handlePopupKey(app: *App, key: vaxis.Key) !bool {
     if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.enter, .{})) {
         const is_enter = key.matches(vaxis.Key.enter, .{});
         const cand = p.completion.candidates[p.selected];
-        // Enter on an already complete slash command runs it.
-        if (is_enter and cand.kind == .command and p.completion.replace_len == cand.text.len) {
+        // Keep exact matches visible without changing Enter-to-run.
+        if (is_enter and app.mode != .config and !p.navigated and p.completion.exact_match) {
             app.closePopup();
             return false;
         }
-        // While the list is open, Enter inserts the selected suggestion (like
-        // Tab). The list closes on space or punctuation, and it does not open
-        // for an already complete word, so Enter then runs the query.
+        // Explicitly selected suggestions are inserted like Tab.
         try app.acceptCandidate(cand, p.completion.replace_len, p.completion.replace_after);
         return true;
     }
@@ -779,7 +783,7 @@ fn handlePopupKey(app: *App, key: vaxis.Key) !bool {
                 try app.openCompletion(false);
                 if (app.popup) |np| {
                     const is_command = std.mem.startsWith(u8, app.editor.text(), "/");
-                    if (!is_command and (np.completion.exact_match or !np.completion.auto)) app.closePopup();
+                    if (!is_command and !np.completion.auto) app.closePopup();
                 }
             }
             return true;
@@ -854,7 +858,7 @@ fn openCompletion(app: *App, explicit: bool) Allocator.Error!void {
         .commands = &commands,
         .kind = if (app.conn) |conn| conn.kind else null,
     });
-    if (result.candidates.len == 0 or (app.mode == .config and !explicit and (!result.auto or result.exact_match))) {
+    if (result.candidates.len == 0 or (!explicit and !result.auto)) {
         app.popup = null;
         return;
     }
@@ -874,6 +878,44 @@ fn openCompletion(app: *App, explicit: bool) Allocator.Error!void {
         }
     }
     app.popup = .{ .completion = result };
+}
+
+test "browse completion keeps exact names visible while typing" {
+    const a = std.testing.allocator;
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = undefined,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+        .cache = .{ .arena = .init(a), .tables = &.{ "ne", "networks" } },
+    };
+    defer app.deinit();
+    try app.editor.setText("/browse ");
+    for ([_][]const u8{ "n", "e" }) |text| {
+        try app.handleKey(.{ .codepoint = text[0], .text = text });
+        try std.testing.expect(app.popup != null);
+        const found = for (app.popup.?.completion.candidates) |candidate| {
+            if (std.mem.eql(u8, candidate.text, "ne")) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
+    try std.testing.expect(!try app.handlePopupKey(.{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expect(app.popup == null);
+    try std.testing.expectEqualStrings("/browse ne", app.editor.text());
+    try app.openCompletion(false);
+    _ = try app.handlePopupKey(.{ .codepoint = vaxis.Key.down });
+    try std.testing.expect(try app.handlePopupKey(.{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expectEqualStrings("/browse networks", app.editor.text());
+    try app.editor.setText("select * from n");
+    try app.openCompletion(false);
+    _ = try app.handlePopupKey(.{ .codepoint = 'e', .text = "e" });
+    try std.testing.expect(app.popup != null);
+    try std.testing.expectEqualStrings("ne", app.popup.?.completion.candidates[0].text);
 }
 
 fn commonPrefix(cands: []const complete.Candidate) []const u8 {
@@ -910,7 +952,7 @@ fn handlePickerKey(app: *App, key: vaxis.Key) !void {
                     const name = try app.gpa.dupe(u8, label);
                     defer app.gpa.free(name);
                     app.closePicker();
-                    if (purpose == .browse) try app.startBrowse(name, "") else try app.startDescribe(name);
+                    if (purpose == .browse) try app.startBrowse(name, "") else try app.startDescribe(name, false);
                 },
                 .definition => {
                     try app.startDefinitionSql(label, p.items[i].value);
@@ -970,6 +1012,23 @@ fn closePicker(app: *App) void {
 
 fn handleTableKey(app: *App, key: vaxis.Key) !void {
     const tv = app.table_view.?;
+    if (app.table_description) |*description| {
+        if (key.matchesAny(&.{ vaxis.Key.escape, 'q' }, .{}) or key.matches('c', .{ .ctrl = true })) {
+            app.closeTableDescription();
+            if (app.job != null) app.cancelJob(false);
+        } else if (description.layout_dirty) {
+            return;
+        } else if (key.matchesAny(&.{ vaxis.Key.up, 'k' }, .{})) {
+            description.scrollBy(1, app.table_description_height);
+        } else if (key.matchesAny(&.{ vaxis.Key.down, 'j' }, .{})) {
+            description.scrollBy(-1, app.table_description_height);
+        } else if (key.matches(vaxis.Key.page_up, .{})) {
+            description.scrollBy(@intCast(app.table_description_height), app.table_description_height);
+        } else if (key.matches(vaxis.Key.page_down, .{})) {
+            description.scrollBy(-@as(isize, app.table_description_height), app.table_description_height);
+        }
+        return;
+    }
     if (app.job != null) {
         if (key.matches('c', .{ .ctrl = true })) {
             if (app.conn) |c| c.cancel();
@@ -985,7 +1044,7 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
     const action = try tv.handleKey(key);
     // After a failed reconnect the viewer stays open without a connection.
     if (app.conn == null) switch (action) {
-        .reload, .count, .follow_fk, .delete_row => {
+        .reload, .count, .describe, .follow_fk, .delete_row => {
             switch (action) {
                 .follow_fk, .delete_row => |sql| app.gpa.free(sql),
                 else => {},
@@ -1004,6 +1063,7 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
         },
         .reload => try app.startBrowseReload(),
         .count => try app.startBrowseCount(),
+        .describe => try app.startDescribe(tv.browse.?.table, true),
         .follow_fk => |sql| {
             defer app.gpa.free(sql);
             const job = try app.newJob(.browse_fk);
@@ -1486,7 +1546,7 @@ fn runCommand(app: *App, text: []const u8) !void {
     if (eql(u8, cmd.name, "/triggers")) return app.startList(.triggers);
     if (eql(u8, cmd.name, "/describe")) {
         if (arg.len == 0) return app.openTablePicker(.describe);
-        return app.startDescribe(arg);
+        return app.startDescribe(arg, false);
     }
     if (eql(u8, cmd.name, "/browse")) {
         if (arg.len == 0) return app.openTablePicker(.browse);
@@ -2077,6 +2137,7 @@ fn connectTarget(app: *App, target: []const u8) !void {
 }
 
 fn disconnect(app: *App) void {
+    app.closeTableDescription();
     if (app.conn) |c| c.close();
     app.conn = null;
     if (app.conn_params) |p| @memset(@constCast(p.password), 0);
@@ -2288,7 +2349,7 @@ test "browse keys after a lost connection do not crash" {
         return err;
     };
     app.mode = .table;
-    for ("rt") |c| {
+    for ("rtw") |c| {
         try app.handleTableKey(.{ .codepoint = c });
         try std.testing.expect(app.job == null);
         try std.testing.expectEqualStrings("not connected — close with q and use /connect", app.table_view.?.notice.?);
@@ -2767,9 +2828,14 @@ fn processJob(app: *App, job: *Job) !void {
                 .canceled => try app.transcript.addMessage(.warn, "canceled", .{}),
             }
         },
-        .describe => {
+        .describe, .browse_describe => {
+            const transcript = if (job.kind == .browse_describe)
+                if (app.table_description) |*description| description else return
+            else
+                &app.transcript;
             const third: []const u8 = if (app.conn != null and app.conn.?.kind == .clickhouse) "Engine" else "Constraints";
-            try app.showOutcomes(job, &.{ "Columns", "Indexes", third }, false);
+            try app.showOutcomes(job, &.{ "Columns", "Indexes", third }, false, transcript);
+            if (job.kind == .browse_describe) transcript.scroll = std.math.maxInt(usize);
         },
         .definition => |name| {
             const o = if (job.outcomes.items.len > 0) &job.outcomes.items[0] else return;
@@ -2936,23 +3002,23 @@ fn countFromOutcome(outcome: Outcome) ?u64 {
 }
 
 /// Adds results with titles; secondary empty results are skipped.
-fn showOutcomes(app: *App, job: *Job, titles: []const []const u8, show_empty_first: bool) !void {
+fn showOutcomes(app: *App, job: *Job, titles: []const []const u8, show_empty_first: bool, transcript: *Transcript) !void {
     for (job.outcomes.items, 0..) |*o, i| {
         const title = if (i < titles.len) titles[i] else null;
         switch (o.*) {
             .result => |r| {
                 if (r.result.rows.len == 0) {
-                    if (i == 0 and show_empty_first) try app.transcript.addMessage(.dim, "no {s}", .{std.ascii.lowerString(try app.frame_arena.allocator().alloc(u8, title.?.len), title.?)});
-                    if (i == 0 and !show_empty_first) try app.transcript.addMessage(.dim, "table not found or has no columns", .{});
+                    if (i == 0 and show_empty_first) try transcript.addMessage(.dim, "no {s}", .{std.ascii.lowerString(try app.frame_arena.allocator().alloc(u8, title.?.len), title.?)});
+                    if (i == 0 and !show_empty_first) try transcript.addMessage(.dim, "table not found or has no columns", .{});
                     continue;
                 }
-                var res = r.result;
+                const res = &o.result.result;
                 res.status = try countNoun(res.arena.allocator(), res.rows.len, title orelse "rows");
-                try app.transcript.add(.{ .result = .{ .result = res, .elapsed_ms = r.ms, .title = title } });
+                try transcript.add(.{ .result = .{ .result = res.*, .elapsed_ms = r.ms, .title = title, .expanded = job.kind == .browse_describe } });
                 o.* = .canceled;
             },
-            .failed => |msg| try app.transcript.addMessage(.err, "{s}", .{msg}),
-            .canceled => try app.transcript.addMessage(.warn, "canceled", .{}),
+            .failed => |msg| try transcript.addMessage(.err, "{s}", .{msg}),
+            .canceled => try transcript.addMessage(.warn, "canceled", .{}),
         }
     }
 }
@@ -2994,13 +3060,20 @@ fn startList(app: *App, obj: schema.Object) !void {
     try app.startJob(job);
 }
 
-fn startDescribe(app: *App, table: []const u8) !void {
+fn closeTableDescription(app: *App) void {
+    if (app.table_description) |*description| description.deinit();
+    app.table_description = null;
+}
+
+fn startDescribe(app: *App, table: []const u8, from_browse: bool) !void {
     const job = try app.newJob(.{ .describe = undefined });
     errdefer if (app.job != job) app.destroyJob(job);
     const a = job.arena.allocator();
-    job.kind = .{ .describe = try a.dupe(u8, table) };
+    job.kind = if (from_browse) .browse_describe else .{ .describe = try a.dupe(u8, table) };
     job.sqls = try schema.describeSql(a, app.conn.?.kind, table);
     job.stop_on_error = true;
+    if (from_browse) app.table_description = .init(app.gpa);
+    errdefer if (from_browse) app.closeTableDescription();
     try app.startJob(job);
 }
 
@@ -3215,7 +3288,7 @@ test "choosing a table opens its SQLite browse view" {
     };
     defer app.deinit();
     app.loop = .init(app.io, &app.tty, &app.vx);
-    var setup = try conn.query(a, "create table people(id integer primary key, name text, email text unique); insert into people values (1, 'Alice', 'a@example.com');");
+    var setup = try conn.query(a, "create table teams(id integer primary key); create table people(id integer primary key, name text, email text unique, team_id integer references teams(id)); insert into people values (1, 'Alice', 'a@example.com', null), (2, 'Bob', 'b@example.com', null);");
     setup.deinit();
     var listed = try conn.query(a, schema.listSql(.sqlite, .tables).?);
     defer listed.deinit();
@@ -3229,6 +3302,73 @@ test "choosing a table opens its SQLite browse view" {
     try std.testing.expectEqualStrings("Alice", app.table_view.?.result.rows[0][1].?);
     try std.testing.expectEqualStrings("id", app.table_view.?.primary_key.items[0]);
     try std.testing.expectEqualStrings("email", app.table_view.?.unique_keys.items[0]);
+    const tv = app.table_view.?;
+    _ = try tv.handleKey(.{ .codepoint = '/' });
+    try tv.filter_editor.setText("id > 0");
+    _ = try tv.handleKey(.{ .codepoint = vaxis.Key.enter });
+    _ = try tv.handleKey(.{ .codepoint = 's' });
+    tv.col = 2;
+    _ = try tv.handleKey(.{ .codepoint = 'x' });
+    tv.row = 1;
+    tv.top = 1;
+    tv.col = 1;
+    const history_len = app.transcript.entries.items.len;
+    try app.handleKey(.{ .codepoint = 'w' });
+    try std.testing.expect(app.table_description != null);
+    while (app.job != null) try app.handleEvent(try app.loop.nextEvent());
+    const entries = app.table_description.?.entries.items;
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqualStrings("Columns", entries[0].content.result.title.?);
+    try std.testing.expectEqualStrings("PK", entries[0].content.result.result.rows[0][4].?);
+    try std.testing.expectEqualStrings("Indexes", entries[1].content.result.title.?);
+    try std.testing.expectEqualStrings("email", entries[1].content.result.result.rows[0][2].?);
+    try std.testing.expectEqualStrings("Constraints", entries[2].content.result.title.?);
+    try std.testing.expectEqualStrings("teams(id)", entries[2].content.result.result.rows[0][1].?);
+    {
+        var env: std.process.Environ.Map = .init(a);
+        defer env.deinit();
+        var output: [4096]u8 = undefined;
+        var writer: Io.Writer = .fixed(&output);
+        app.vx = try vaxis.init(app.io, a, &env, .{});
+        defer app.vx.deinit(a, &writer);
+        for ([_]u16{ 120, 32 }) |width| {
+            try app.vx.resize(a, &writer, .{ .cols = width, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+            app.table_description.?.scroll = std.math.maxInt(usize);
+            try app.draw();
+            const win = app.vx.window();
+            try std.testing.expectEqualStrings("S", win.readCell(1, 0).?.char.grapheme);
+            try std.testing.expectEqualStrings("C", win.readCell(2, 1).?.char.grapheme);
+            try std.testing.expectEqual(@as(u16, 22), app.table_description_height);
+        }
+    }
+    app.table_description.?.total_lines = 100;
+    app.table_description.?.scroll = 0;
+    app.table_description_height = 20;
+    try app.handleKey(.{ .codepoint = vaxis.Key.up });
+    try std.testing.expectEqual(@as(usize, 1), app.table_description.?.scroll);
+    try app.handleMouse(.{ .button = .wheel_up, .type = .press, .col = 0, .row = 0, .mods = .{} });
+    try std.testing.expectEqual(@as(usize, 4), app.table_description.?.scroll);
+    try app.handleKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expect(app.table_description == null);
+    try std.testing.expect(app.table_view.? == tv);
+    try std.testing.expectEqual(Mode.table, app.mode);
+    try std.testing.expectEqualStrings("id > 0", tv.browse.?.filter);
+    try std.testing.expectEqualStrings("id", tv.browse.?.order.?.column);
+    try std.testing.expectEqual(@as(usize, 1), tv.row);
+    try std.testing.expectEqual(@as(usize, 1), tv.top);
+    try std.testing.expectEqual(@as(usize, 1), tv.col);
+    try std.testing.expect(tv.hidden.items[2]);
+    try std.testing.expectEqualStrings("Bob", tv.result.rows[tv.row][1].?);
+    try app.handleKey(.{ .codepoint = 'w' });
+    try app.handleKey(.{ .codepoint = vaxis.Key.escape });
+    while (app.job != null) try app.handleEvent(try app.loop.nextEvent());
+    try std.testing.expect(app.table_description == null);
+    try std.testing.expect(app.table_view.? == tv);
+    try std.testing.expectEqual(history_len, app.transcript.entries.items.len);
+    app.mode = .console;
+    try app.startDescribe("people", false);
+    while (app.job != null) try app.handleEvent(try app.loop.nextEvent());
+    try std.testing.expectEqual(history_len + 3, app.transcript.entries.items.len);
 }
 
 fn startBrowse(app: *App, table: []const u8, filter: []const u8) !void {
@@ -3399,7 +3539,14 @@ fn draw(app: *App) !void {
 
     if (app.mode == .table) {
         if (app.table_view) |tv| {
-            try tv.draw(win);
+            if (app.table_description) |*description| {
+                const body = win.child(.{ .y_off = @min(1, win.height), .height = win.height -| 2 });
+                app.table_description_height = body.height;
+                try description.draw(body);
+                _ = win.printSegment(.{ .text = try std.fmt.allocPrint(a, " Schema · {s}", .{tv.browse.?.table}), .style = theme.accent_bold }, .{ .wrap = .none });
+                _ = win.printSegment(.{ .text = " ↑↓ scroll · PgUp/PgDn · esc back to browse", .style = theme.dim }, .{ .row_offset = win.height -| 1, .wrap = .none });
+                win.hideCursor();
+            } else try tv.draw(win);
             if (app.job != null) {
                 const msg = try std.fmt.allocPrint(a, " {s} loading… ", .{spinnerFrame(app.spinner)});
                 _ = win.print(&.{.{ .text = msg, .style = theme.accent_bold }}, .{ .row_offset = 0, .col_offset = win.width -| @as(u16, @intCast(render.displayWidth(msg) + 1)), .wrap = .none });
