@@ -4,7 +4,7 @@ Thanks for helping improve zpeek. For a first change, look for a [good first iss
 
 ## Build and test
 
-Install Zig 0.17.0. From the repository root:
+Install Zig 0.17.1. From the repository root:
 
 ```sh
 zig build

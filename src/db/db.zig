@@ -218,12 +218,15 @@ test "row chunks respect small limits and accept values larger than a chunk" {
     for ([_]QueryOptions{ .{ .max_rows = 1 }, .{ .max_bytes = @sizeOf(?[]const u8) + 1 } }) |opts| {
         var memory: [256]u8 = undefined;
         var fixed = std.heap.FixedBufferAllocator.init(&memory);
-        var builder = ResultBuilder.init(fixed.allocator());
+        // Bound row chunks independently of the row-reference list's growth.
+        var builder = ResultBuilder.init(std.testing.allocator);
+        builder.result.arena.child_allocator = fixed.allocator();
         defer builder.deinit();
         var row = (try builder.allocRow(1, 1, opts)).?;
         row.put(0, "x");
         try builder.addRow(row.row, opts);
         try std.testing.expect((try builder.allocRow(1, 1, opts)) == null);
+        try std.testing.expectEqualStrings("x", builder.rows.items[0][0].?);
     }
     var builder = ResultBuilder.init(std.testing.allocator);
     defer builder.deinit();

@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/alaleks/zpeek/master/install.sh | b
 irm https://raw.githubusercontent.com/alaleks/zpeek/master/install.ps1 | iex
 ```
 
-Prefer to build it yourself? With Zig 0.17.0:
+Prefer to build it yourself? With Zig 0.17.1:
 
 ```sh
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
