@@ -65,9 +65,9 @@ const commands = [_]complete.Command{
     .{ .name = "/triggers", .help = "pick a trigger to show its source" },
     .{ .name = "/describe", .args = "<table>", .help = "columns, indexes and constraints", .arg = .table, .aliases = &.{"/d"} },
     .{ .name = "/browse", .args = "<table> [where …]", .help = "open table data (no argument: pick a table)", .arg = .table, .aliases = &.{"/b"} },
-    .{ .name = "/def", .args = "<name>", .help = "source of a view, function, trigger or enum" },
+    .{ .name = "/def", .args = "<name>", .help = "source of a view, function, trigger or enum", .arg = .definition },
     .{ .name = "/databases", .help = "list databases", .aliases = &.{"/dbs"} },
-    .{ .name = "/refresh", .help = "reload table/column names for completion" },
+    .{ .name = "/refresh", .help = "reload schema names for completion" },
     .{ .name = "/history", .args = "[search]", .help = "search SQL history (alt+r) and load into editor" },
     .{ .name = "/export", .args = "<csv|json> [path]", .help = "export the last retained result to a new file" },
     .{ .name = "/explain", .args = "[SQL]", .help = "view a query plan without ANALYZE; default: last SQL" },
@@ -1176,7 +1176,7 @@ fn openHistory(app: *App, search: []const u8) !void {
 }
 
 fn openExportPath(app: *App, format: exporter.Format) !void {
-    app.picker = try Picker.init(app.gpa, if (format == .csv) .export_csv else .export_json, "Export · type a new file path · existing files are never overwritten", &.{}, true);
+    app.picker = try Picker.init(app.gpa, if (format == .csv) .export_csv else .export_json, if (format == .csv) "Export CSV · .csv added automatically · existing files are never overwritten" else "Export JSON · .json added automatically · existing files are never overwritten", &.{}, true);
     app.mode = .picker;
 }
 
@@ -1187,7 +1187,8 @@ fn exportResult(app: *App, format: exporter.Format, path: []const u8) !void {
         .{ .rows = app.table_view.?.view.items, .columns = app.table_view.?.visible.items }
     else
         .{};
-    exporter.save(app.io, path, result.*, format, selection) catch |err| {
+    const destination = try exporter.filePath(app.frame_arena.allocator(), path, format);
+    exporter.save(app.io, destination, result.*, format, selection) catch |err| {
         if (app.export_table) {
             if (app.table_view) |tv| {
                 app.notice.clearRetainingCapacity();
@@ -1202,7 +1203,7 @@ fn exportResult(app: *App, format: exporter.Format, path: []const u8) !void {
     }
     try app.transcript.addMessage(.ok, "exported {d} retained rows to {s}{s}", .{
         if (selection.rows) |rows| rows.len else result.rows.len,
-        path,
+        destination,
         if (result.truncated) " (source result was truncated)" else "",
     });
 }
@@ -2137,6 +2138,7 @@ fn connectTarget(app: *App, target: []const u8) !void {
 }
 
 fn disconnect(app: *App) void {
+    app.closePopup();
     app.closeTableDescription();
     if (app.conn) |c| c.close();
     app.conn = null;
@@ -2356,6 +2358,87 @@ test "browse keys after a lost connection do not crash" {
     }
 }
 
+test "definition completion refreshes cached objects and reuses popup allocations" {
+    const a = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    var counted = std.testing.FailingAllocator.init(a, .{});
+    const conn = try db.connect(a, std.testing.io, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(counted.allocator()),
+        .frame_arena = .init(a),
+        .conn = conn,
+    };
+    defer app.deinit();
+    app.loop = .init(app.io, &app.tty, &app.vx);
+    defer while (app.job) |job| {
+        job.future.await(app.io);
+        app.finishJob();
+    };
+    var setup = try conn.query(a,
+        \\create table users(id integer);
+        \\create table audit(user_id integer);
+        \\create view active_users as select id from users;
+        \\create view "Recent Users" as select id from users;
+        \\create trigger audit_users after insert on users begin insert into audit values(new.id); end;
+    );
+    setup.deinit();
+    try app.startCacheLoad(false);
+    app.job.?.future.await(app.io);
+    app.finishJob();
+    try std.testing.expectEqual(@as(usize, 3), app.cache.?.definitions.len);
+    try app.editor.setText("/def ");
+    try app.openCompletion(false);
+    const allocations = counted.allocations;
+    for (0..250) |_| {
+        for ([_][]const u8{ "/def a", "/def au", "/def active_users", "/def missing" }) |input| {
+            try app.editor.setText(input);
+            try app.openCompletion(false);
+        }
+    }
+    try std.testing.expectEqual(allocations, counted.allocations);
+    try std.testing.expect(app.job == null);
+    try app.editor.setText("/def Recent U");
+    try app.openCompletion(true);
+    try std.testing.expectEqualStrings("/def Recent Users", app.editor.text());
+    try app.runCommand(app.editor.text());
+    app.job.?.future.await(app.io);
+    app.finishJob();
+    try std.testing.expect(std.mem.indexOf(u8, app.sqlToCopy(), "Recent Users") != null);
+    try app.editor.setText("/def audit_");
+    try app.openCompletion(true);
+    try std.testing.expectEqualStrings("/def audit_users", app.editor.text());
+    try app.runCommand(app.editor.text());
+    app.job.?.future.await(app.io);
+    app.finishJob();
+    try std.testing.expect(std.mem.indexOf(u8, app.sqlToCopy(), "insert into audit values(new.id)") != null);
+
+    var changed = try conn.query(a, "drop view active_users; create view current_users as select id from users;");
+    changed.deinit();
+    try app.editor.setText("/def active");
+    try app.openCompletion(false);
+    try std.testing.expect(app.popup != null);
+    try app.runCommand("/refresh");
+    app.job.?.future.await(app.io);
+    app.finishJob();
+    try std.testing.expect(app.popup == null);
+    try app.editor.setText("/def current");
+    try app.openCompletion(true);
+    try std.testing.expectEqualStrings("/def current_users", app.editor.text());
+    try app.editor.setText("/def active");
+    try app.openCompletion(false);
+    try std.testing.expect(app.popup == null);
+}
+
 test "SQL tools confirm writes, search history, export views and show plans" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2412,7 +2495,7 @@ test "SQL tools confirm writes, search history, export views and show plans" {
     try app.submit();
     app.job.?.future.await(app.io);
     app.finishJob();
-    try app.runCommand(try app.tmpPrint("/export csv {s}", .{csv_path}));
+    try app.runCommand(try app.tmpPrint("/export csv {s}", .{csv_path[0 .. csv_path.len - 4]}));
     const csv = try Io.Dir.cwd().readFileAlloc(app.io, csv_path, a, .limited(4096));
     defer a.free(csv);
     try std.testing.expect(std.mem.indexOf(u8, csv, "\"1\",\"changed\"") != null);
@@ -2430,7 +2513,7 @@ test "SQL tools confirm writes, search history, export views and show plans" {
     try app.handleTableKey(.{ .codepoint = 'e' });
     try app.handlePickerKey(.{ .codepoint = vaxis.Key.down });
     try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
-    try app.handlePickerKey(.{ .codepoint = 0, .text = json_path });
+    try app.handlePickerKey(.{ .codepoint = 0, .text = json_path[0 .. json_path.len - 5] });
     try app.handlePickerKey(.{ .codepoint = vaxis.Key.enter });
     try std.testing.expectEqual(Mode.table, app.mode);
     const json = try Io.Dir.cwd().readFileAlloc(app.io, json_path, a, .limited(4096));
@@ -2981,8 +3064,16 @@ fn processJob(app: *App, job: *Job) !void {
             if (job.outcomes.items.len == 0) return;
             switch (job.outcomes.items[0]) {
                 .result => |r| {
-                    if (app.cache) |*c| c.deinit();
-                    app.cache = try complete.SchemaCache.fromResult(app.gpa, r.result);
+                    var cache = try complete.SchemaCache.fromResult(app.gpa, r.result);
+                    errdefer cache.deinit();
+                    if (job.outcomes.items.len > 1) switch (job.outcomes.items[1]) {
+                        .result => |definitions| try cache.addDefinitions(definitions.result),
+                        .failed => |msg| try app.transcript.addMessage(.warn, "could not load /def names: {s}", .{msg}),
+                        .canceled => {},
+                    };
+                    app.closePopup();
+                    if (app.cache) |*old| old.deinit();
+                    app.cache = cache;
                 },
                 .failed => |msg| try app.transcript.addMessage(.warn, "could not load table names for completion: {s}", .{msg}),
                 .canceled => {},
@@ -3178,13 +3269,24 @@ fn openObjectPicker(app: *App, obj: schema.Object, result: db.Result) !void {
         const table = objectColumn(result, row, "table");
         const label = if (obj == .types and name.len == 0)
             try std.fmt.allocPrint(a, "{s}.{s}", .{ table, objectColumn(result, row, "column") })
-        else if (kind == .postgres and obj == .triggers)
-            try std.fmt.allocPrint(a, "{s}.{s}.{s}", .{ namespace, table, name })
+        else if (obj == .triggers)
+            name
         else if (kind == .postgres)
             try std.fmt.allocPrint(a, "{s}.{s}", .{ namespace, name })
         else
             name;
-        const detail = if (obj == .functions) objectColumn(result, row, "arguments") else objectColumn(result, row, "kind");
+        const detail = if (obj == .triggers) blk: {
+            const table_name = if (namespace.len > 0) try std.fmt.allocPrint(a, "{s}.{s}", .{ namespace, table }) else table;
+            const event = objectColumn(result, row, "event");
+            const status = objectColumn(result, row, "status");
+            break :blk try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{
+                table_name,
+                if (event.len > 0) " · " else "",
+                event,
+                if (status.len > 0) " · " else "",
+                status,
+            });
+        } else if (obj == .functions) objectColumn(result, row, "arguments") else objectColumn(result, row, "kind");
         const value = if (obj == .tables)
             ""
         else if (obj == .types)
@@ -3246,6 +3348,10 @@ test "schema pickers select the requested object" {
     try app.openObjectPicker(.triggers, triggers);
     p = app.picker.?;
     try std.testing.expect(std.mem.indexOf(u8, p.items[0].value, "type = 'trigger'") != null);
+    try std.testing.expectEqualStrings("audit_orders", p.items[0].label);
+    try std.testing.expectEqualStrings("orders", p.items[0].detail);
+    _ = try p.handleKey(.{ .codepoint = 0, .text = "orders" });
+    try std.testing.expectEqual(@as(usize, 1), p.matches.items.len);
     app.closePicker();
 
     app.conn.?.kind = .mysql;
@@ -3258,6 +3364,22 @@ test "schema pickers select the requested object" {
     app.closePicker();
 
     app.conn.?.kind = .postgres;
+    const pg_trigger_rows = [_][]const ?[]const u8{
+        &.{ "public", "orders", "audit", "AFTER INSERT", "enabled", "201" },
+        &.{ "public", "users", "audit", "BEFORE UPDATE", "disabled", "202" },
+    };
+    const pg_triggers: db.Result = .{ .arena = .init(a), .columns = &.{ "schema", "table", "name", "event", "status", "oid" }, .rows = &pg_trigger_rows };
+    try app.openObjectPicker(.triggers, pg_triggers);
+    p = app.picker.?;
+    try std.testing.expectEqualStrings("audit", p.items[0].label);
+    try std.testing.expectEqualStrings("public.orders · AFTER INSERT · enabled", p.items[0].detail);
+    _ = try p.handleKey(.{ .codepoint = 0, .text = "users" });
+    const trigger_choice = try p.handleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqual(@as(usize, 1), trigger_choice.choose);
+    try std.testing.expect(std.mem.indexOf(u8, p.items[trigger_choice.choose].value, "t.oid = 202") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.items[trigger_choice.choose].value, "pg_get_functiondef(t.tgfoid)") != null);
+    app.closePicker();
+
     const function_rows = [_][]const ?[]const u8{ &.{ "public", "calculate", "integer", "101" }, &.{ "public", "calculate", "text", "102" } };
     const functions: db.Result = .{ .arena = .init(a), .columns = &.{ "schema", "name", "arguments", "oid" }, .rows = &function_rows };
     try app.openObjectPicker(.functions, functions);
@@ -3449,9 +3571,9 @@ fn startCacheLoad(app: *App, announce: bool) !void {
     if (app.job != null) return;
     const job = try app.newJob(.cache);
     errdefer if (app.job != job) app.destroyJob(job);
-    job.sqls = try job.arena.allocator().dupe([]const u8, &.{schema.completionSql(conn.kind)});
+    job.sqls = try job.arena.allocator().dupe([]const u8, &.{ schema.completionSql(conn.kind), schema.definitionCompletionSql(conn.kind) });
     try app.startJob(job);
-    if (announce) try app.transcript.addMessage(.dim, "reloading table and column names…", .{});
+    if (announce) try app.transcript.addMessage(.dim, "reloading schema names…", .{});
 }
 
 fn startConnect(app: *App, name: []const u8, params: conninfo.Params) !void {
@@ -3793,6 +3915,7 @@ fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16
             .operator => "=",
             .keyword => "k",
             .function => "f",
+            .definition => "d",
             .connection => "●",
             .query => "q",
             .config_key => "=",

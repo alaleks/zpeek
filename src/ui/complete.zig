@@ -6,7 +6,7 @@ const lexer = @import("../sql/lexer.zig");
 const db = @import("../db/db.zig");
 const toml = @import("../toml.zig");
 
-pub const Kind = enum { command, table, column, operator, keyword, function, connection, query, config_key, config_value };
+pub const Kind = enum { command, table, column, operator, keyword, function, definition, connection, query, config_key, config_value };
 
 pub const Candidate = struct {
     text: []const u8,
@@ -19,11 +19,11 @@ pub const Command = struct {
     args: []const u8 = "",
     help: []const u8,
     /// What the first argument completes to.
-    arg: enum { none, table, connection, query } = .none,
+    arg: enum { none, table, definition, connection, query } = .none,
     aliases: []const []const u8 = &.{},
 };
 
-/// Table and column names of the connected database.
+/// Schema names used by SQL and slash-command completion.
 pub const SchemaCache = struct {
     arena: std.heap.ArenaAllocator,
     tables: []const []const u8 = &.{},
@@ -31,6 +31,7 @@ pub const SchemaCache = struct {
     columns: []const []const []const u8 = &.{},
     /// Distinct column names across all tables.
     all_columns: []const []const u8 = &.{},
+    definitions: []const Candidate = &.{},
 
     /// Builds the cache from a (table, column) result; takes ownership of nothing.
     pub fn fromResult(gpa: Allocator, r: db.Result) Allocator.Error!SchemaCache {
@@ -65,6 +66,18 @@ pub const SchemaCache = struct {
         c.columns = columns.items;
         c.all_columns = all.items;
         return c;
+    }
+
+    /// Own names once; completion borrows them until the next schema refresh.
+    pub fn addDefinitions(c: *SchemaCache, r: db.Result) Allocator.Error!void {
+        const a = c.arena.allocator();
+        const definitions = try a.alloc(Candidate, r.rows.len);
+        for (r.rows, definitions) |row, *candidate| candidate.* = .{
+            .text = try a.dupe(u8, row[0] orelse ""),
+            .kind = .definition,
+            .detail = try a.dupe(u8, row[1] orelse ""),
+        };
+        c.definitions = definitions;
     }
 
     pub fn deinit(c: *SchemaCache) void {
@@ -417,13 +430,24 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
         const name_end = std.mem.indexOfAny(u8, trimmed, " \t").?;
         const name = trimmed[0..name_end];
         const cmd = findCommand(ctx.commands, name) orelse return .{ .replace_len = 0, .candidates = &.{} };
-        const word = argWord(before);
+        const word = if (cmd.arg == .definition) std.mem.trimStart(u8, trimmed[name_end..], " \t") else argWord(before);
         switch (cmd.arg) {
             .none => {},
             .connection => for (ctx.connections) |c| try list.addIfMatch(c, word, .connection, ""),
             .query => for (ctx.queries) |q| try list.addIfMatch(q, word, .query, ""),
             .table => if (ctx.cache) |cache| {
                 for (cache.tables) |t| try list.addIfMatch(t, word, .table, "");
+            },
+            .definition => if (ctx.cache) |cache| {
+                // Filter on the stack; allocate only the returned candidate array.
+                var buffer: [max_candidates]Candidate = undefined;
+                var definitions: List = .{ .a = a, .items = .initBuffer(&buffer) };
+                for (cache.definitions) |c| try definitions.addIfMatch(c.text, word, c.kind, c.detail);
+                return .{
+                    .replace_len = word.len,
+                    .candidates = try a.dupe(Candidate, definitions.items.items),
+                    .exact_match = definitions.exact,
+                };
             },
         }
         return .{ .replace_len = word.len, .candidates = list.items.items, .exact_match = list.exact };
@@ -961,13 +985,52 @@ test "/def does not suggest ordinary tables" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const commands = [_]Command{
-        .{ .name = "/def", .help = "definition" },
+        .{ .name = "/def", .help = "definition", .arg = .definition },
         .{ .name = "/browse", .help = "browse", .arg = .table },
     };
     const def = try complete(arena.allocator(), .{ .text = "/def us", .cursor = 7, .cache = &cache, .connections = &.{}, .commands = &commands });
     try testing.expectEqual(@as(usize, 0), def.candidates.len);
     const browse = try complete(arena.allocator(), .{ .text = "/browse us", .cursor = 10, .cache = &cache, .connections = &.{}, .commands = &commands });
     try testing.expectEqualStrings("users", browse.candidates[0].text);
+}
+
+test "/def borrows cached names with one candidate allocation and none for no matches" {
+    var cache = try testCache(testing.allocator);
+    defer cache.deinit();
+    cache.definitions = &.{
+        .{ .text = "users_view", .kind = .definition, .detail = "view" },
+        .{ .text = "audit_users", .kind = .definition, .detail = "trigger" },
+        .{ .text = "mood", .kind = .definition, .detail = "type" },
+    };
+    const commands = [_]Command{.{ .name = "/def", .help = "", .arg = .definition }};
+    for ([_][]const u8{ "/def ", "/def us", "/def users_view" }, [_]usize{ 3, 2, 1 }) |text, count| {
+        var counted = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+        const result = try complete(counted.allocator(), .{ .text = text, .cursor = text.len, .cache = &cache, .connections = &.{}, .commands = &commands });
+        defer counted.allocator().free(result.candidates);
+        try testing.expectEqual(count, result.candidates.len);
+        try testing.expectEqual(@as(usize, 1), counted.allocations);
+        try testing.expectEqual(cache.definitions[0].text.ptr, result.candidates[0].text.ptr);
+        try testing.expectEqual(cache.definitions[0].detail.ptr, result.candidates[0].detail.ptr);
+        try testing.expectEqual(std.mem.eql(u8, text, "/def users_view"), result.exact_match);
+    }
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const none = "/def missing";
+    const result = try complete(failing.allocator(), .{ .text = none, .cursor = none.len, .cache = &cache, .connections = &.{}, .commands = &commands });
+    try testing.expectEqual(@as(usize, 0), result.candidates.len);
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    const definitions = try cache.arena.allocator().alloc(Candidate, max_candidates + 5);
+    for (definitions, 0..) |*candidate, i| candidate.* = .{
+        .text = try std.fmt.allocPrint(cache.arena.allocator(), "user_view_{d}", .{i}),
+        .kind = .definition,
+        .detail = "view",
+    };
+    cache.definitions = definitions;
+    var counted = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    const capped = try complete(counted.allocator(), .{ .text = "/def user", .cursor = 9, .cache = &cache, .connections = &.{}, .commands = &commands });
+    defer counted.allocator().free(capped.candidates);
+    try testing.expectEqual(@as(usize, max_candidates), capped.candidates.len);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
 }
 
 test "operators depend on SQL dialect" {

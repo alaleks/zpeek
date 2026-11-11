@@ -138,7 +138,7 @@ pub fn draw(p: *Picker, win: vaxis.Window, a: Allocator) Allocator.Error!void {
     if (p.selected >= p.top + visible) p.top = p.selected + 1 - visible;
 
     if (p.matches.items.len == 0) {
-        const msg: []const u8 = if (p.purpose == .export_csv or p.purpose == .export_json) "type a new file path · enter exports · esc cancels" else if (p.purpose == .save_query) "type a name · enter saves · esc cancels" else if (p.allow_raw and p.query.items.len > 0) "no match — enter connects to this URL / path" else "no matches";
+        const msg: []const u8 = if (p.purpose == .export_csv or p.purpose == .export_json) "type a path and filename · enter exports · esc cancels" else if (p.purpose == .save_query) "type a name · enter saves · esc cancels" else if (p.allow_raw and p.query.items.len > 0) "no match — enter connects to this URL / path" else "no matches";
         _ = box.print(&.{.{ .text = msg, .style = theme.dim }}, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
         return;
     }

@@ -91,7 +91,7 @@ pub fn listSql(kind: Kind, obj: Object) ?[]const u8 {
             .triggers =>
             \\select n.nspname as schema, c.relname as "table", t.tgname as name,
             \\  case t.tgenabled when 'D' then 'disabled' else 'enabled' end as status,
-            \\  regexp_replace(pg_get_triggerdef(t.oid, true), '^CREATE (CONSTRAINT )?TRIGGER \S+ ', '') as definition,
+            \\  split_part(regexp_replace(pg_get_triggerdef(t.oid, true), '^CREATE (CONSTRAINT )?TRIGGER \S+ ', ''), ' ON ', 1) as event,
             \\  t.oid::text as oid
             \\from pg_trigger t
             \\  join pg_class c on c.oid = t.tgrelid
@@ -333,7 +333,8 @@ pub fn definitionSql(a: Allocator, kind: Kind, name: []const u8) Allocator.Error
                 \\from pg_proc p join pg_namespace n on n.oid = p.pronamespace
                 \\where p.prokind in ('f', 'p', 'w') and p.proname = {[obj]s} and {[sf]s}
                 \\union all
-                \\select 'trigger', n.nspname || '.' || c.relname || '.' || t.tgname, pg_get_triggerdef(t.oid, true)
+                \\select 'trigger', n.nspname || '.' || c.relname || '.' || t.tgname,
+                \\  pg_get_triggerdef(t.oid, true) || E';\n\n' || pg_get_functiondef(t.tgfoid)
                 \\from pg_trigger t join pg_class c on c.oid = t.tgrelid join pg_namespace n on n.oid = c.relnamespace
                 \\where not t.tgisinternal and t.tgname = {[obj]s} and {[sf]s}
                 \\union all
@@ -401,7 +402,8 @@ pub fn definitionSqlForOid(a: Allocator, obj: Object, oid_text: []const u8) (All
             \\where p.oid = {d}
         , .{oid}),
         .triggers => std.fmt.allocPrint(a,
-            \\select 'trigger', n.nspname || '.' || c.relname || '.' || t.tgname, pg_get_triggerdef(t.oid, true)
+            \\select 'trigger', n.nspname || '.' || c.relname || '.' || t.tgname,
+            \\  pg_get_triggerdef(t.oid, true) || E';\n\n' || pg_get_functiondef(t.tgfoid)
             \\from pg_trigger t join pg_class c on c.oid = t.tgrelid join pg_namespace n on n.oid = c.relnamespace
             \\where t.oid = {d} and not t.tgisinternal
         , .{oid}),
@@ -455,6 +457,59 @@ pub fn definitionSqlForObject(a: Allocator, kind: Kind, obj: Object, name: []con
             , .{try quoteLiteral(a, kind, splitName(name).name)}),
             else => definitionSql(a, kind, name),
         },
+    };
+}
+
+/// (name, kind) pairs for /def; source bodies are fetched only on selection.
+pub fn definitionCompletionSql(kind: Kind) []const u8 {
+    return switch (kind) {
+        .postgres =>
+        \\select n.nspname || '.' || c.relname as name, 'view' as kind
+        \\from pg_class c join pg_namespace n on n.oid = c.relnamespace
+        \\where c.relkind in ('v', 'm') and
+        ++ pg_user_ns ++
+            \\
+            \\union all
+            \\select distinct n.nspname || '.' || p.proname,
+            \\  case p.prokind when 'p' then 'procedure' else 'function' end
+            \\from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            \\where p.prokind in ('f', 'p', 'w') and
+        ++ pg_user_ns ++
+            \\
+            \\union all
+            \\select distinct n.nspname || '.' || t.tgname, 'trigger'
+            \\from pg_trigger t join pg_class c on c.oid = t.tgrelid
+            \\  join pg_namespace n on n.oid = c.relnamespace
+            \\where not t.tgisinternal and
+        ++ pg_user_ns ++
+            \\
+            \\union all
+            \\select n.nspname || '.' || t.typname, 'type'
+            \\from pg_type t join pg_namespace n on n.oid = t.typnamespace
+            \\where t.typtype = 'e' and
+        ++ pg_user_ns ++
+            \\
+            \\order by 1, 2
+        ,
+        .mysql =>
+        \\select table_name as name, 'view' as kind from information_schema.views where table_schema = database()
+        \\union all
+        \\select routine_name, lower(routine_type) from information_schema.routines where routine_schema = database()
+        \\union all
+        \\select trigger_name, 'trigger' from information_schema.triggers where trigger_schema = database()
+        \\order by 1, 2
+        ,
+        .sqlite =>
+        \\select name, type as kind from sqlite_schema
+        \\where type in ('view', 'trigger') and sql is not null order by name
+        ,
+        .clickhouse =>
+        \\select name, 'view' as kind from system.tables
+        \\where database = currentDatabase() and engine in ('View', 'MaterializedView', 'LiveView')
+        \\union all
+        \\select name, 'function' from system.functions where origin = 'SQLUserDefined'
+        \\order by 1, 2
+        ,
     };
 }
 
@@ -769,4 +824,6 @@ test "selected definition filters object kind" {
     try testing.expect(std.mem.indexOf(u8, clickhouse, "engine in ('View', 'MaterializedView', 'LiveView')") != null);
     const general_clickhouse = try definitionSql(a, .clickhouse, "report");
     try testing.expect(std.mem.indexOf(u8, general_clickhouse, "engine in ('View', 'MaterializedView', 'LiveView')") != null);
+    const trigger = try definitionSql(a, .postgres, "public.audit_orders");
+    try testing.expect(std.mem.indexOf(u8, trigger, "pg_get_functiondef(t.tgfoid)") != null);
 }

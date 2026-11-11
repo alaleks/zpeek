@@ -8,6 +8,36 @@ pub const Selection = struct {
     columns: ?[]const usize = null,
 };
 
+/// Borrows matching paths; paths with an appended extension belong to a.
+pub fn filePath(a: std.mem.Allocator, path: []const u8, format: Format) std.mem.Allocator.Error![]const u8 {
+    if (path.len == 0 or path[path.len - 1] == '/' or
+        (@import("builtin").os.tag == .windows and path[path.len - 1] == '\\')) return path;
+    const extension = switch (format) {
+        .csv => ".csv",
+        .json => ".json",
+    };
+    if (std.ascii.endsWithIgnoreCase(path, extension)) return path;
+    return std.mem.concat(a, u8, &.{ path, extension });
+}
+
+test "export paths append the selected extension without duplicating it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { path: []const u8, format: Format, expected: []const u8 }{
+        .{ .path = "report", .format = .csv, .expected = "report.csv" },
+        .{ .path = "folder.with.dots/report", .format = .json, .expected = "folder.with.dots/report.json" },
+        .{ .path = "report.csv", .format = .json, .expected = "report.csv.json" },
+        .{ .path = "report.CSV", .format = .csv, .expected = "report.CSV" },
+        .{ .path = "report.json", .format = .json, .expected = "report.json" },
+    };
+    for (cases) |c| try std.testing.expectEqualStrings(c.expected, try filePath(arena.allocator(), c.path, c.format));
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const existing = "report.csv";
+    try std.testing.expectEqual(existing.ptr, (try filePath(failing.allocator(), existing, .csv)).ptr);
+    try std.testing.expectEqualStrings("", try filePath(failing.allocator(), "", .csv));
+    try std.testing.expectEqualStrings("folder/", try filePath(failing.allocator(), "folder/", .json));
+}
+
 pub fn write(w: *std.Io.Writer, result: db.Result, format: Format, selection: Selection) !void {
     const ncols = if (selection.columns) |cols| cols.len else result.columns.len;
     const nrows = if (selection.rows) |rows| rows.len else result.rows.len;

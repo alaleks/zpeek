@@ -13,9 +13,9 @@ Type SQL at the prompt, or start a command with `/`. Press `tab` to accept a com
 | `/views`, `/functions`, `/triggers` | Pick an object and see its SQL definition |
 | `/types` | Pick a custom type and see its values |
 | `/describe <table>` | Show columns, indexes, and constraints |
-| `/def <name>` | Show the definition of a view, function, trigger, or enum |
+| `/def <name>` | Complete an object name and show its view, function, trigger, or enum definition |
 | `/databases` | List databases |
-| `/refresh` | Reload table and column names for completion |
+| `/refresh` | Reload table, column, and definition names for completion |
 | `/save [name]`, `/queries [name]` | Save SQL or find a saved query; omit the name to open a dialog |
 | `/unsave <name>` | Delete a saved query |
 | `/history [search]` | Search SQL history and load an input for review |
@@ -28,6 +28,10 @@ Type SQL at the prompt, or start a command with `/`. Press `tab` to accept a com
 | `/help` | Show commands and keys |
 
 In a picker, type to filter and press `enter` to open the selected item.
+
+The `/triggers` picker shows each trigger's table and, where supported, event and status. Search by trigger or table name. PostgreSQL trigger definitions include the backing function body.
+
+Type `/def ` followed by part of an object name to see suggestions, or press `tab` to complete it. Names are loaded when connecting and refreshed after schema changes; use `/refresh` after changes made outside zpeek.
 
 ## Console keys
 
@@ -98,11 +102,11 @@ History retains at most 1,000 console entries and 16 MiB. It is streamed to a te
 Export the last retained query result:
 
 ```text
-/export csv ./result.csv
-/export json ./result.json
+/export csv ./result
+/export json ./result
 ```
 
-Omit the path to enter it in a dialog. In a table or plan viewer, press `e`, choose CSV or JSON, and enter a new file path. Table export includes the current visible columns and retained rows in their displayed sort/filter order. In `/browse`, that means the current page, not the entire database table.
+Omit the path to enter it in a dialog. In a table or plan viewer, press `e`, choose CSV or JSON, and enter a new file path. The selected format's `.csv` or `.json` extension is appended automatically unless the filename already ends with it (case-insensitive). Table export includes the current visible columns and retained rows in their displayed sort/filter order. In `/browse`, that means the current page, not the entire database table.
 
 The export command refuses to overwrite an existing file. It writes a temporary file and moves it into place when complete. On Unix, the new file is private to your user.
 
