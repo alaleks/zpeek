@@ -105,18 +105,27 @@ pub fn fitWidth(s: []const u8, max: usize) struct { text: []const u8, width: usi
 /// Makes a value printable on one line: control characters become spaces,
 /// newlines become `¶` (Latin-1, present in every font). Returns `s` itself when nothing needs changing.
 pub fn singleLine(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-    const needs = for (s) |ch| {
-        if (ch < 0x20 or ch == 0x7f) break true;
-    } else false;
+    var needs = false;
+    var len = s.len;
+    for (s) |ch| {
+        needs = needs or ch < 0x20 or ch == 0x7f;
+        if (ch == '\n') len = std.math.add(usize, len, "¶".len - 1) catch return error.OutOfMemory;
+        if (ch == '\r') len -= 1;
+    }
     if (!needs) return s;
-    var out: std.ArrayList(u8) = .empty;
-    for (s) |ch| switch (ch) {
-        '\n' => try out.appendSlice(a, "¶"),
-        '\r' => {},
-        0...9, 11...12, 14...0x1f, 0x7f => try out.append(a, ' '),
-        else => try out.append(a, ch),
-    };
-    return out.items;
+    const out = try a.alloc(u8, len);
+    var offset: usize = 0;
+    for (s, 0..) |ch, i| {
+        const text = switch (ch) {
+            '\n' => "¶",
+            '\r' => "",
+            0...9, 11...12, 14...0x1f, 0x7f => " ",
+            else => s[i..][0..1],
+        };
+        @memcpy(out[offset..][0..text.len], text);
+        offset += text.len;
+    }
+    return out;
 }
 
 pub const TableOptions = struct {
@@ -141,8 +150,9 @@ pub fn writeResult(gpa: Allocator, w: *std.Io.Writer, r: db.Result, opts: TableO
     var cell_memory: [preview_bytes + "…".len]u8 = undefined;
     var scratch: std.heap.FixedBufferAllocator = .init(&cell_memory);
     const ncols = r.columns.len;
-    const widths = try gpa.alloc(usize, ncols);
-    defer gpa.free(widths);
+    var width_memory: [64]usize = undefined;
+    const widths = if (ncols <= width_memory.len) width_memory[0..ncols] else try gpa.alloc(usize, ncols);
+    defer if (ncols > width_memory.len) gpa.free(widths);
     for (r.columns, 0..) |name, i| {
         widths[i] = displayWidth(try singleLine(arena.allocator(), name));
         _ = arena.reset(.{ .retain_with_limit = scratch_limit });
@@ -211,6 +221,27 @@ test "fitWidth and singleLine" {
     try std.testing.expectEqualStrings("a¶b", try singleLine(arena.allocator(), "a\r\nb"));
 }
 
+test "singleLine allocates exactly once for changed text and borrows clean input" {
+    for ([_][2][]const u8{
+        .{ "a\r\n\t\x00\x7f日本", "a¶   日本" },
+        .{ "first\nsecond\n", "first¶second¶" },
+        .{ "\r\r", "" },
+        .{ "plain 日本", "plain 日本" },
+        .{ "", "" },
+    }) |case| {
+        var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+        const text = try singleLine(counted.allocator(), case[0]);
+        defer if (text.ptr != case[0].ptr) counted.allocator().free(text);
+        try std.testing.expectEqualStrings(case[1], text);
+        const changed = !std.mem.eql(u8, case[0], case[1]);
+        try std.testing.expectEqual(@as(usize, if (changed and text.len > 0) 1 else 0), counted.allocations);
+        try std.testing.expectEqual(@as(usize, if (changed) text.len else 0), counted.allocated_bytes);
+        if (!changed) try std.testing.expectEqual(case[0].ptr, text.ptr);
+    }
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, singleLine(failing.allocator(), "a\nb"));
+}
+
 test "saturated column widths preserve output and validate later rows" {
     var r: db.Result = .{ .arena = .init(std.testing.allocator), .columns = &.{"x"}, .rows = &.{ &.{"abcd"}, &.{"日本"} } };
     defer r.deinit();
@@ -261,12 +292,29 @@ test "CLI cell scratch avoids heap allocation across repeated cells" {
     const rows: [5000][]const ?[]const u8 = @splat(&cells);
     var result: db.Result = .{ .arena = .init(std.testing.allocator), .columns = &.{ "a", "b", "c", "d" }, .rows = &rows };
     defer result.deinit();
-    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var memory: [256]u8 = undefined;
     var output = std.Io.Writer.Discarding.init(&memory);
     try writeResult(counted.allocator(), &output.writer, result, .{});
-    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 0), counted.allocations);
     try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+}
+
+test "table widths use the stack through 64 columns and one heap allocation beyond" {
+    const columns: [65][]const u8 = @splat("column");
+    const values: [65]?[]const u8 = @splat("x");
+    for ([_]usize{ 64, 65 }) |ncols| {
+        const rows = [_][]const ?[]const u8{values[0..ncols]};
+        var result: db.Result = .{ .arena = .init(std.testing.allocator), .columns = columns[0..ncols], .rows = &rows };
+        defer result.deinit();
+        const expected: usize = if (ncols == 64) 0 else 1;
+        var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = expected });
+        var memory: [256]u8 = undefined;
+        var output = std.Io.Writer.Discarding.init(&memory);
+        try writeResult(counted.allocator(), &output.writer, result, .{});
+        try std.testing.expectEqual(expected, counted.allocations);
+        try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+    }
 }
 
 test "status explicitly shows zero affected rows and duration" {

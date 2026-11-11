@@ -81,17 +81,7 @@ const My = struct {
     }
 
     fn writePacket(self: *My, payload: []const u8) Error!void {
-        const w = self.t.writer();
-        var rest = payload;
-        while (true) {
-            const chunk = rest[0..@min(rest.len, 0xFFFFFF)];
-            const len: u32 = @intCast(chunk.len);
-            try w.writeAll(&.{ @truncate(len), @truncate(len >> 8), @truncate(len >> 16), self.seq });
-            self.seq +%= 1;
-            try w.writeAll(chunk);
-            rest = rest[chunk.len..];
-            if (chunk.len < 0xFFFFFF) break;
-        }
+        try writePacketParts(self.t.writer(), &self.seq, &.{payload});
         try self.t.flush();
     }
 
@@ -309,11 +299,8 @@ const My = struct {
 
     fn runQuery(self: *My, gpa: Allocator, sql: []const u8, opts: db.QueryOptions) (Error || error{ QueryFailed, Canceled })!db.Result {
         self.seq = 0;
-        const cmd = try self.gpa.alloc(u8, sql.len + 1);
-        defer self.gpa.free(cmd);
-        cmd[0] = 0x03; // COM_QUERY
-        @memcpy(cmd[1..], sql);
-        try self.writePacket(cmd);
+        try writePacketParts(self.t.writer(), &self.seq, &.{ &.{0x03}, sql }); // COM_QUERY
+        try self.t.flush();
 
         var b: db.ResultBuilder = .init(gpa);
         errdefer b.deinit();
@@ -448,6 +435,73 @@ const My = struct {
         self.gpa.destroy(self);
     }
 };
+
+fn writePacketParts(w: *Io.Writer, seq: *u8, parts: []const []const u8) (Io.Writer.Error || error{StreamTooLong})!void {
+    var length: usize = 0;
+    for (parts) |part| length = std.math.add(usize, length, part.len) catch return error.StreamTooLong;
+    var index: usize = 0;
+    var offset: usize = 0;
+    while (true) {
+        const chunk_len = @min(length, 0xFFFFFF);
+        const len: u32 = @intCast(chunk_len);
+        try w.writeAll(&.{ @truncate(len), @truncate(len >> 8), @truncate(len >> 16), seq.* });
+        seq.* +%= 1;
+        var remaining = chunk_len;
+        while (remaining > 0) {
+            const part = parts[index];
+            const take = @min(remaining, part.len - offset);
+            try w.writeAll(part[offset..][0..take]);
+            offset += take;
+            remaining -= take;
+            if (offset == part.len) {
+                index += 1;
+                offset = 0;
+            }
+        }
+        length -= chunk_len;
+        if (chunk_len < 0xFFFFFF) break;
+    }
+}
+
+test "packet parts share one header and empty packets preserve sequence numbers" {
+    var buffer: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    var seq: u8 = 254;
+    try writePacketParts(&writer, &seq, &.{ "", "\x03", "select ", "", "1", "" });
+    try writePacketParts(&writer, &seq, &.{});
+    try std.testing.expectEqualSlices(u8, "\x09\x00\x00\xfe\x03select 1\x00\x00\x00\xff", writer.buffered());
+    try std.testing.expectEqual(@as(u8, 0), seq);
+    var too_small: Io.Writer = .fixed(&.{});
+    try std.testing.expectError(error.WriteFailed, writePacketParts(&too_small, &seq, &.{"x"}));
+}
+
+test "query packet parts preserve continuation boundaries without a combined SQL buffer" {
+    const a = std.testing.allocator;
+    const sql = try a.alloc(u8, 0x1000000);
+    defer a.free(sql);
+    @memset(sql, 'x');
+    const output = try a.alloc(u8, sql.len + 16);
+    defer a.free(output);
+    for ([_]usize{ 0, 3, 0xFFFFFE, 0xFFFFFF, 0x1000000 }) |size| {
+        var writer: Io.Writer = .fixed(output);
+        var seq: u8 = 254;
+        try writePacketParts(&writer, &seq, &.{ &.{0x03}, sql[0..size] });
+        var reader: Io.Reader = .fixed(writer.buffered());
+        const first_len = @min(size + 1, 0xFFFFFF);
+        try std.testing.expectEqual(@as(u24, @intCast(first_len)), try reader.takeInt(u24, .little));
+        try std.testing.expectEqual(@as(u8, 254), try reader.takeByte());
+        try std.testing.expectEqual(@as(u8, 0x03), try reader.takeByte());
+        try std.testing.expectEqualSlices(u8, sql[0 .. first_len - 1], try reader.take(first_len - 1));
+        if (size + 1 >= 0xFFFFFF) {
+            const rest = size + 1 - first_len;
+            try std.testing.expectEqual(@as(u24, @intCast(rest)), try reader.takeInt(u24, .little));
+            try std.testing.expectEqual(@as(u8, 255), try reader.takeByte());
+            try std.testing.expectEqualSlices(u8, sql[first_len - 1 .. size], try reader.take(rest));
+            try std.testing.expectEqual(@as(u8, 0), seq);
+        } else try std.testing.expectEqual(@as(u8, 255), seq);
+        try std.testing.expectError(error.EndOfStream, reader.takeByte());
+    }
+}
 
 fn checkedLogicalPacketEnd(start: usize, len: usize) error{StreamTooLong}!usize {
     if (start > max_logical_packet_size or len > max_logical_packet_size - start) return error.StreamTooLong;

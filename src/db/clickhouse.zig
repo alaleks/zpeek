@@ -28,13 +28,25 @@ const BodySink = struct {
         s.response.body_bytes += bytes.len;
         if (s.builder == null) return s.response.body.appendSlice(s.gpa, bytes);
         var remaining = bytes;
-        while (std.mem.indexOfScalar(u8, remaining, '\n')) |end| {
-            try s.line.appendSlice(s.gpa, remaining[0..end]);
-            try s.consumeLine(s.line.items);
+        while (remaining.len > 0) {
+            const b = s.builder.?;
+            if (b.result.columns.len > 0 and b.full(s.opts) and std.mem.eql(u8, s.response.format(), "TabSeparatedWithNames")) {
+                b.result.truncated = true;
+                return;
+            }
+            const end = std.mem.indexOfScalar(u8, remaining, '\n') orelse {
+                try s.line.appendSlice(s.gpa, remaining);
+                return;
+            };
+            if (s.line.items.len == 0) {
+                try s.consumeLine(remaining[0..end]);
+            } else {
+                try s.line.appendSlice(s.gpa, remaining[0..end]);
+                try s.consumeLine(s.line.items);
+            }
             @import("../memory.zig").clear(&s.line, s.gpa);
             remaining = remaining[end + 1 ..];
         }
-        try s.line.appendSlice(s.gpa, remaining);
     }
 
     fn finish(s: *BodySink) !void {
@@ -522,6 +534,86 @@ pub fn connect(gpa: Allocator, io: Io, params: conninfo.Params, err_out: *db.Err
 }
 
 const testing = std.testing;
+
+test "complete TSV lines need no scratch allocation and retain owned values" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var response: Ch.Response = .{ .status = 200 };
+    defer response.deinit(failing.allocator());
+    const format = "TabSeparatedWithNames";
+    @memcpy(response.format_buf[0..format.len], format);
+    response.format_len = format.len;
+    var builder = db.ResultBuilder.init(a);
+    defer builder.deinit();
+    var sink: BodySink = .{ .gpa = failing.allocator(), .response = &response, .builder = &builder, .opts = .{} };
+    defer sink.line.deinit(failing.allocator());
+    var body = "id\tvalue\n1\t日本\\t語\n2\t\\N\n".*;
+    try sink.feed(&body);
+    try sink.finish();
+    @memset(&body, 'x');
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 2), builder.rows.items.len);
+    try std.testing.expectEqualStrings("value", builder.result.columns[1]);
+    try std.testing.expectEqualStrings("日本\t語", builder.rows.items[0][1].?);
+    try std.testing.expect(builder.rows.items[1][1] == null);
+}
+
+test "discarded TSV rows need no scratch allocation after row or byte limits" {
+    const a = std.testing.allocator;
+    const prefix = "value\nkept\n";
+    const body_len = prefix.len + 1024 * 1024 + 1;
+    const wire = try a.alloc(u8, body_len + 4);
+    defer a.free(wire);
+    @memcpy(wire[0..prefix.len], prefix);
+    @memset(wire[prefix.len .. body_len - 1], 'x');
+    wire[body_len - 1] = '\n';
+    @memcpy(wire[body_len..], "NEXT");
+    for ([_]db.QueryOptions{ .{ .max_rows = 1 }, .{ .max_bytes = @sizeOf(?[]const u8) + 4 } }) |opts| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        var response: Ch.Response = .{ .status = 200 };
+        defer response.deinit(failing.allocator());
+        const format = "TabSeparatedWithNames";
+        @memcpy(response.format_buf[0..format.len], format);
+        response.format_len = format.len;
+        var builder = db.ResultBuilder.init(a);
+        defer builder.deinit();
+        var reader: Io.Reader = .fixed(wire);
+        try readBody(failing.allocator(), &reader, &response, &builder, opts, body_len, false);
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+        try std.testing.expectEqual(@as(usize, 1), builder.rows.items.len);
+        try std.testing.expectEqualStrings("kept", builder.rows.items[0][0].?);
+        try std.testing.expect(builder.result.truncated);
+        try std.testing.expectEqual(body_len, response.body_bytes);
+        try std.testing.expectEqualStrings("NEXT", try reader.take(4));
+    }
+}
+
+test "stream limits preserve exact row counts and raw trailing newlines" {
+    const a = std.testing.allocator;
+    for ([_]struct { body: []const u8, tsv: bool = true, limit: usize = 1, rows: usize = 1, truncated: bool = false }{
+        .{ .body = "value\nkept\n" },
+        .{ .body = "value\nkept" },
+        .{ .body = "value\nkept\n\n", .truncated = true },
+        .{ .body = "value\n", .limit = 0, .rows = 0 },
+        .{ .body = "value\n\n", .limit = 0, .rows = 0, .truncated = true },
+        .{ .body = "first\n\n", .tsv = false },
+        .{ .body = "first\n\nlast\n\n", .tsv = false, .truncated = true },
+    }) |case| {
+        var response: Ch.Response = .{ .status = 200 };
+        defer response.deinit(a);
+        if (case.tsv) {
+            const format = "TabSeparatedWithNames";
+            @memcpy(response.format_buf[0..format.len], format);
+            response.format_len = format.len;
+        }
+        var builder = db.ResultBuilder.init(a);
+        defer builder.deinit();
+        var reader: Io.Reader = .fixed(case.body);
+        try readBody(a, &reader, &response, &builder, .{ .max_rows = case.limit }, case.body.len, false);
+        try std.testing.expectEqual(case.rows, builder.rows.items.len);
+        try std.testing.expectEqual(case.truncated, builder.result.truncated);
+    }
+}
 
 test "streamed TSV survives chunk boundaries and drains trailers after row limits" {
     const a = std.testing.allocator;

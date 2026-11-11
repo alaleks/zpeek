@@ -83,10 +83,11 @@ pub fn list(arena: Allocator, io: Io, dir_path: []const u8, include_sql: bool) !
         const name = entry.name[0 .. entry.name.len - ".sql".len];
         if (!validName(name)) continue;
         const owned = try arena.dupe(u8, name);
-        const sql = if (include_sql) load(arena, io, dir_path, owned) catch |err| switch (err) {
+        const data = if (include_sql) dir.readFileAlloc(io, entry.name, arena, .limited(max_size)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => "",
         } else "";
+        const sql = std.mem.trim(u8, data, " \t\r\n");
         try out.append(arena, .{ .name = owned, .preview = previewLine(sql), .sql = sql });
     }
     std.mem.sort(Entry, out.items, {}, struct {

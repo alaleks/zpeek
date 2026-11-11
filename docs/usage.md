@@ -89,6 +89,8 @@ Press `ctrl+s` to save SQL from the editor without executing it. With empty inpu
 
 Press `ctrl+r` or run `/queries` to find a saved query by name or SQL text. You can preview it before pressing `enter` to load it. This replaces your current input without running the query. `/queries <name>` loads a known query directly; `/save <name>` skips the naming dialog.
 
+Saved-query names are reused while typing. Changes made to files outside zpeek appear when you start a new saved-query command or reopen completion with `esc`, then `tab`. Loading a query always reads its current contents from disk.
+
 Queries are ordinary `<name>.sql` files in the `queries` directory beside the active config. Names use letters, digits, `_`, `-`, and `.`; queries can also be edited outside zpeek.
 
 ## SQL history

@@ -441,8 +441,8 @@ fn ensureLayout(e: *Entry, width: u16) Allocator.Error!void {
     e.layout_width = width;
 }
 
-/// Wraps segments to `width`, splitting on newlines. The first line gets
-/// `first`, following lines get `cont` as prefix.
+/// Wraps at word boundaries, splitting oversized words only at graphemes.
+/// The first line gets `first`, following lines get `cont` as prefix.
 pub fn wrapWithPrefix(
     a: Allocator,
     out: *std.ArrayList(Line),
@@ -452,10 +452,11 @@ pub fn wrapWithPrefix(
     cont: []const u8,
 ) Allocator.Error!void {
     const prefix_w = render.displayWidth(first.text);
-    const avail: usize = @max(@as(usize, width) -| prefix_w, 8);
+    const avail: usize = @max(@as(usize, width) -| prefix_w, 1);
     var line: std.ArrayList(Segment) = .empty;
     try line.append(a, first);
     var col: usize = 0;
+    var has_content = false;
 
     for (segs) |seg| {
         var rest = seg.text;
@@ -465,29 +466,44 @@ pub fn wrapWithPrefix(
                 line = .empty;
                 try line.append(a, .{ .text = cont, .style = first.style });
                 col = 0;
+                has_content = false;
                 rest = rest[1..];
                 continue;
             }
             const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
             const piece = rest[0..nl];
-            const fit = render.fitWidth(piece, avail - col);
+            var fit = render.fitWidth(piece, avail -| col);
+            if (fit.text.len > 0 and fit.text.len < piece.len and
+                !std.ascii.isWhitespace(piece[fit.text.len - 1]) and !std.ascii.isWhitespace(piece[fit.text.len]))
+            {
+                const space = std.mem.lastIndexOfAny(u8, fit.text, " \t");
+                if (space != null and std.mem.trim(u8, fit.text[0 .. space.? + 1], " \t").len > 0) {
+                    const text = fit.text[0 .. space.? + 1];
+                    fit = .{ .text = text, .width = render.displayWidth(text) };
+                } else if (has_content) {
+                    fit = .{ .text = "", .width = 0 };
+                }
+            }
             if (fit.text.len == 0 and col > 0) {
                 // wrap
                 try out.append(a, line.items);
                 line = .empty;
                 try line.append(a, .{ .text = cont, .style = first.style });
                 col = 0;
+                has_content = false;
                 continue;
             }
             const take = if (fit.text.len == 0) firstGrapheme(piece) else fit.text;
             try line.append(a, .{ .text = take, .style = seg.style });
             col += if (fit.text.len == 0) render.displayWidth(take) else fit.width;
+            has_content = has_content or std.mem.trim(u8, take, " \t\r").len > 0;
             rest = rest[take.len..];
             if (rest.len > 0 and rest[0] != '\n' and col >= avail) {
                 try out.append(a, line.items);
                 line = .empty;
                 try line.append(a, .{ .text = cont, .style = first.style });
                 col = 0;
+                has_content = false;
             }
         }
     }
@@ -498,6 +514,83 @@ fn firstGrapheme(s: []const u8) []const u8 {
     var it = vaxis.unicode.graphemeIterator(s);
     const g = it.next() orelse return s;
     return g.bytes(s);
+}
+
+test "trigger source wraps whole highlighted words and reflows on resize" {
+    const a = std.testing.allocator;
+    const source = "CREATE TRIGGER audit_orders BEFORE INSERT ON orders\nEXECUTE FUNCTION audit_orders();";
+    var transcript = Transcript.init(a);
+    defer transcript.deinit();
+    try transcript.add(.{ .code = source });
+    const entry = transcript.entries.items[0];
+    for ([_]u16{ 22, 80, 22 }) |width| {
+        try ensureLayout(entry, width);
+        const expected: []const []const u8 = if (width == 22) &.{
+            "  CREATE TRIGGER",
+            "  audit_orders BEFORE",
+            "  INSERT ON orders",
+            "  EXECUTE FUNCTION",
+            "  audit_orders();",
+        } else &.{
+            "  CREATE TRIGGER audit_orders BEFORE INSERT ON orders",
+            "  EXECUTE FUNCTION audit_orders();",
+        };
+        try std.testing.expectEqual(expected.len, entry.layout.len);
+        var found_keyword = false;
+        for (entry.layout, expected) |line, text| {
+            var memory: [128]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&memory);
+            for (line) |segment| {
+                try writer.writeAll(segment.text);
+                if (std.mem.eql(u8, segment.text, "CREATE")) {
+                    try std.testing.expect(std.meta.eql(theme.sqlStyle(.keyword), segment.style));
+                    found_keyword = true;
+                }
+            }
+            try std.testing.expectEqualStrings(text, std.mem.trimEnd(u8, writer.buffered(), " \t"));
+            try std.testing.expect(render.displayWidth(writer.buffered()) <= width);
+        }
+        try std.testing.expect(found_keyword);
+        try std.testing.expectEqualStrings(source, entry.content.code);
+    }
+}
+
+test "wrapping prefers spaces within a segment and preserves long Unicode words" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var lines: std.ArrayList(Line) = .empty;
+    try wrapWithPrefix(arena.allocator(), &lines, &.{.{ .text = "alpha beta gamma", .style = theme.info }}, 14, .{ .text = "  " }, "  ");
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    const expected = [_][]const u8{ "  alpha beta ", "  gamma" };
+    for (lines.items, expected) |line, text| {
+        var memory: [64]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&memory);
+        for (line) |segment| try writer.writeAll(segment.text);
+        try std.testing.expectEqualStrings(text, writer.buffered());
+        for (line[1..]) |segment| try std.testing.expect(std.meta.eql(theme.info, segment.style));
+    }
+    const segments = [_]Segment{
+        .{ .text = "日本é0123456789", .style = theme.info },
+        .{ .text = "語abc", .style = theme.bold },
+    };
+    for ([_]u16{ 3, 4, 5, 8 }) |width| {
+        lines = .empty;
+        try wrapWithPrefix(arena.allocator(), &lines, &segments, width, .{ .text = "  " }, "  ");
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(a);
+        for (lines.items) |line| {
+            var line_width: usize = 0;
+            for (line, 0..) |segment, i| {
+                try std.testing.expect(std.unicode.utf8ValidateSlice(segment.text));
+                line_width += render.displayWidth(segment.text);
+                if (i > 0) try joined.appendSlice(a, segment.text);
+            }
+            // A two-cell grapheme cannot fit beside the prefix in a three-cell window.
+            try std.testing.expect(line_width <= @max(width, 4));
+        }
+        try std.testing.expectEqualStrings("日本é0123456789語abc", joined.items);
+    }
 }
 
 test "expanded schema results show rows beyond the console preview" {

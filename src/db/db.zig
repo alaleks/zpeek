@@ -73,6 +73,7 @@ pub const ResultBuilder = struct {
     gpa: Allocator,
     rows: std.ArrayList([]const ?[]const u8) = .empty,
     row_chunk: []align(@alignOf(?[]const u8)) u8 = &.{},
+    next_chunk_bytes: usize = 8 * 1024,
     stored_bytes: usize = 0,
 
     pub fn init(gpa: Allocator) ResultBuilder {
@@ -92,8 +93,9 @@ pub const ResultBuilder = struct {
         const padded_bytes = std.math.add(usize, row_bytes, alignment - 1) catch return error.OutOfMemory;
         const stride = std.mem.alignBackward(usize, padded_bytes, alignment);
         if (b.row_chunk.len < stride) {
-            const chunk_bytes = @max(stride, @min(64 * 1024, opts.max_bytes - b.stored_bytes, stride *| (opts.max_rows - b.rows.items.len)));
+            const chunk_bytes = @max(stride, @min(b.next_chunk_bytes, opts.max_bytes - b.stored_bytes, stride *| (opts.max_rows - b.rows.items.len)));
             b.row_chunk = try a.alignedAlloc(u8, .of(?[]const u8), std.mem.alignBackward(usize, chunk_bytes, alignment));
+            b.next_chunk_bytes = @min(64 * 1024, @max(b.next_chunk_bytes, stride) *| 2);
         }
         const block = b.row_chunk[0..row_bytes];
         b.row_chunk = @alignCast(b.row_chunk[stride..]);
@@ -169,6 +171,26 @@ pub const QueryOptions = struct {
     max_bytes: usize = 16 * 1024 * 1024,
 };
 
+test "short results fit in a small allocation budget" {
+    var memory: [16 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    var result = blk: {
+        var builder = ResultBuilder.init(fixed.allocator());
+        errdefer builder.deinit();
+        try builder.setColumns(&.{ "id", "name", "note" });
+        var row = (try builder.allocRow(3, 7, .{})).?;
+        row.put(0, "1");
+        row.put(1, "日本");
+        row.put(2, null);
+        try builder.addRow(row.row, .{});
+        break :blk builder.finish();
+    };
+    defer result.deinit();
+    try std.testing.expect(result.capacity() < memory.len);
+    try std.testing.expectEqualStrings("日本", result.rows[0][1].?);
+    try std.testing.expect(result.rows[0][2] == null);
+}
+
 test "row chunks bound backing allocations and preserve earlier values" {
     var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     var builder = ResultBuilder.init(std.testing.allocator);
@@ -182,7 +204,7 @@ test "row chunks bound backing allocations and preserve earlier values" {
         try builder.addRow(row.row, .{});
     }
     // Count row data separately from growth of the array of row references.
-    try std.testing.expect(counted.allocations <= 2);
+    try std.testing.expect(counted.allocations <= 4);
     counted.fail_index = counted.alloc_index;
     try std.testing.expect(builder.result.arena.queryCapacity() < 1024 * 1024);
     try std.testing.expectError(error.OutOfMemory, builder.allocRow(1, 1024 * 1024, .{}));

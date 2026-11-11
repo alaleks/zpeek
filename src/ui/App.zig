@@ -192,6 +192,7 @@ ticker: ?Io.Future(void) = null,
 
 popup: ?Popup = null,
 popup_arena: std.heap.ArenaAllocator,
+saved_query_names: ?struct { arena: std.heap.ArenaAllocator, names: []const []const u8 = &.{} } = null,
 pasting: bool = false,
 exit_armed: bool = false,
 notice: std.ArrayList(u8) = .empty,
@@ -293,6 +294,7 @@ fn deinit(app: *App) void {
     }
     app.transcript.deinit();
     app.conn_arena.deinit();
+    app.clearSavedQueryNames();
     app.popup_arena.deinit();
     app.frame_arena.deinit();
     if (app.config_arena) |*arena| arena.deinit();
@@ -631,6 +633,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         } else if (app.popup != null) {
             app.closePopup();
         } else if (!app.editor.isEmpty()) {
+            app.clearSavedQueryNames();
             app.editor.clear();
         } else if (exit_was_armed) {
             app.running = false;
@@ -845,6 +848,7 @@ fn openCompletion(app: *App, explicit: bool) Allocator.Error!void {
     const input = app.editor.text();
     const name_end = std.mem.indexOfAny(u8, input, " \t\n") orelse input.len;
     const command = findCommand(input[0..name_end]);
+    if (explicit or app.mode == .config or command == null or command.?.arg != .query) app.clearSavedQueryNames();
     var names: std.ArrayList([]const u8) = .empty;
     if (app.mode == .config or (command != null and command.?.arg == .connection)) {
         for (app.cfg.connections) |c| try names.append(a, c.name);
@@ -854,7 +858,7 @@ fn openCompletion(app: *App, explicit: bool) Allocator.Error!void {
         .cursor = app.editor.cursor,
         .cache = if (app.cache) |*c| c else null,
         .connections = names.items,
-        .queries = if (command != null and command.?.arg == .query) try app.savedQueryNames(a) else &.{},
+        .queries = if (command != null and command.?.arg == .query) try app.savedQueryNames() else &.{},
         .commands = &commands,
         .kind = if (app.conn) |conn| conn.kind else null,
     });
@@ -1104,6 +1108,7 @@ fn submit(app: *App) !void {
     defer app.gpa.free(text);
     const visible_text = redactConnectionInput(text);
     try app.editor.commitHistoryText(visible_text);
+    app.clearSavedQueryNames();
     app.editor.clear();
     try app.transcript.add(.{ .input = visible_text });
 
@@ -1226,11 +1231,24 @@ fn queriesDir(app: *App) !?[]const u8 {
     return queries.dirPath(app.frame_arena.allocator(), app.cfg.path);
 }
 
-fn savedQueryNames(app: *App, a: Allocator) ![]const []const u8 {
-    const dir = (try app.queriesDir()) orelse return &.{};
+fn clearSavedQueryNames(app: *App) void {
+    if (app.saved_query_names) |*cache| {
+        app.closePopup();
+        cache.arena.deinit();
+        app.saved_query_names = null;
+    }
+}
+
+fn savedQueryNames(app: *App) Allocator.Error![]const []const u8 {
+    if (app.saved_query_names) |cache| return cache.names;
+    app.saved_query_names = .{ .arena = .init(app.gpa) };
+    errdefer app.clearSavedQueryNames();
+    const a = app.saved_query_names.?.arena.allocator();
+    const dir = (try queries.dirPath(a, app.cfg.path)) orelse return &.{};
     const entries = queries.list(a, app.io, dir, false) catch return &.{};
     const names = try a.alloc([]const u8, entries.len);
     for (entries, names) |e, *n| n.* = e.name;
+    app.saved_query_names.?.names = names;
     return names;
 }
 
@@ -1387,6 +1405,87 @@ test "saved query shortcuts preserve drafts and confirm replacement" {
     try std.testing.expectEqualStrings("select 3;", try queries.load(app.frame_arena.allocator(), app.io, dir, "rec"));
 }
 
+test "saved query completion reuses names while typing and refreshes after changes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "config.toml" });
+    defer a.free(path);
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var counted = std.testing.FailingAllocator.init(a, .{});
+    var app: App = .{
+        .gpa = counted.allocator(),
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = path, .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(counted.allocator()),
+        .frame_arena = .init(a),
+    };
+    defer app.deinit();
+    const dir = (try app.queriesDir()).?;
+    try queries.save(app.io, dir, "alpha", "select 1;", false);
+    try queries.save(app.io, dir, "beta", "select 2;", false);
+    try app.editor.setText("/queries ");
+    try app.openCompletion(false);
+    try std.testing.expectEqual(@as(usize, 2), app.popup.?.completion.candidates.len);
+    const allocations = counted.allocations;
+    const names = app.saved_query_names.?.names;
+    for (0..250) |_| {
+        for ([_][]const u8{ "/queries ", "/queries a", "/queries al", "/queries missing" }) |input| {
+            try app.editor.setText(input);
+            try app.openCompletion(false);
+        }
+    }
+    try std.testing.expectEqual(allocations, counted.allocations);
+    try std.testing.expectEqual(names.ptr, app.saved_query_names.?.names.ptr);
+    try queries.save(app.io, dir, "external", "select 3;", false);
+    try app.editor.setText("/queries ext");
+    try app.openCompletion(false);
+    try std.testing.expect(app.popup == null);
+    try app.openCompletion(true);
+    try std.testing.expectEqualStrings("/queries external", app.editor.text());
+    try std.testing.expectEqual(@as(usize, 3), app.saved_query_names.?.names.len);
+    try queries.save(app.io, dir, "external", "select 99;", true);
+    try app.runCommand(app.editor.text());
+    try std.testing.expectEqualStrings("select 99;", app.editor.text());
+    try std.testing.expect(app.saved_query_names == null);
+
+    try app.editor.setText("/queries ");
+    try app.openCompletion(false);
+    try app.pending_save.appendSlice(app.gpa, "select 4;");
+    try app.writeSavedQuery("gamma", false);
+    try std.testing.expect(app.saved_query_names == null);
+    try app.openCompletion(false);
+    try std.testing.expectEqual(@as(usize, 4), app.saved_query_names.?.names.len);
+    try app.runCommand("/unsave gamma");
+    try std.testing.expect(app.saved_query_names == null);
+    try app.openCompletion(false);
+    try std.testing.expectEqual(@as(usize, 3), app.saved_query_names.?.names.len);
+
+    try queries.remove(app.io, dir, "external");
+    try app.editor.setText("/queries external");
+    try app.openCompletion(false);
+    try std.testing.expect(app.popup != null);
+    try app.handleKey(.{ .codepoint = 'c', .mods = .{ .ctrl = true } });
+    try app.handleKey(.{ .codepoint = 'c', .mods = .{ .ctrl = true } });
+    try std.testing.expect(app.editor.isEmpty());
+    try std.testing.expect(app.saved_query_names == null);
+    try app.editor.setText("/queries external");
+    try app.openCompletion(false);
+    try std.testing.expect(app.popup == null);
+    try app.editor.setText("/unsave beta");
+    try app.openCompletion(false);
+    try app.submit();
+    try std.testing.expect(app.saved_query_names == null);
+    try app.editor.setText("/queries ");
+    try app.openCompletion(false);
+    try std.testing.expectEqual(@as(usize, 1), app.saved_query_names.?.names.len);
+}
+
 fn saveQuery(app: *App, name: []const u8) !void {
     const input = std.mem.trim(u8, app.editor.text(), " \t\r\n");
     const sql = if (input.len > 0 and input[0] != '/') input else app.last_sql.items;
@@ -1418,10 +1517,12 @@ fn writeSavedQuery(app: *App, name: []const u8, overwrite: bool) !void {
         }
         return app.transcript.addMessage(.err, "cannot save query: {t}", .{err});
     };
+    defer app.clearSavedQueryNames();
     try app.transcript.addMessage(.ok, "saved as '{s}' ({s}) — /queries to use it", .{ name, dir });
 }
 
 fn loadSavedQuery(app: *App, name: []const u8) !void {
+    defer app.clearSavedQueryNames();
     const dir = (try app.queriesDir()) orelse return;
     const sql = queries.load(app.frame_arena.allocator(), app.io, dir, name) catch {
         return app.transcript.addMessage(.err, "no saved query named '{s}'", .{name});
@@ -1431,6 +1532,7 @@ fn loadSavedQuery(app: *App, name: []const u8) !void {
 }
 
 fn openQueriesPicker(app: *App) !void {
+    app.clearSavedQueryNames();
     const dir = (try app.queriesDir()) orelse return app.transcript.addMessage(.err, "cannot determine the config directory", .{});
     const a = app.frame_arena.allocator();
     const entries = queries.list(a, app.io, dir, true) catch |err| return app.transcript.addMessage(.err, "cannot read {s}: {t}", .{ dir, err });
@@ -1575,6 +1677,7 @@ fn runCommand(app: *App, text: []const u8) !void {
     if (eql(u8, cmd.name, "/unsave")) {
         const dir = (try app.queriesDir()) orelse return;
         queries.remove(app.io, dir, arg) catch return app.transcript.addMessage(.err, "no saved query named '{s}'", .{arg});
+        defer app.clearSavedQueryNames();
         return app.transcript.addMessage(.dim, "deleted saved query '{s}'", .{arg});
     }
 }
