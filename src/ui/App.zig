@@ -446,7 +446,11 @@ fn handleEventInner(app: *App, event: Event) !void {
                 _ = try p.handleKey(.{ .codepoint = 0, .text = text });
                 return;
             }
-            if (app.mode == .console or app.mode == .config) try app.editor.insertPaste(text);
+            if (app.mode == .console or app.mode == .config) {
+                try app.editor.insertPaste(text);
+                app.closePopup();
+                app.exit_armed = false;
+            }
             if (app.filterEditor()) |editor| {
                 try editor.insertPaste(text);
                 app.table_view.?.completion.clearRetainingCapacity();
@@ -567,9 +571,13 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    if (app.filterEditor() != null and
-        (key.matches('s', .{ .ctrl = true }) or key.matches('v', .{ .ctrl = true })))
+    const paste_key = key.matches('v', .{ .ctrl = true }) or key.matches('v', .{ .ctrl = true, .shift = true }) or
+        key.matches('v', .{ .super = true });
+    const filtering = app.filterEditor() != null;
+    if ((paste_key and (filtering or app.mode == .console)) or
+        (filtering and key.matches('s', .{ .ctrl = true })))
     {
+        app.exit_armed = false;
         return app.vx.requestSystemClipboard(app.tty.writer());
     }
 
@@ -627,10 +635,17 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     const exit_was_armed = app.exit_armed;
     app.exit_armed = false;
 
-    if (key.matches('c', .{ .ctrl = true })) {
-        if (app.job != null) {
+    const ctrl_c = key.matches('c', .{ .ctrl = true });
+    const copy_key = key.matches('c', .{ .super = true }) or key.matches('c', .{ .ctrl = true, .shift = true });
+    if (app.mode == .console and (ctrl_c or copy_key)) {
+        if (ctrl_c and app.job != null) {
             app.cancelJob(false);
-        } else if (app.popup != null) {
+            return;
+        }
+        const input = std.mem.trimStart(u8, app.editor.text(), " \t\r\n");
+        if (input.len > 0 and input[0] != '/') return app.copyQuery(app.editor.text());
+        if (copy_key) return app.copyQuery(app.sqlToCopy());
+        if (app.popup != null) {
             app.closePopup();
         } else if (!app.editor.isEmpty()) {
             app.clearSavedQueryNames();
@@ -646,6 +661,12 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         app.running = false;
         return;
     }
+    if (app.mode == .console and key.matches('g', .{ .ctrl = true })) {
+        app.closePopup();
+        app.clearSavedQueryNames();
+        app.editor.clear();
+        return;
+    }
     if (key.matches('y', .{ .ctrl = true })) {
         return app.copyQuery(if (app.editor.isEmpty()) app.sqlToCopy() else app.editor.text());
     }
@@ -658,21 +679,23 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         app.closePopup();
         return app.openHistory("");
     }
+    if (key.matches(vaxis.Key.enter, .{ .ctrl = true }) or key.matches(vaxis.Key.enter, .{ .alt = true }) or
+        key.matches(vaxis.Key.enter, .{ .shift = true }) or key.matches('j', .{ .ctrl = true }))
+    {
+        app.closePopup();
+        return app.editor.insertNewline();
+    }
 
     if (app.popup != null) {
         if (try app.handlePopupKey(key)) return;
     }
 
     const e = &app.editor;
-    if (key.matches(vaxis.Key.enter, .{ .alt = true }) or key.matches(vaxis.Key.enter, .{ .shift = true }) or
-        key.matches('j', .{ .ctrl = true }))
-    {
-        try e.insert("\n");
-    } else if (key.matches(vaxis.Key.enter, .{})) {
+    if (key.matches(vaxis.Key.enter, .{})) {
         // A trailing backslash continues the input on a new line.
         if (std.mem.endsWith(u8, e.text()[0..e.cursor], "\\")) {
             e.backspace();
-            try e.insert("\n");
+            try e.insertNewline();
         } else {
             try app.submit();
         }
@@ -1296,7 +1319,7 @@ test "copy command and shortcut preserve SQL and handle empty input" {
     const original_writer = writer.*;
     writer.* = .fixed(&output);
     defer writer.* = original_writer;
-    app.vx = try vaxis.init(app.io, a, &env, .{});
+    app.vx = try vaxis.init(app.io, a, &env, .{ .system_clipboard_allocator = a });
     defer app.vx.deinit(a, writer);
 
     try app.runCommand("/copy");
@@ -1308,17 +1331,44 @@ test "copy command and shortcut preserve SQL and handle empty input" {
     const sql = "select 'Привет';\nselect 2;";
     try app.last_sql.appendSlice(a, "select 1;");
     try app.editor.setText(sql);
-    try app.handleKey(.{ .codepoint = 'y', .mods = .{ .ctrl = true } });
-    try std.testing.expectEqualStrings(sql, app.editor.text());
+    for ([_]vaxis.Key{
+        .{ .codepoint = 'y', .mods = .{ .ctrl = true } },
+        .{ .codepoint = 'c', .mods = .{ .ctrl = true } },
+        .{ .codepoint = 'c', .mods = .{ .super = true } },
+    }) |key| {
+        writer.end = 0;
+        try app.handleKey(key);
+        try std.testing.expectEqualStrings(sql, app.editor.text());
+        try std.testing.expectEqualStrings("\x1b]52;c;c2VsZWN0ICfQn9GA0LjQstC10YInOwpzZWxlY3QgMjs=\x1b\\", writer.buffered());
+    }
     app.editor.clear();
+    writer.end = 0;
     try app.handleKey(.{ .codepoint = 'y', .mods = .{ .ctrl = true } });
     try app.runCommand("/copy");
     try std.testing.expectEqualStrings(
-        "\x1b]52;c;c2VsZWN0ICfQn9GA0LjQstC10YInOwpzZWxlY3QgMjs=\x1b\\" ++
-            "\x1b]52;c;c2VsZWN0IDE7\x1b\\" ++
+        "\x1b]52;c;c2VsZWN0IDE7\x1b\\" ++
             "\x1b]52;c;c2VsZWN0IDE7\x1b\\",
         writer.buffered(),
     );
+
+    try app.editor.setText("  SELECT * FROM orders");
+    app.editor.cursor = "  SELECT *".len;
+    try app.openCompletion(true);
+    try std.testing.expect(app.popup != null);
+    try app.handleKey(.{ .codepoint = vaxis.Key.enter, .mods = .{ .ctrl = true } });
+    try std.testing.expect(app.popup == null);
+    try std.testing.expect(app.job == null);
+    try std.testing.expectEqualStrings("  SELECT *\n   FROM orders", app.editor.text());
+    for ([_]vaxis.Key.Modifiers{ .{ .ctrl = true }, .{ .super = true } }) |mods| {
+        writer.end = 0;
+        try app.handleKey(.{ .codepoint = 'v', .mods = mods });
+        try std.testing.expectEqualStrings("\x1b]52;c;?\x1b\\", writer.buffered());
+    }
+    try app.handleEvent(.{ .paste = try a.dupe(u8, "-- comment\r\n  ") });
+    try std.testing.expectEqualStrings("  SELECT *\n  -- comment\n   FROM orders", app.editor.text());
+    try std.testing.expect(app.job == null);
+    try app.handleKey(.{ .codepoint = 'g', .mods = .{ .ctrl = true } });
+    try std.testing.expect(app.editor.isEmpty());
 
     var db_error: db.ErrorText = .{};
     defer db_error.deinit(a);
@@ -2111,17 +2161,20 @@ fn showHelp(app: *App) !void {
     try lines.append(a, try a.dupe(Segment, &.{.{ .text = "  Keys", .style = theme.bold }}));
     const keys = [_][2][]const u8{
         .{ "enter", "run SQL / command (several statements separated by ;)" },
-        .{ "shift+enter, alt+enter, ctrl+j, \\", "new line" },
+        .{ "ctrl+enter, shift+enter, alt+enter, ctrl+j, \\", "new line with indentation" },
         .{ "tab", "complete commands, tables, columns, operators, keywords" },
         .{ "tab, enter (list open)", "insert the highlighted suggestion; esc closes the list" },
         .{ "↑ ↓", "history (or move between lines)" },
         .{ "ctrl+o", "open the last result in the table viewer" },
+        .{ "ctrl+c, cmd+c", "copy SQL input" },
         .{ "ctrl+y", "copy input (or the last SQL / definition if input is empty)" },
+        .{ "ctrl+v, cmd+v", "paste at the cursor" },
         .{ "ctrl+s", "save input SQL (or the last query if input is empty)" },
         .{ "ctrl+r", "search saved queries and preview SQL" },
         .{ "alt+r", "search SQL history and load a query for review" },
         .{ "pgup pgdn, mouse wheel", "scroll" },
-        .{ "ctrl+c", "cancel query / clear input / exit (twice)" },
+        .{ "ctrl+g", "clear input" },
+        .{ "ctrl+c", "cancel a running query or exit (twice on empty input)" },
         .{ "ctrl+d", "exit (on an empty input)" },
         .{ "ctrl+l", "clear the screen" },
     };
@@ -3584,6 +3637,15 @@ test "choosing a table opens its SQLite browse view" {
     try std.testing.expectEqual(@as(usize, 1), tv.col);
     try std.testing.expect(tv.hidden.items[2]);
     try std.testing.expectEqualStrings("Bob", tv.result.rows[tv.row][1].?);
+    var update = try conn.query(a, "update people set name = 'Robert' where id = 2");
+    update.deinit();
+    tv.browse.?.total = 2;
+    try app.handleKey(.{ .codepoint = vaxis.Key.f5 });
+    while (app.job != null) try app.handleEvent(try app.loop.nextEvent());
+    try std.testing.expectEqualStrings("Robert", tv.result.rows[1][1].?);
+    try std.testing.expect(tv.browse.?.total == null);
+    try std.testing.expectEqualStrings("id > 0", tv.browse.?.filter);
+    try std.testing.expectEqualStrings("id", tv.browse.?.order.?.column);
     try app.handleKey(.{ .codepoint = 'w' });
     try app.handleKey(.{ .codepoint = vaxis.Key.escape });
     while (app.job != null) try app.handleEvent(try app.loop.nextEvent());

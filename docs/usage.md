@@ -38,7 +38,7 @@ Type `/def ` followed by part of an object name to see suggestions, or press `ta
 | Key | Action |
 | --- | --- |
 | `enter` | Run SQL or a command; separate SQL statements with `;` |
-| `shift+enter`, `alt+enter`, `ctrl+j`, trailing `\` | Continue input on a new line |
+| `ctrl+enter`, `shift+enter`, `alt+enter`, `ctrl+j`, trailing `\` | Continue input on a new line with the current indentation |
 | `tab` | Complete commands, SQL keywords, operators, tables, or columns |
 | `tab` / `enter` with completion open | Insert the selected suggestion; `esc` dismisses the list |
 | `↑` / `↓` | Browse history, or move between input lines |
@@ -46,13 +46,18 @@ Type `/def ` followed by part of an object name to see suggestions, or press `ta
 | `ctrl+s` | Save current SQL, or the last executed query if input is empty |
 | `ctrl+r` | Search saved queries and preview their SQL |
 | `alt+r` | Search SQL history, newest first |
+| `ctrl+c` with a SQL draft, `cmd+c` on macOS | Copy the whole SQL draft |
 | `ctrl+y` | Copy input, or the last SQL / displayed definition if input is empty |
-| `ctrl+c` | Cancel a running query, dismiss completion, or clear input; press twice on empty input to exit |
+| `ctrl+v`, `cmd+v` on macOS | Paste at the cursor |
+| `ctrl+g` | Clear the input |
+| `ctrl+c` | Cancel a running query; press twice on an empty prompt to exit |
 | `ctrl+d` | Exit on an empty prompt |
 | `ctrl+l` | Clear the screen |
 | `PageUp` / `PageDown`, mouse wheel | Scroll the transcript |
 
-After selecting a view in `/views`, use `/copy` or `ctrl+y` with empty input to copy its definition. Clipboard copying requires a terminal that permits OSC 52 clipboard writes.
+After selecting a view in `/views`, use `/copy` or `ctrl+y` with empty input to copy its definition. zpeek uses OSC 52 when the terminal forwards a clipboard shortcut. You can also use your terminal's paste shortcut (often `ctrl+shift+v` or `cmd+v`). If your terminal sends plain Enter for `ctrl+enter`, use `ctrl+j`.
+
+For a multi-line join, type `LEFT JOIN` and press `tab` to see tables. After the joined table and its optional alias, type a space and press `tab` for `ON` or `USING`. Type an alias followed by a dot, such as `orders_alias.`, to complete its columns in the join condition.
 
 ## Browse tables
 
@@ -66,7 +71,8 @@ Headers identify key columns: `PK` means primary key, `UQ` means a column belong
 | `s` | Cycle sorting on the selected column: ascending, descending, off |
 | `/` | Filter with a SQL `WHERE` condition |
 | `t` | Count matching rows |
-| `w` | Show the table's columns, indexes and constraints, as in `/describe`; `esc` returns to the same browse view |
+| `r` / `F5` | Reload the current page using its filter and sort order |
+| `w` | Show the table's columns, indexes and constraints with long values wrapped; `esc` returns to the same browse view |
 | `n` / `p` | Next / previous page |
 | `enter` | Show the full cell value |
 | `f` on an FK cell | Preview the referenced row below the table |

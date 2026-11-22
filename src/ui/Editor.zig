@@ -67,6 +67,18 @@ pub fn insert(e: *Editor, s: []const u8) Allocator.Error!void {
     e.goal_col = null;
 }
 
+pub fn insertNewline(e: *Editor) Allocator.Error!void {
+    const start = e.lineStart(e.cursor);
+    const before = e.buf.items[start..e.cursor];
+    const indent = before.len - std.mem.trimStart(u8, before, " \t").len;
+    try e.buf.ensureUnusedCapacity(e.gpa, indent + 1);
+    const line = e.buf.addManyAtAssumeCapacity(e.cursor, indent + 1);
+    line[0] = '\n';
+    @memcpy(line[1..], e.buf.items[start..][0..indent]);
+    e.cursor += line.len;
+    e.goal_col = null;
+}
+
 /// Inserts pasted text, normalizing CRLF/CR to LF.
 pub fn insertPaste(e: *Editor, s: []const u8) Allocator.Error!void {
     if (std.mem.indexOfAny(u8, s, "\r\t") == null) return e.insert(s);

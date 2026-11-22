@@ -85,14 +85,14 @@ pub const SchemaCache = struct {
     }
 
     pub fn columnsOf(c: *const SchemaCache, table: []const u8) ?[]const []const u8 {
+        var unqualified: ?[]const []const u8 = null;
         for (c.tables, 0..) |t, i| {
             if (std.ascii.eqlIgnoreCase(t, table)) return c.columns[i];
-            // allow unqualified lookups of schema-qualified names
             if (std.mem.lastIndexOfScalar(u8, t, '.')) |dot| {
-                if (std.ascii.eqlIgnoreCase(t[dot + 1 ..], table)) return c.columns[i];
+                if (unqualified == null and std.ascii.eqlIgnoreCase(t[dot + 1 ..], table)) unqualified = c.columns[i];
             }
         }
-        return null;
+        return unqualified;
     }
 };
 
@@ -474,7 +474,7 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
         const qualifier = unquote(word[0..dot]);
         const partial = word[dot + 1 ..];
         if (cache) |c| {
-            const table = resolveAlias(a, stmt.text, qualifier) catch qualifier;
+            const table = (try resolveAlias(a, stmt.text, qualifier)) orelse qualifier;
             if (c.columnsOf(table)) |cols| {
                 for (cols) |col| try list.addIfMatch(col, partial, .column, table);
             }
@@ -505,7 +505,7 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
     // 2. Keywords that must follow the previous one (DELETE -> FROM, ORDER -> BY).
     if (prev_token.?.tag == .keyword) {
         for (followUps(prev_text)) |k| try list.addIfMatchCase(k, word, .keyword, "", upper or prev_text.len > 0 and std.ascii.isUpper(prev_text[0]));
-        if (list.items.items.len > 0 and word.len == 0) return .{ .replace_len = 0, .candidates = list.items.items, .exact_match = list.exact };
+        if (list.items.items.len > 0) return .{ .replace_len = word.len, .candidates = list.items.items, .exact_match = list.exact };
     }
 
     // 3. Table names after FROM / JOIN / INTO / UPDATE.
@@ -523,6 +523,16 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
     const prefer_upper = upper or word.len == 0;
 
     if (after_expression) {
+        if (joinBeforeCondition(before_word)) |join| {
+            const join_upper = if (word.len > 0) upper else std.ascii.isUpper(join[0]);
+            for ([_][]const u8{ "ON", "USING" }) |k| try list.addIfMatchCase(k, word, .keyword, "", join_upper);
+            if (list.items.items.len > 0) return .{
+                .replace_len = word.len,
+                .candidates = list.items.items,
+                .exact_match = list.exact,
+                .auto = word.len > 0,
+            };
+        }
         // 4. "SELECT * F" -> FROM, "WHERE a = 1 A" -> AND: clause keywords first.
         for (clauseKeywords(kind)) |k| try list.addIfMatchCase(k, word, .keyword, "", prefer_upper);
         if (word.len == 0) return .{ .replace_len = 0, .candidates = list.items.items, .exact_match = list.exact, .auto = false };
@@ -643,6 +653,7 @@ fn followUps(prev: []const u8) []const []const u8 {
         .{ "inner", &[_][]const u8{"JOIN"} },
         .{ "cross", &[_][]const u8{"JOIN"} },
         .{ "full", &[_][]const u8{ "JOIN", "OUTER JOIN" } },
+        .{ "outer", &[_][]const u8{"JOIN"} },
         .{ "is", &[_][]const u8{ "NULL", "NOT NULL" } },
         .{ "union", &[_][]const u8{ "ALL", "SELECT" } },
         .{ "create", &[_][]const u8{ "TABLE", "VIEW", "INDEX", "UNIQUE INDEX" } },
@@ -752,7 +763,7 @@ pub fn operatorPrefix(text: []const u8, cursor: usize, condition_only: bool) ?[]
             in_condition = true;
         } else if (std.ascii.eqlIgnoreCase(keyword, "group") or std.ascii.eqlIgnoreCase(keyword, "order") or
             std.ascii.eqlIgnoreCase(keyword, "limit") or std.ascii.eqlIgnoreCase(keyword, "returning") or
-            std.ascii.eqlIgnoreCase(keyword, "union"))
+            std.ascii.eqlIgnoreCase(keyword, "union") or std.ascii.eqlIgnoreCase(keyword, "join"))
         {
             in_condition = false;
         }
@@ -815,63 +826,108 @@ fn isTableKeyword(k: []const u8) bool {
     return false;
 }
 
-/// Collects table names following FROM/JOIN/UPDATE/INTO.
+fn nextSignificant(it: *lexer.Iterator) ?lexer.Token {
+    while (it.next()) |t| {
+        if (t.tag != .whitespace and t.tag != .comment) return t;
+    }
+    return null;
+}
+
+fn isName(t: lexer.Token) bool {
+    return t.tag == .identifier or t.tag == .quoted_identifier;
+}
+
+const Relation = struct {
+    name: []const u8,
+    object: ?[]const u8 = null,
+    alias: ?[]const u8 = null,
+
+    fn table(r: Relation, a: Allocator) Allocator.Error![]const u8 {
+        return if (r.object) |object| std.mem.concat(a, u8, &.{ r.name, ".", object }) else r.name;
+    }
+};
+
+/// Reads a table and its optional alias, leaving the iterator at the last name.
+fn readRelation(it: *lexer.Iterator, stmt: []const u8) ?Relation {
+    var scan = it.*;
+    const name = nextSignificant(&scan) orelse return null;
+    if (!isName(name)) return null;
+    var relation: Relation = .{ .name = unquote(name.text(stmt)) };
+    it.* = scan;
+    var token = nextSignificant(&scan) orelse return relation;
+    if (token.tag == .punctuation and stmt[token.start] == '.') {
+        const object = nextSignificant(&scan) orelse return null;
+        if (!isName(object)) return null;
+        relation.object = unquote(object.text(stmt));
+        it.* = scan;
+        token = nextSignificant(&scan) orelse return relation;
+    }
+    if (token.tag == .keyword and std.ascii.eqlIgnoreCase(token.text(stmt), "as")) {
+        token = nextSignificant(&scan) orelse return relation;
+    }
+    if (isName(token)) {
+        relation.alias = unquote(token.text(stmt));
+        it.* = scan;
+    }
+    return relation;
+}
+
+fn joinBeforeCondition(stmt: []const u8) ?[]const u8 {
+    var it: lexer.Iterator = .init(stmt);
+    var allows_condition = true;
+    while (nextSignificant(&it)) |t| {
+        const word = t.text(stmt);
+        if (t.tag == .keyword and std.ascii.eqlIgnoreCase(word, "join") and allows_condition) {
+            if (readRelation(&it, stmt) != null) {
+                var rest = it;
+                if (nextSignificant(&rest) == null) return word;
+            }
+        }
+        for ([_][]const u8{ "left", "right", "inner", "outer", "full" }) |modifier| {
+            if (std.ascii.eqlIgnoreCase(word, modifier)) break;
+        } else {
+            allows_condition = !std.ascii.eqlIgnoreCase(word, "cross") and
+                !std.ascii.eqlIgnoreCase(word, "natural") and !std.ascii.eqlIgnoreCase(word, "array");
+        }
+    }
+    return null;
+}
+
+/// Reads table references after a table keyword or a comma in FROM.
+fn nextRelation(it: *lexer.Iterator, stmt: []const u8, from_list: *bool) ?Relation {
+    while (nextSignificant(it)) |t| {
+        if (t.tag == .keyword) {
+            const word = t.text(stmt);
+            from_list.* = std.ascii.eqlIgnoreCase(word, "from");
+            if (!isTableKeyword(word)) continue;
+        } else if (!from_list.* or t.tag != .punctuation or stmt[t.start] != ',') {
+            from_list.* = false;
+            continue;
+        }
+        if (readRelation(it, stmt)) |relation| return relation;
+    }
+    return null;
+}
+
 fn referencedTables(a: Allocator, stmt: []const u8, out: *std.ArrayList([]const u8)) Allocator.Error!void {
     var it: lexer.Iterator = .init(stmt);
-    var expect_table = false;
-    while (it.next()) |t| {
-        switch (t.tag) {
-            .whitespace, .comment => continue,
-            .keyword => expect_table = isTableKeyword(t.text(stmt)),
-            .identifier, .quoted_identifier => {
-                if (expect_table) {
-                    var name = unquote(t.text(stmt));
-                    // schema-qualified: identifier . identifier
-                    const save = it.pos;
-                    if (it.next()) |dot| {
-                        if (dot.tag == .punctuation and stmt[dot.start] == '.') {
-                            if (it.next()) |n| name = unquote(n.text(stmt));
-                        } else it.pos = save;
-                    }
-                    try out.append(a, name);
-                    expect_table = false;
-                }
-            },
-            .punctuation => {
-                // FROM a, b
-                if (stmt[t.start] != ',') expect_table = false else if (out.items.len > 0) expect_table = true;
-            },
-            else => expect_table = false,
-        }
+    var from_list = false;
+    while (nextRelation(&it, stmt, &from_list)) |relation| {
+        try out.append(a, try relation.table(a));
     }
 }
 
 /// Resolves `alias` (FROM users u / JOIN orders AS o) to its table name.
-fn resolveAlias(a: Allocator, stmt: []const u8, alias: []const u8) ![]const u8 {
-    _ = a;
+fn resolveAlias(a: Allocator, stmt: []const u8, alias: []const u8) Allocator.Error!?[]const u8 {
     var it: lexer.Iterator = .init(stmt);
-    var toks: [3]?lexer.Token = .{ null, null, null };
-    while (it.next()) |t| {
-        if (t.tag == .whitespace or t.tag == .comment) continue;
-        // pattern: <table> [as] <alias>
-        const is_alias = (t.tag == .identifier or t.tag == .quoted_identifier) and
-            std.ascii.eqlIgnoreCase(unquote(t.text(stmt)), alias);
-        if (is_alias) {
-            const p1 = toks[2];
-            const p2 = toks[1];
-            if (p1) |x| {
-                if (x.tag == .keyword and std.ascii.eqlIgnoreCase(x.text(stmt), "as")) {
-                    if (p2) |y| if (y.tag == .identifier or y.tag == .quoted_identifier) return unquote(y.text(stmt));
-                } else if (x.tag == .identifier or x.tag == .quoted_identifier) {
-                    return unquote(x.text(stmt));
-                }
-            }
+    var from_list = false;
+    while (nextRelation(&it, stmt, &from_list)) |relation| {
+        const qualifier = relation.alias orelse relation.object orelse relation.name;
+        if (std.ascii.eqlIgnoreCase(qualifier, alias)) {
+            return try relation.table(a);
         }
-        toks[0] = toks[1];
-        toks[1] = toks[2];
-        toks[2] = t;
     }
-    return error.NotFound;
+    return null;
 }
 
 const testing = std.testing;
@@ -967,6 +1023,36 @@ test "alias columns" {
     const c = try complete(arena.allocator(), .{ .text = text, .cursor = cursor, .cache = &cache, .connections = &.{}, .commands = &.{} });
     try testing.expectEqual(@as(usize, 2), c.replace_len);
     try testing.expectEqualStrings("name", c.candidates[0].text);
+}
+
+test "left join completion follows clauses and resolves qualified aliases" {
+    var cache = try testCache(testing.allocator);
+    defer cache.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const b = cache.arena.allocator();
+    cache.tables = try b.dupe([]const u8, &.{ "public.orders", "users", "archive.orders" });
+    cache.columns = try b.dupe([]const []const u8, &.{ &.{ "id", "user_id" }, &.{ "id", "name" }, &.{"archived_at"} });
+
+    const base = "select u.name\nfrom users u\nleft ";
+    const joined = base ++ "join public.orders o\n    on o.user_id = u.id\nLEFT OUTER JOIN \"archive\".\"orders\" AS old ";
+    const cases = .{
+        .{ base ++ "j", "join" },
+        .{ base ++ "outer ", "join" },
+        .{ base ++ "join pu", "public.orders" },
+        .{ base ++ "join public.orders as o o", "on" },
+        .{ joined, "ON" },
+        .{ joined ++ "ON old.", "archived_at" },
+        .{ joined ++ "ON old.archived_at = o.us", "user_id" },
+    };
+    inline for (cases) |case| {
+        const result = try complete(a, .{ .text = case[0], .cursor = case[0].len, .cache = &cache, .connections = &.{}, .commands = &.{}, .kind = .postgres });
+        try testing.expect(result.candidates.len > 0);
+        try testing.expectEqualStrings(case[1], result.candidates[0].text);
+    }
+    const natural = "select * from users natural left join public.orders ";
+    try testing.expect(joinBeforeCondition(natural) == null);
 }
 
 test "keywords keep case and commands" {

@@ -617,6 +617,39 @@ test "expanded schema results show rows beyond the console preview" {
     }
 }
 
+test "schema layouts preserve long index definitions and later fields" {
+    const a = std.testing.allocator;
+    var transcript = Transcript.init(a);
+    defer transcript.deinit();
+    const definition = "CREATE INDEX orders_by_customer ON orders (customer_id, created_at) WHERE archived_at IS NULL";
+    try transcript.add(.{ .result = .{
+        .result = .{
+            .arena = .init(a),
+            .columns = &.{ "index", "definition", "status" },
+            .rows = &.{&.{ "orders_by_customer", definition, "valid" }},
+        },
+        .elapsed_ms = 0,
+        .expanded = true,
+    } });
+    const entry = transcript.entries.items[0];
+    for ([_]u16{ 32, 160, 32 }) |width| {
+        try ensureLayout(entry, width);
+        var found_end = false;
+        var found_status = false;
+        for (entry.layout) |line| {
+            var line_width: usize = 0;
+            for (line) |segment| {
+                line_width += render.displayWidth(segment.text);
+                found_end = found_end or std.mem.indexOf(u8, segment.text, "NULL") != null;
+                found_status = found_status or std.mem.indexOf(u8, segment.text, "valid") != null;
+            }
+            try std.testing.expect(line_width <= width);
+        }
+        try std.testing.expect(found_end);
+        try std.testing.expect(found_status);
+    }
+}
+
 test "wide result layout retains only screen-sized previews" {
     const a = std.testing.allocator;
     const payload: [512]u8 = @splat('x');
@@ -711,7 +744,11 @@ fn layoutResult(
         widths[i] = render.displayWidth(header[i]);
         for (r.rows[0..shown_rows], 0..) |row, ri| {
             const v = row[i];
-            const cell = if (v) |s| try cellText(a, s) else null;
+            const cell: ?render.Measured = if (v) |s| blk: {
+                if (!expanded) break :blk try cellText(a, s);
+                const text = try render.singleLine(a, s);
+                break :blk .{ .text = text, .width = render.displayWidth(text) };
+            } else null;
             cells[ri * column_limit + i] = cell;
             widths[i] = @max(widths[i], if (cell) |c| c.width else render.null_text.len);
         }
@@ -719,40 +756,45 @@ fn layoutResult(
         used += widths[i] + 3;
         visible += 1;
     }
-    if (visible == 0) {
-        visible = 1;
-        widths[0] = @max(avail -| 4, 1);
-    }
-    const hidden = ncols - visible;
-
-    try out.append(a, try ruleLine(a, widths[0..visible], "  ┌", "┬", "┐", hidden > 0));
-    {
-        var line: std.ArrayList(Segment) = .empty;
-        try line.append(a, .{ .text = "  │", .style = theme.border });
-        for (header[0..visible], widths[0..visible]) |h, w| try appendCell(a, &line, h, w, theme.header);
-        if (hidden > 0) try line.append(a, .{ .text = " …", .style = theme.dim });
-        try out.append(a, line.items);
-    }
-    try out.append(a, try ruleLine(a, widths[0..visible], "  ├", "┼", "┤", hidden > 0));
-    for (0..shown_rows) |ri| {
-        var line: std.ArrayList(Segment) = .empty;
-        try line.append(a, .{ .text = "  │", .style = theme.border });
-        for (0..visible) |i| {
-            const cell = cells[ri * column_limit + i];
-            if (cell) |c| {
-                if (c.width > widths[i]) {
-                    try appendCell(a, &line, c.text, widths[i], theme.plain);
-                } else {
-                    try appendMeasuredCell(a, &line, c, widths[i], theme.plain);
-                }
-            } else {
-                try appendCell(a, &line, render.null_text, widths[i], theme.null_value);
-            }
+    var hidden: usize = 0;
+    if (expanded and visible < ncols) {
+        try layoutSchemaFields(a, out, r, width);
+    } else {
+        if (visible == 0) {
+            visible = 1;
+            widths[0] = @max(avail -| 4, 1);
         }
-        if (hidden > 0) try line.append(a, .{ .text = " …", .style = theme.dim });
-        try out.append(a, line.items);
+        hidden = ncols - visible;
+
+        try out.append(a, try ruleLine(a, widths[0..visible], "  ┌", "┬", "┐", hidden > 0));
+        {
+            var line: std.ArrayList(Segment) = .empty;
+            try line.append(a, .{ .text = "  │", .style = theme.border });
+            for (header[0..visible], widths[0..visible]) |h, w| try appendCell(a, &line, h, w, theme.header);
+            if (hidden > 0) try line.append(a, .{ .text = " …", .style = theme.dim });
+            try out.append(a, line.items);
+        }
+        try out.append(a, try ruleLine(a, widths[0..visible], "  ├", "┼", "┤", hidden > 0));
+        for (0..shown_rows) |ri| {
+            var line: std.ArrayList(Segment) = .empty;
+            try line.append(a, .{ .text = "  │", .style = theme.border });
+            for (0..visible) |i| {
+                const cell = cells[ri * column_limit + i];
+                if (cell) |c| {
+                    if (c.width > widths[i]) {
+                        try appendCell(a, &line, c.text, widths[i], theme.plain);
+                    } else {
+                        try appendMeasuredCell(a, &line, c, widths[i], theme.plain);
+                    }
+                } else {
+                    try appendCell(a, &line, render.null_text, widths[i], theme.null_value);
+                }
+            }
+            if (hidden > 0) try line.append(a, .{ .text = " …", .style = theme.dim });
+            try out.append(a, line.items);
+        }
+        try out.append(a, try ruleLine(a, widths[0..visible], "  └", "┴", "┘", hidden > 0));
     }
-    try out.append(a, try ruleLine(a, widths[0..visible], "  └", "┴", "┘", hidden > 0));
 
     var status: std.ArrayList(u8) = .empty;
     try status.print(a, "{s} · {d} ms", .{ r.status, elapsed_ms });
@@ -763,12 +805,28 @@ fn layoutResult(
         if (shown_rows < total_rows) try status.print(a, "showing {d} of {d} rows", .{ shown_rows, total_rows });
         if (shown_rows < total_rows and hidden > 0) try status.appendSlice(a, ", ");
         if (hidden > 0) try status.print(a, "{d} column{s} hidden", .{ hidden, if (hidden == 1) "" else "s" });
-        try status.appendSlice(a, if (expanded) " — widen terminal to see all columns" else " — ctrl+o to open");
+        try status.appendSlice(a, " — ctrl+o to open");
     }
     try out.append(a, try a.dupe(Segment, &.{
         .{ .text = "  └ ", .style = theme.dim },
         .{ .text = status.items, .style = theme.dim },
     }));
+}
+
+fn layoutSchemaFields(a: Allocator, out: *std.ArrayList(Line), r: db.Result, width: u16) Allocator.Error!void {
+    const names = try a.alloc([]const u8, r.columns.len);
+    for (names, r.columns) |*name, column| name.* = try render.singleLine(a, column);
+    for (r.rows, 0..) |row, i| {
+        if (i != 0) try out.append(a, &.{});
+        for (names, row) |name, cell| {
+            const value = if (cell) |text| try render.singleLine(a, text) else render.null_text;
+            try wrapWithPrefix(a, out, &.{
+                .{ .text = name, .style = theme.header },
+                .{ .text = ": ", .style = theme.dim },
+                .{ .text = value, .style = if (cell == null) theme.null_value else theme.plain },
+            }, width, .{ .text = "  " }, "  ");
+        }
+    }
 }
 
 fn cellText(a: Allocator, s: []const u8) Allocator.Error!render.Measured {

@@ -1654,16 +1654,18 @@ fn drawFooter(tv: *TableView, a: Allocator, win: vaxis.Window, last_col: usize) 
             (if (win.width >= 52) " ↑↓ fields · enter full value · y copy · f/esc close" else if (win.width >= 32) " ↑↓ fields · enter full · f close" else " ↑↓ fields · f close")
         else if (tv.browse == null)
             " / filter · s sort · c columns · y copy · e export · q back"
-        else if (win.width >= 74)
-            " w schema · f FK · / filter · s sort · c cols · y copy · e export · q back"
-        else if (win.width >= 48)
-            " w schema · f FK · / filter · s sort · q back"
-        else if (win.width >= 29)
-            " w schema · / filter · q back"
+        else if (win.width >= 87)
+            " r/F5 refresh · w schema · f FK · / filter · s sort · c cols · y copy · e export · q back"
+        else if (win.width >= 55)
+            " r refresh · w schema · / filter · s sort · q back"
+        else if (win.width >= 32)
+            " r refresh · w schema · q back"
+        else if (win.width >= 21)
+            " r refresh · q back"
         else if (win.width >= 18)
-            " w schema · q back"
+            " r reload · q back"
         else
-            " q back";
+            " r/F5 · q";
         _ = win.print(&.{.{ .text = hint, .style = theme.plain }}, .{ .row_offset = 1, .wrap = .none });
     }
 }
