@@ -228,54 +228,56 @@ pub fn describeSql(a: Allocator, kind: Kind, table: []const u8) Allocator.Error!
             });
         },
         .mysql => {
-            const lit = try quoteLiteral(a, kind, table);
+            const parts = try unescapeName(a, table);
+            const schema_expr = if (parts.schema) |s| try quoteLiteral(a, kind, s) else "database()";
+            const lit = try quoteLiteral(a, kind, parts.name);
             return a.dupe([]const u8, &.{
                 try std.fmt.allocPrint(a,
                     \\select column_name as `column`, column_type as type, is_nullable as nullable,
                     \\  column_default as `default`, column_key as `key`, extra, column_comment as comment
                     \\from information_schema.columns
-                    \\where table_schema = database() and table_name = {s}
+                    \\where table_schema = {s} and table_name = {s}
                     \\order by ordinal_position
-                , .{lit}),
+                , .{ schema_expr, lit }),
                 try std.fmt.allocPrint(a,
                     \\select index_name as `index`, if(non_unique = 0, 'unique', '') as uniq,
                     \\  group_concat(column_name order by seq_in_index separator ', ') as columns
                     \\from information_schema.statistics
-                    \\where table_schema = database() and table_name = {s}
+                    \\where table_schema = {s} and table_name = {s}
                     \\group by index_name, non_unique
                     \\order by index_name = 'PRIMARY' desc, 1
-                , .{lit}),
+                , .{ schema_expr, lit }),
                 try std.fmt.allocPrint(a,
                     \\select constraint_name as `constraint`,
                     \\  concat(group_concat(column_name order by ordinal_position separator ', '), ' -> ',
                     \\    referenced_table_name, '(', group_concat(referenced_column_name order by ordinal_position separator ', '), ')') as `references`
                     \\from information_schema.key_column_usage
-                    \\where table_schema = database() and table_name = {s} and referenced_table_name is not null
+                    \\where table_schema = {s} and table_name = {s} and referenced_table_name is not null
                     \\group by constraint_name, referenced_table_name
                     \\order by 1
-                , .{lit}),
+                , .{ schema_expr, lit }),
             });
         },
         .sqlite => {
-            const lit = try quoteLiteral(a, kind, table);
+            const args = try sqlitePragmaArgs(a, table);
             return a.dupe([]const u8, &.{
                 try std.fmt.allocPrint(a,
                     \\select name as "column", type, case when "notnull" then 'NO' else 'YES' end as nullable,
                     \\  dflt_value as "default", case when pk > 0 then 'PK' end as "key"
                     \\from pragma_table_info({s})
                     \\order by cid
-                , .{lit}),
+                , .{args}),
                 try std.fmt.allocPrint(a,
                     \\select il.name as "index", case when il."unique" then 'unique' else '' end as uniq,
-                    \\  (select group_concat(ii.name, ', ') from pragma_index_info(il.name) ii) as columns
+                    \\  (select group_concat(ii.name, ', ') from pragma_index_info(il.name, il."schema") ii) as columns
                     \\from pragma_index_list({s}) il
                     \\order by 1
-                , .{lit}),
+                , .{args}),
                 try std.fmt.allocPrint(a,
                     \\select "from" as "column", "table" || '(' || coalesce("to", '?') || ')' as "references",
                     \\  on_update, on_delete
                     \\from pragma_foreign_key_list({s})
-                , .{lit}),
+                , .{args}),
             });
         },
         .clickhouse => {
@@ -306,7 +308,7 @@ pub fn describeSql(a: Allocator, kind: Kind, table: []const u8) Allocator.Error!
 
 /// `database = … and <name_column> = …` for an optionally qualified ClickHouse table.
 fn chWhere(a: Allocator, table: []const u8, name_column: []const u8) Allocator.Error![]const u8 {
-    const parts = splitName(table);
+    const parts = try unescapeName(a, table);
     const db_expr = if (parts.schema) |s| try quoteLiteral(a, .clickhouse, s) else "currentDatabase()";
     return std.fmt.allocPrint(a, "database = {s} and {s} = {s}", .{ db_expr, name_column, try quoteLiteral(a, .clickhouse, parts.name) });
 }
@@ -315,7 +317,7 @@ fn chWhere(a: Allocator, table: []const u8, name_column: []const u8) Allocator.E
 pub fn definitionSql(a: Allocator, kind: Kind, name: []const u8) Allocator.Error![]const u8 {
     switch (kind) {
         .postgres => {
-            const parts = splitName(name);
+            const parts = try unescapeName(a, name);
             const obj = try quoteLiteral(a, kind, parts.name);
             const schema_filter = if (parts.schema) |s|
                 try std.fmt.allocPrint(a, "n.nspname = {s}", .{try quoteLiteral(a, kind, s)})
@@ -346,10 +348,12 @@ pub fn definitionSql(a: Allocator, kind: Kind, name: []const u8) Allocator.Error
             , .{ .obj = obj, .sf = schema_filter });
         },
         .mysql => {
-            const lit = try quoteLiteral(a, kind, name);
+            const parts = try unescapeName(a, name);
+            const schema_expr = if (parts.schema) |s| try quoteLiteral(a, kind, s) else "database()";
+            const lit = try quoteLiteral(a, kind, parts.name);
             return std.fmt.allocPrint(a,
                 \\select 'view' as kind, table_name as name, concat('CREATE VIEW ', table_name, ' AS\n', view_definition) as definition
-                \\from information_schema.views where table_schema = database() and table_name = {[n]s}
+                \\from information_schema.views where table_schema = {[s]s} and table_name = {[n]s}
                 \\union all
                 \\select lower(r.routine_type), r.routine_name,
                 \\  concat('CREATE ', r.routine_type, ' ', r.routine_name, '(',
@@ -359,18 +363,25 @@ pub fn definitionSql(a: Allocator, kind: Kind, name: []const u8) Allocator.Error
                 \\     where p.specific_schema = r.routine_schema and p.specific_name = r.specific_name
                 \\       and p.ordinal_position > 0), ''), ')',
                 \\    if(r.routine_type = 'FUNCTION', concat(' RETURNS ', r.dtd_identifier), ''), '\n', r.routine_definition)
-                \\from information_schema.routines r where r.routine_schema = database() and r.routine_name = {[n]s}
+                \\from information_schema.routines r where r.routine_schema = {[s]s} and r.routine_name = {[n]s}
                 \\union all
                 \\select 'trigger', trigger_name,
                 \\  concat('CREATE TRIGGER ', trigger_name, ' ', action_timing, ' ', event_manipulation, ' ON ',
                 \\    event_object_table, ' FOR EACH ROW\n', action_statement)
-                \\from information_schema.triggers where trigger_schema = database() and trigger_name = {[n]s}
-            , .{ .n = lit });
+                \\from information_schema.triggers where trigger_schema = {[s]s} and trigger_name = {[n]s}
+            , .{ .s = schema_expr, .n = lit });
         },
-        .sqlite => return std.fmt.allocPrint(a,
-            \\select type as kind, name, sql as definition from sqlite_schema
-            \\where type in ('view', 'trigger') and name = {s} and sql is not null
-        , .{try quoteLiteral(a, kind, name)}),
+        .sqlite => {
+            const parts = try unescapeName(a, name);
+            const catalog = if (parts.schema) |s|
+                try std.fmt.allocPrint(a, "{s}.sqlite_schema", .{try quoteIdent(a, kind, s)})
+            else
+                "sqlite_schema";
+            return std.fmt.allocPrint(a,
+                \\select type as kind, name, sql as definition from {s}
+                \\where type in ('view', 'trigger') and name = {s} and sql is not null
+            , .{ catalog, try quoteLiteral(a, kind, parts.name) });
+        },
         .clickhouse => return std.fmt.allocPrint(a,
             \\select 'view' as kind, name,
             \\  create_table_query as definition
@@ -378,7 +389,7 @@ pub fn definitionSql(a: Allocator, kind: Kind, name: []const u8) Allocator.Error
             \\union all
             \\select 'function', name, create_query from system.functions
             \\where origin = 'SQLUserDefined' and name = {[n]s}
-        , .{ .w = try chWhere(a, name, "name"), .n = try quoteLiteral(a, kind, splitName(name).name) }),
+        , .{ .w = try chWhere(a, name, "name"), .n = try quoteLiteral(a, kind, (try unescapeName(a, name)).name) }),
     }
 }
 
@@ -412,7 +423,9 @@ pub fn definitionSqlForOid(a: Allocator, obj: Object, oid_text: []const u8) (All
 }
 
 pub fn definitionSqlForObject(a: Allocator, kind: Kind, obj: Object, name: []const u8, selected_kind: []const u8) Allocator.Error![]const u8 {
-    const lit = try quoteLiteral(a, kind, name);
+    const parts = try unescapeName(a, name);
+    const lit = try quoteLiteral(a, kind, parts.name);
+    const mysql_schema = if (parts.schema) |s| try quoteLiteral(a, kind, s) else "database()";
     return switch (kind) {
         .postgres => definitionSql(a, kind, name),
         .sqlite => std.fmt.allocPrint(
@@ -424,8 +437,8 @@ pub fn definitionSqlForObject(a: Allocator, kind: Kind, obj: Object, name: []con
             .views => std.fmt.allocPrint(a,
                 \\select 'view' as kind, table_name as name,
                 \\  concat('CREATE VIEW ', table_name, ' AS\n', view_definition) as definition
-                \\from information_schema.views where table_schema = database() and table_name = {s}
-            , .{lit}),
+                \\from information_schema.views where table_schema = {s} and table_name = {s}
+            , .{ mysql_schema, lit }),
             .functions => std.fmt.allocPrint(a,
                 \\select lower(r.routine_type) as kind, r.routine_name as name,
                 \\  concat('CREATE ', r.routine_type, ' ', r.routine_name, '(',
@@ -435,15 +448,15 @@ pub fn definitionSqlForObject(a: Allocator, kind: Kind, obj: Object, name: []con
                 \\     where p.specific_schema = r.routine_schema and p.specific_name = r.specific_name
                 \\       and p.ordinal_position > 0), ''), ')',
                 \\    if(r.routine_type = 'FUNCTION', concat(' RETURNS ', r.dtd_identifier), ''), '\n', r.routine_definition) as definition
-                \\from information_schema.routines r where r.routine_schema = database() and r.routine_name = {s}
+                \\from information_schema.routines r where r.routine_schema = {s} and r.routine_name = {s}
                 \\  and lower(r.routine_type) = {s}
-            , .{ lit, try quoteLiteral(a, kind, selected_kind) }),
+            , .{ mysql_schema, lit, try quoteLiteral(a, kind, selected_kind) }),
             .triggers => std.fmt.allocPrint(a,
                 \\select 'trigger' as kind, trigger_name as name,
                 \\  concat('CREATE TRIGGER ', trigger_name, ' ', action_timing, ' ', event_manipulation, ' ON ',
                 \\    event_object_table, ' FOR EACH ROW\n', action_statement) as definition
-                \\from information_schema.triggers where trigger_schema = database() and trigger_name = {s}
-            , .{lit}),
+                \\from information_schema.triggers where trigger_schema = {s} and trigger_name = {s}
+            , .{ mysql_schema, lit }),
             else => definitionSql(a, kind, name),
         },
         .clickhouse => switch (obj) {
@@ -454,7 +467,7 @@ pub fn definitionSqlForObject(a: Allocator, kind: Kind, obj: Object, name: []con
             .functions => std.fmt.allocPrint(a,
                 \\select 'function' as kind, name, create_query as definition
                 \\from system.functions where origin = 'SQLUserDefined' and name = {s}
-            , .{try quoteLiteral(a, kind, splitName(name).name)}),
+            , .{lit}),
             else => definitionSql(a, kind, name),
         },
     };
@@ -588,14 +601,17 @@ pub fn primaryKeySql(a: Allocator, kind: Kind, table: []const u8) Allocator.Erro
             \\where i.indrelid = {s}::regclass and i.indisprimary
             \\order by array_position(i.indkey::int2[], a.attnum)
         , .{try quoteLiteral(a, kind, try quoteName(a, kind, table))}),
-        .mysql => std.fmt.allocPrint(a,
-            \\select column_name from information_schema.key_column_usage
-            \\where table_schema = database() and table_name = {s} and constraint_name = 'PRIMARY'
-            \\order by ordinal_position
-        , .{try quoteLiteral(a, kind, splitName(table).name)}),
+        .mysql => blk: {
+            const parts = try unescapeName(a, table);
+            break :blk std.fmt.allocPrint(a,
+                \\select column_name from information_schema.key_column_usage
+                \\where table_schema = {s} and table_name = {s} and constraint_name = 'PRIMARY'
+                \\order by ordinal_position
+            , .{ if (parts.schema) |s| try quoteLiteral(a, kind, s) else "database()", try quoteLiteral(a, kind, parts.name) });
+        },
         .sqlite => std.fmt.allocPrint(a,
             \\select name from pragma_table_info({s}) where pk > 0 order by pk
-        , .{try quoteLiteral(a, kind, table)}),
+        , .{try sqlitePragmaArgs(a, table)}),
         // Row deletion is disabled for ClickHouse (no point deletes); no key needed.
         .clickhouse => a.dupe(u8, "select 1 where 0"),
     };
@@ -611,18 +627,21 @@ pub fn uniqueKeySql(a: Allocator, kind: Kind, table: []const u8) Allocator.Error
             \\where i.indrelid = {s}::regclass and i.indisunique and not i.indisprimary
             \\order by 1
         , .{try quoteLiteral(a, kind, try quoteName(a, kind, table))}),
-        .mysql => std.fmt.allocPrint(a,
-            \\select distinct column_name from information_schema.statistics
-            \\where table_schema = database() and table_name = {s}
-            \\  and non_unique = 0 and index_name <> 'PRIMARY' and column_name is not null
-            \\order by 1
-        , .{try quoteLiteral(a, kind, splitName(table).name)}),
+        .mysql => blk: {
+            const parts = try unescapeName(a, table);
+            break :blk std.fmt.allocPrint(a,
+                \\select distinct column_name from information_schema.statistics
+                \\where table_schema = {s} and table_name = {s}
+                \\  and non_unique = 0 and index_name <> 'PRIMARY' and column_name is not null
+                \\order by 1
+            , .{ if (parts.schema) |s| try quoteLiteral(a, kind, s) else "database()", try quoteLiteral(a, kind, parts.name) });
+        },
         .sqlite => std.fmt.allocPrint(a,
             \\select distinct ii.name from pragma_index_list({s}) il
-            \\  join pragma_index_info(il.name) ii
+            \\  join pragma_index_info(il.name, il."schema") ii
             \\where il."unique" = 1 and il.origin <> 'pk' and ii.name is not null
             \\order by 1
-        , .{try quoteLiteral(a, kind, table)}),
+        , .{try sqlitePragmaArgs(a, table)}),
         .clickhouse => a.dupe(u8, "select 1 where 0"),
     };
 }
@@ -641,18 +660,21 @@ pub fn foreignKeySql(a: Allocator, kind: Kind, table: []const u8) Allocator.Erro
             \\where c.contype = 'f' and c.conrelid = {s}::regclass
             \\order by c.oid, k.pos
         , .{try quoteLiteral(a, kind, try quoteName(a, kind, table))}),
-        .mysql => try std.fmt.allocPrint(a,
-            \\select constraint_name, column_name, referenced_table_schema, referenced_table_name, referenced_column_name
-            \\from information_schema.key_column_usage
-            \\where table_schema = {s} and table_name = {s} and referenced_table_name is not null
-            \\order by constraint_name, ordinal_position
-        , .{ if (splitName(table).schema) |s| try quoteLiteral(a, kind, s) else "database()", try quoteLiteral(a, kind, splitName(table).name) }),
+        .mysql => blk: {
+            const parts = try unescapeName(a, table);
+            break :blk try std.fmt.allocPrint(a,
+                \\select constraint_name, column_name, referenced_table_schema, referenced_table_name, referenced_column_name
+                \\from information_schema.key_column_usage
+                \\where table_schema = {s} and table_name = {s} and referenced_table_name is not null
+                \\order by constraint_name, ordinal_position
+            , .{ if (parts.schema) |s| try quoteLiteral(a, kind, s) else "database()", try quoteLiteral(a, kind, parts.name) });
+        },
         .sqlite => try std.fmt.allocPrint(a,
-            \\select cast(f.id as text), f."from", '', f."table",
-            \\  coalesce(nullif(f."to", ''), (select p.name from pragma_table_info(f."table") p where p.pk = f.seq + 1))
+            \\select cast(f.id as text), f."from", coalesce(f."schema", ''), f."table",
+            \\  coalesce(nullif(f."to", ''), (select p.name from pragma_table_info(f."table", f."schema") p where p.pk = f.seq + 1))
             \\from pragma_foreign_key_list({s}) f
             \\order by f.id, f.seq
-        , .{try quoteLiteral(a, kind, table)}),
+        , .{try sqlitePragmaArgs(a, table)}),
         .clickhouse => null,
     };
 }
@@ -705,19 +727,35 @@ pub const Name = struct {
     name: []const u8,
 };
 
-/// Splits `schema.table`; names already quoted by the user are unwrapped.
-pub fn splitName(s: []const u8) Name {
+fn splitNameRaw(s: []const u8) Name {
     var in_quote: u8 = 0;
-    for (s, 0..) |c, i| {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
         if (in_quote != 0) {
-            if (c == in_quote) in_quote = 0;
+            if (c == in_quote) {
+                if (i + 1 < s.len and s[i + 1] == in_quote) {
+                    i += 1;
+                } else {
+                    in_quote = 0;
+                }
+            }
         } else if (c == '"' or c == '`') {
             in_quote = c;
         } else if (c == '.') {
-            return .{ .schema = unquote(s[0..i]), .name = unquote(s[i + 1 ..]) };
+            return .{ .schema = s[0..i], .name = s[i + 1 ..] };
         }
     }
-    return .{ .schema = null, .name = unquote(s) };
+    return .{ .schema = null, .name = s };
+}
+
+/// Splits `schema.table`; names already quoted by the user are unwrapped.
+pub fn splitName(s: []const u8) Name {
+    const raw = splitNameRaw(s);
+    return .{
+        .schema = if (raw.schema) |sc| unquote(sc) else null,
+        .name = unquote(raw.name),
+    };
 }
 
 fn unquote(s: []const u8) []const u8 {
@@ -725,9 +763,40 @@ fn unquote(s: []const u8) []const u8 {
     return s;
 }
 
+fn unescapePart(a: Allocator, raw: []const u8) Allocator.Error![]const u8 {
+    if (raw.len >= 2 and (raw[0] == '"' or raw[0] == '`') and raw[raw.len - 1] == raw[0]) {
+        const q = raw[0];
+        const inner = raw[1 .. raw.len - 1];
+        if (std.mem.indexOfScalar(u8, inner, q) == null) return inner;
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < inner.len) : (i += 1) {
+            if (inner[i] == q and i + 1 < inner.len and inner[i + 1] == q) i += 1;
+            try out.append(a, inner[i]);
+        }
+        return out.items;
+    }
+    return raw;
+}
+
+fn unescapeName(a: Allocator, s: []const u8) Allocator.Error!Name {
+    const raw = splitNameRaw(s);
+    return .{
+        .schema = if (raw.schema) |sc| try unescapePart(a, sc) else null,
+        .name = try unescapePart(a, raw.name),
+    };
+}
+
+fn sqlitePragmaArgs(a: Allocator, table: []const u8) Allocator.Error![]const u8 {
+    const parts = try unescapeName(a, table);
+    const name = try quoteLiteral(a, .sqlite, parts.name);
+    const schema = parts.schema orelse return name;
+    return std.fmt.allocPrint(a, "{s}, {s}", .{ name, try quoteLiteral(a, .sqlite, schema) });
+}
+
 /// Quotes a possibly schema-qualified name.
 pub fn quoteName(a: Allocator, kind: Kind, name: []const u8) Allocator.Error![]const u8 {
-    const parts = splitName(name);
+    const parts = try unescapeName(a, name);
     const n = try quoteIdent(a, kind, parts.name);
     if (parts.schema) |s| return std.fmt.allocPrint(a, "{s}.{s}", .{ try quoteIdent(a, kind, s), n });
     return n;
@@ -826,4 +895,35 @@ test "selected definition filters object kind" {
     try testing.expect(std.mem.indexOf(u8, general_clickhouse, "engine in ('View', 'MaterializedView', 'LiveView')") != null);
     const trigger = try definitionSql(a, .postgres, "public.audit_orders");
     try testing.expect(std.mem.indexOf(u8, trigger, "pg_get_functiondef(t.tgfoid)") != null);
+}
+
+test "quoted identifiers and schema-qualified MySQL/SQLite metadata queries unescape properly" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Escaped quotes inside quoted identifiers must not be double-escaped.
+    try testing.expectEqualStrings("\"a\"\"b\"", try quoteName(a, .postgres, "\"a\"\"b\""));
+    try testing.expectEqualStrings("`a``b`", try quoteName(a, .mysql, "`a``b`"));
+    try testing.expectEqualStrings("\"my.schema\".\"a\"\"b\"", try quoteName(a, .postgres, "\"my.schema\".\"a\"\"b\""));
+
+    // MySQL metadata queries must honor explicit schema prefixes.
+    const my_desc = try describeSql(a, .mysql, "shop.orders");
+    for (my_desc) |q| {
+        try testing.expect(std.mem.indexOf(u8, q, "table_schema = 'shop'") != null);
+        try testing.expect(std.mem.indexOf(u8, q, "table_name = 'orders'") != null);
+    }
+    const my_pk = try primaryKeySql(a, .mysql, "shop.orders");
+    try testing.expect(std.mem.indexOf(u8, my_pk, "table_schema = 'shop'") != null);
+    const my_uq = try uniqueKeySql(a, .mysql, "shop.orders");
+    try testing.expect(std.mem.indexOf(u8, my_uq, "table_schema = 'shop'") != null);
+    const my_def = try definitionSql(a, .mysql, "shop.active_orders");
+    try testing.expect(std.mem.indexOf(u8, my_def, "table_schema = 'shop' and table_name = 'active_orders'") != null);
+
+    // SQLite metadata queries must unwrap quoted table names before quoting as string literals.
+    const sq_desc = try describeSql(a, .sqlite, "\"My Table\"");
+    try testing.expect(std.mem.indexOf(u8, sq_desc[0], "pragma_table_info('My Table')") != null);
+    try testing.expect(std.mem.indexOf(u8, try primaryKeySql(a, .sqlite, "\"My Table\""), "pragma_table_info('My Table')") != null);
+    try testing.expect(std.mem.indexOf(u8, try uniqueKeySql(a, .sqlite, "\"My Table\""), "pragma_index_list('My Table')") != null);
+    try testing.expect(std.mem.indexOf(u8, (try foreignKeySql(a, .sqlite, "\"a\"\"b\"")).?, "pragma_foreign_key_list('a\"b')") != null);
 }

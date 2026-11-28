@@ -191,7 +191,7 @@ const Pg = struct {
 
     /// Formats an ErrorResponse: "ERROR: message (SQLSTATE) DETAIL … HINT …".
     fn setServerError(self: *Pg, m: []const u8) void {
-        var severity: []const u8 = "ERROR";
+        var severity: []const u8 = "";
         var code: []const u8 = "";
         var message: []const u8 = "";
         var detail: []const u8 = "";
@@ -214,6 +214,7 @@ const Pg = struct {
                 else => {},
             }
         }
+        if (severity.len == 0) severity = "ERROR";
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.gpa);
         buf.print(self.gpa, "{s}: {s}", .{ severity, message }) catch {};
@@ -266,6 +267,7 @@ const Pg = struct {
                 'T' => {
                     var r: Io.Reader = .fixed(m);
                     const n = try r.takeInt(u16, .big);
+                    b.resetResult();
                     const names = try a.alloc([]const u8, n);
                     const booleans = try a.alloc(bool, n);
                     for (names, booleans) |*name, *is_boolean| {
@@ -277,8 +279,6 @@ const Pg = struct {
                     }
                     try b.setColumns(names);
                     b.result.boolean_columns = booleans;
-                    b.result.truncated = false;
-                    b.result.affected_rows = null;
                 },
                 'D' => {
                     if (b.full(opts)) {
@@ -315,7 +315,7 @@ const Pg = struct {
                 'E' => {
                     self.setServerError(m);
                     // 57014 = query_canceled
-                    canceled = std.mem.indexOf(u8, m, "C57014\x00") != null;
+                    canceled = isCancelError(m);
                     failed = true;
                 },
                 'G' => try self.sendMessage('f', &.{"COPY FROM STDIN is not supported by zpeek\x00"}),
@@ -324,10 +324,10 @@ const Pg = struct {
                         self.err.set(self.gpa, "COPY TO STDOUT binary format is not supported", .{});
                         failed = true;
                     } else {
+                        b.resetResult();
                         const names = try a.alloc([]const u8, 1);
                         names[0] = "COPY";
                         try b.setColumns(names);
-                        b.result.boolean_columns = &.{};
                         copy_out = true;
                     }
                 },
@@ -393,6 +393,14 @@ const Pg = struct {
     }
 };
 
+fn isCancelError(m: []const u8) bool {
+    var it = std.mem.splitScalar(u8, m, 0);
+    while (it.next()) |field| {
+        if (field.len > 0 and field[0] == 'C' and std.mem.eql(u8, field[1..], "57014")) return true;
+    }
+    return false;
+}
+
 fn checkedMessageBodyLength(len: u32) error{ ProtocolError, StreamTooLong }!usize {
     if (len < 4) return error.ProtocolError;
     const body_len: usize = len - 4;
@@ -404,6 +412,24 @@ test "postgres message size is bounded" {
     try std.testing.expectEqual(@as(usize, 0), try checkedMessageBodyLength(4));
     try std.testing.expectError(error.ProtocolError, checkedMessageBodyLength(3));
     try std.testing.expectError(error.StreamTooLong, checkedMessageBodyLength(max_message_size + 5));
+}
+
+test "postgres error response parses S severity and SQLSTATE 57014 accurately" {
+    var pg: Pg = .{
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .t = undefined,
+        .host = "",
+        .port = 5432,
+        .unix_path = null,
+    };
+    defer pg.err.deinit(std.testing.allocator);
+    pg.setServerError("SFATAL\x00C28P01\x00Mauth failed\x00\x00");
+    try std.testing.expectEqualStrings("FATAL: auth failed (SQLSTATE 28P01)", pg.err.slice());
+    pg.setServerError("SLOCALIZED\x00VERROR\x00Mbad C57014\x00C22000\x00\x00");
+    try std.testing.expectEqualStrings("ERROR: bad C57014 (SQLSTATE 22000)", pg.err.slice());
+    try std.testing.expect(!isCancelError("SLOCALIZED\x00VERROR\x00Mbad C57014\x00C22000\x00\x00"));
+    try std.testing.expect(isCancelError("VERROR\x00C57014\x00Mcanceled\x00\x00"));
 }
 
 /// SCRAM-SHA-256 client state (RFC 5802 / 7677) without channel binding.

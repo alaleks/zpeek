@@ -60,6 +60,8 @@ pub fn deinit(p: *Picker) void {
 
 fn refilter(p: *Picker) Allocator.Error!void {
     p.matches.clearRetainingCapacity();
+    p.selected = 0;
+    p.top = 0;
     const q = p.query.items;
     const Match = enum { exact, prefix, substring };
     for ([_]Match{ .exact, .prefix, .substring }) |pass| {
@@ -71,8 +73,6 @@ fn refilter(p: *Picker) Allocator.Error!void {
             try p.matches.append(p.gpa, i);
         }
     }
-    p.selected = 0;
-    p.top = 0;
 }
 
 pub fn handleKey(p: *Picker, key: vaxis.Key) Allocator.Error!Action {
@@ -134,8 +134,13 @@ pub fn draw(p: *Picker, win: vaxis.Window, a: Allocator) Allocator.Error!void {
     }, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
     box.showCursor(@intCast(@min(1 + render.displayWidth(prompt) + render.displayWidth(p.query.items), box.width -| 1)), 1);
 
-    if (p.selected < p.top) p.top = p.selected;
-    if (p.selected >= p.top + visible) p.top = p.selected + 1 - visible;
+    if (visible > 0) {
+        if (p.selected < p.top) p.top = p.selected;
+        if (p.selected >= p.top + visible) p.top = p.selected + 1 - visible;
+        p.top = @min(p.top, p.matches.items.len -| visible);
+    } else {
+        p.top = 0;
+    }
 
     if (p.matches.items.len == 0) {
         const msg: []const u8 = if (p.purpose == .export_csv or p.purpose == .export_json) "type a path and filename · enter exports · esc cancels" else if (p.purpose == .save_query) "type a name · enter saves · esc cancels" else if (p.allow_raw and p.query.items.len > 0) "no match — enter connects to this URL / path" else "no matches";
@@ -211,4 +216,50 @@ test "picker keeps exact and substring table matches" {
         try std.testing.expectEqual(@as(usize, 3), p.matches.items.len);
     }
     try std.testing.expectEqual(@as(usize, 1), p.matches.items[0]);
+}
+
+test "picker refilter resets selection before OOM and draw clamps on small or growing terminal" {
+    const a = std.testing.allocator;
+    // OOM mid-refilter must not leave selected/top out of bounds.
+    var items: [16]Item = undefined;
+    for (&items, 0..) |*it, i| it.* = .{ .label = if (i % 2 == 0) "alpha" else "beta" };
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    const p = try Picker.init(failing.allocator(), .browse, "Tables", &items, false);
+    defer p.deinit();
+    p.selected = 10;
+    p.top = 5;
+    p.matches.deinit(failing.allocator());
+    p.matches = .empty;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, p.refilter());
+    try std.testing.expectEqual(@as(usize, 0), p.selected);
+    try std.testing.expectEqual(@as(usize, 0), p.top);
+
+    // Draw on a tiny terminal (height 8 -> visible 0) and after growing taller from scrolled bottom.
+    const p2 = try Picker.init(a, .browse, "Tables", &items, false);
+    defer p2.deinit();
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+
+    // Small screen (height 12 -> visible 4), scroll to bottom
+    var small = try vaxis.Screen.init(a, .{ .cols = 60, .rows = 12, .x_pixel = 0, .y_pixel = 0 });
+    defer small.deinit(a);
+    const small_win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 12, .screen = &small };
+    p2.selected = 15;
+    try p2.draw(small_win, arena.allocator());
+    try std.testing.expectEqual(@as(usize, 12), p2.top);
+
+    // Grow taller (height 24 -> visible 15): top must clamp to 16 - 15 = 1
+    var tall = try vaxis.Screen.init(a, .{ .cols = 60, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer tall.deinit(a);
+    const tall_win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 24, .screen = &tall };
+    try p2.draw(tall_win, arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), p2.top);
+
+    // Very short terminal (height 8 -> visible 0): must not underflow or panic
+    var tiny = try vaxis.Screen.init(a, .{ .cols = 60, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer tiny.deinit(a);
+    const tiny_win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 8, .screen = &tiny };
+    try p2.draw(tiny_win, arena.allocator());
+    try std.testing.expectEqual(@as(usize, 0), p2.top);
 }

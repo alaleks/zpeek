@@ -2,7 +2,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const vaxis = @import("vaxis");
 const memory = @import("../memory.zig");
+const render = @import("../render.zig");
 const lexer = @import("../sql/lexer.zig");
 
 const Editor = @This();
@@ -64,6 +66,7 @@ pub fn setText(e: *Editor, s: []const u8) Allocator.Error!void {
 pub fn insert(e: *Editor, s: []const u8) Allocator.Error!void {
     try e.buf.insertSlice(e.gpa, e.cursor, s);
     e.cursor += s.len;
+    e.snapCursor(.right);
     e.goal_col = null;
 }
 
@@ -76,6 +79,7 @@ pub fn insertNewline(e: *Editor) Allocator.Error!void {
     line[0] = '\n';
     @memcpy(line[1..], e.buf.items[start..][0..indent]);
     e.cursor += line.len;
+    e.snapCursor(.right);
     e.goal_col = null;
 }
 
@@ -105,16 +109,41 @@ pub fn insertPaste(e: *Editor, s: []const u8) Allocator.Error!void {
 
 fn prevCharStart(s: []const u8, pos: usize) usize {
     if (pos == 0) return 0;
-    var i = pos - 1;
-    while (i > 0 and (s[i] & 0xC0) == 0x80) i -= 1;
-    return i;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, s[0..pos], '\n')) |nl| nl + 1 else 0;
+    if (line_start == pos) return pos - 1;
+    const line = s[line_start..pos];
+    var gi = vaxis.unicode.graphemeIterator(line);
+    var last: usize = 0;
+    while (gi.next()) |g| last = g.start;
+    return line_start + last;
 }
 
 fn nextCharEnd(s: []const u8, pos: usize) usize {
     if (pos >= s.len) return s.len;
-    var i = pos + 1;
-    while (i < s.len and (s[i] & 0xC0) == 0x80) i += 1;
-    return i;
+    if (s[pos] == '\n') return pos + 1;
+    const line_end = std.mem.indexOfScalarPos(u8, s, pos, '\n') orelse s.len;
+    const tail = s[pos..line_end];
+    var gi = vaxis.unicode.graphemeIterator(tail);
+    const g = gi.next() orelse return pos + 1;
+    return pos + g.start + g.bytes(tail).len;
+}
+
+fn snapCursor(e: *Editor, direction: enum { left, right }) void {
+    const s = e.text();
+    const pos = e.cursor;
+    if (pos == 0 or pos == s.len or s[pos - 1] == '\n' or s[pos] == '\n') return;
+    if (std.ascii.isAscii(s[pos - 1]) and std.ascii.isAscii(s[pos])) return;
+    const start = e.lineStart(pos);
+    const line = s[start..e.lineEnd(pos)];
+    var it = vaxis.unicode.graphemeIterator(line);
+    while (it.next()) |g| {
+        const grapheme_end = start + g.start + g.len;
+        if (pos == grapheme_end) return;
+        if (pos < grapheme_end) {
+            e.cursor = if (direction == .right) grapheme_end else start + g.start;
+            return;
+        }
+    }
 }
 
 pub fn backspace(e: *Editor) void {
@@ -122,6 +151,7 @@ pub fn backspace(e: *Editor) void {
     const start = prevCharStart(e.buf.items, e.cursor);
     e.buf.replaceRangeAssumeCapacity(start, e.cursor - start, "");
     e.cursor = start;
+    e.snapCursor(.right);
     e.goal_col = null;
 }
 
@@ -129,6 +159,7 @@ pub fn deleteForward(e: *Editor) void {
     if (e.cursor >= e.buf.items.len) return;
     const stop = nextCharEnd(e.buf.items, e.cursor);
     e.buf.replaceRangeAssumeCapacity(e.cursor, stop - e.cursor, "");
+    e.snapCursor(.left);
     e.goal_col = null;
 }
 
@@ -169,14 +200,19 @@ pub fn onLastLine(e: *const Editor) bool {
 }
 
 fn columnOf(s: []const u8, from: usize, to: usize) usize {
-    return std.unicode.utf8CountCodepoints(s[from..to]) catch to - from;
+    return render.displayWidth(s[from..to]);
 }
 
 fn posAtColumn(s: []const u8, line_start: usize, line_end: usize, col: usize) usize {
-    var pos = line_start;
-    var c: usize = 0;
-    while (pos < line_end and c < col) : (c += 1) pos = nextCharEnd(s, pos);
-    return pos;
+    const line = s[line_start..line_end];
+    var gi = vaxis.unicode.graphemeIterator(line);
+    var width: usize = 0;
+    while (gi.next()) |g| {
+        const w = vaxis.gwidth.gwidth(g.bytes(line), .unicode);
+        if (width + w > col) return line_start + g.start;
+        width += w;
+    }
+    return line_end;
 }
 
 pub fn up(e: *Editor) void {
@@ -207,6 +243,7 @@ pub fn wordLeft(e: *Editor) void {
     while (i > 0 and !isWordByte(s[i - 1])) i -= 1;
     while (i > 0 and isWordByte(s[i - 1])) i -= 1;
     e.cursor = i;
+    e.snapCursor(.left);
     e.goal_col = null;
 }
 
@@ -216,6 +253,7 @@ pub fn wordRight(e: *Editor) void {
     while (i < s.len and !isWordByte(s[i])) i += 1;
     while (i < s.len and isWordByte(s[i])) i += 1;
     e.cursor = i;
+    e.snapCursor(.right);
     e.goal_col = null;
 }
 
@@ -223,6 +261,7 @@ pub fn deleteWordLeft(e: *Editor) void {
     const old = e.cursor;
     e.wordLeft();
     e.buf.replaceRangeAssumeCapacity(e.cursor, old - e.cursor, "");
+    e.snapCursor(.right);
 }
 
 pub fn killToLineStart(e: *Editor) void {
@@ -267,6 +306,7 @@ pub fn replaceBeforeCursorAndMove(e: *Editor, len: usize, replacement: []const u
     const start = e.cursor - len;
     try e.buf.replaceRange(e.gpa, start, len, replacement);
     e.cursor = start + replacement.len - cursor_back;
+    e.snapCursor(.right);
     e.goal_col = null;
 }
 
@@ -490,4 +530,45 @@ test "completion snippet positions cursor inside delimiters" {
     try e.replaceBeforeCursorAndMove(1, "IN ()", 1);
     try testing.expectEqualStrings("where id IN ()", e.text());
     try testing.expectEqualStrings(")", e.text()[e.cursor..]);
+}
+
+test "grapheme cursor movement and wide character vertical alignment" {
+    var e: Editor = .init(testing.allocator);
+    defer e.deinit();
+
+    // Combining accent (e + U+0301) is one grapheme cluster.
+    try e.setText("e\u{0301}x");
+    e.left();
+    try testing.expectEqual(@as(usize, "e\u{0301}".len), e.cursor);
+    e.left();
+    try testing.expectEqual(@as(usize, 0), e.cursor);
+    e.right();
+    try testing.expectEqual(@as(usize, "e\u{0301}".len), e.cursor);
+    e.backspace();
+    try testing.expectEqualStrings("x", e.text());
+    try testing.expectEqual(@as(usize, 0), e.cursor);
+
+    // ZWJ emoji sequence is moved and deleted as one grapheme cluster.
+    try e.setText("👩‍💻a");
+    e.left();
+    try testing.expectEqual(@as(usize, "👩‍💻".len), e.cursor);
+    e.left();
+    try testing.expectEqual(@as(usize, 0), e.cursor);
+    e.deleteForward();
+    try testing.expectEqualStrings("a", e.text());
+
+    try e.setText("👩💻");
+    e.left();
+    try e.insert("\u{200d}");
+    try testing.expectEqual("👩‍💻".len, e.cursor);
+    e.backspace();
+    try testing.expectEqualStrings("", e.text());
+
+    // Wide CJK characters align vertical navigation by display column.
+    try e.setText("日本a\n12345");
+    e.cursor = "日本".len; // display column 4 (at 'a')
+    e.down();
+    try testing.expectEqualStrings("5", e.text()[e.cursor..]);
+    e.up();
+    try testing.expectEqualStrings("a\n12345", e.text()[e.cursor..]);
 }

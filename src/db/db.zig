@@ -84,6 +84,13 @@ pub const ResultBuilder = struct {
         return b.result.arena.allocator();
     }
 
+    /// Discard the previous result before allocating metadata or rows for the next one.
+    pub fn resetResult(b: *ResultBuilder) void {
+        _ = b.result.arena.reset(.free_all);
+        b.rows.clearRetainingCapacity();
+        b.* = .{ .gpa = b.gpa, .result = .{ .arena = b.result.arena }, .rows = b.rows };
+    }
+
     pub fn allocRow(b: *ResultBuilder, ncols: usize, value_bytes: usize, opts: QueryOptions) Allocator.Error!?RowBuffer {
         const pointer_bytes = std.math.mul(usize, ncols, @sizeOf(?[]const u8)) catch return error.OutOfMemory;
         const row_bytes = std.math.add(usize, pointer_bytes, value_bytes) catch return error.OutOfMemory;
@@ -105,8 +112,8 @@ pub const ResultBuilder = struct {
     }
 
     pub fn setColumns(b: *ResultBuilder, names: []const []const u8) Allocator.Error!void {
+        std.debug.assert(b.rows.items.len == 0);
         b.result.columns = names;
-        b.rows.clearRetainingCapacity();
     }
 
     pub fn addRow(b: *ResultBuilder, row: []const ?[]const u8, opts: QueryOptions) Allocator.Error!void {
@@ -442,6 +449,30 @@ test "result byte limit stops storing rows" {
     try std.testing.expect(b.result.truncated);
     try std.testing.expectEqual(@as(usize, 0), b.rows.items.len);
     try std.testing.expect(b.full(opts));
+}
+
+test "resetResult releases row memory and restores the byte budget" {
+    var b: ResultBuilder = .init(std.testing.allocator);
+    errdefer b.deinit();
+    const opts: QueryOptions = .{ .max_bytes = @sizeOf(?[]const u8) + 4 };
+    try b.setColumns(&.{"a"});
+    var row1 = (try b.allocRow(1, 4, opts)).?;
+    row1.put(0, "1234");
+    try b.addRow(row1.row, opts);
+    try std.testing.expect(b.full(opts));
+
+    b.resetResult();
+    try std.testing.expectEqual(@as(usize, 0), b.result.arena.queryCapacity());
+    try b.setColumns(&.{"b"});
+    try std.testing.expect(!b.full(opts));
+    var row2 = (try b.allocRow(1, 2, opts)).?;
+    row2.put(0, "ok");
+    try b.addRow(row2.row, opts);
+    var res = b.finish();
+    defer res.deinit();
+    try std.testing.expect(!res.truncated);
+    try std.testing.expectEqual(@as(usize, 1), res.rows.len);
+    try std.testing.expectEqualStrings("ok", res.rows[0][0].?);
 }
 
 fn buildOwnedRows(a: Allocator) !void {

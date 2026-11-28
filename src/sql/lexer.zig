@@ -35,6 +35,7 @@ pub const Iterator = struct {
     src: []const u8,
     dialect: Dialect = .postgres,
     pos: usize = 0,
+    mysql_no_backslash_escapes: bool = false,
 
     pub fn init(src: []const u8) Iterator {
         return .{ .src = src };
@@ -49,6 +50,7 @@ pub const Iterator = struct {
         if (it.pos >= s.len) return null;
         const start = it.pos;
         const c = s[start];
+        const mysql_escapes = it.dialect == .mysql and !it.mysql_no_backslash_escapes;
         var tag: Tag = .punctuation;
         var i = start + 1;
 
@@ -85,15 +87,15 @@ pub const Iterator = struct {
             },
             '\'' => {
                 tag = .string;
-                i = scanQuoted(s, i, '\'', it.dialect == .mysql);
+                i = scanQuoted(s, i, '\'', mysql_escapes);
             },
             '"' => {
                 tag = .quoted_identifier;
-                i = scanQuoted(s, i, '"', it.dialect == .mysql);
+                i = scanQuoted(s, i, '"', mysql_escapes);
             },
             '`' => {
                 tag = .quoted_identifier;
-                i = scanQuoted(s, i, '`', it.dialect == .mysql);
+                i = scanQuoted(s, i, '`', mysql_escapes);
             },
             '[' => {
                 if (it.dialect == .sqlite) {
@@ -145,7 +147,8 @@ pub const Iterator = struct {
                     // E'...' / X'...' / B'...' / N'...' string prefixes
                     if (i < s.len and s[i] == '\'' and std.mem.indexOfScalar(u8, "eExXbBnN", c) != null) {
                         tag = .string;
-                        i = scanQuoted(s, i + 1, '\'', it.dialect == .mysql or c == 'e' or c == 'E');
+                        const escapes = if (it.dialect == .mysql) mysql_escapes else c == 'e' or c == 'E';
+                        i = scanQuoted(s, i + 1, '\'', escapes);
                     } else {
                         while (i < s.len and isIdentChar(s[i])) i += 1;
                         const word = s[start..i];

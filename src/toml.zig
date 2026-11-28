@@ -302,7 +302,12 @@ const Parser = struct {
 
     fn multilineLiteral(p: *Parser) Error![]const u8 {
         p.pos += 3;
-        if (p.startsWith("\n")) p.advance() else if (p.startsWith("\r\n")) p.pos += 2;
+        if (p.startsWith("\n")) {
+            p.advance();
+        } else if (p.startsWith("\r\n")) {
+            p.advance();
+            p.advance();
+        }
         const start = p.pos;
         while (p.pos < p.src.len) {
             if (p.startsWith("'''")) {
@@ -337,7 +342,12 @@ const Parser = struct {
 
     fn multilineBasic(p: *Parser) Error![]const u8 {
         p.pos += 3;
-        if (p.startsWith("\n")) p.advance() else if (p.startsWith("\r\n")) p.pos += 2;
+        if (p.startsWith("\n")) {
+            p.advance();
+        } else if (p.startsWith("\r\n")) {
+            p.advance();
+            p.advance();
+        }
         var out: std.ArrayList(u8) = .empty;
         while (p.peek()) |c| {
             if (p.startsWith("\"\"\"")) {
@@ -354,7 +364,8 @@ const Parser = struct {
                         p.advance();
                     }
                     if (p.startsWith("\r\n")) {
-                        p.pos += 2;
+                        p.advance();
+                        p.advance();
                     } else if (p.startsWith("\n")) {
                         p.advance();
                     } else return p.fail("line continuation requires a newline");
@@ -388,7 +399,9 @@ const Parser = struct {
             'u', 'U' => {
                 const len: usize = if (c == 'u') 4 else 8;
                 if (p.pos + len > p.src.len) return p.fail("invalid unicode escape");
-                const cp = std.fmt.parseInt(u21, p.src[p.pos .. p.pos + len], 16) catch
+                const hex = p.src[p.pos .. p.pos + len];
+                for (hex) |ch| if (!std.ascii.isHex(ch)) return p.fail("invalid unicode escape");
+                const cp = std.fmt.parseInt(u21, hex, 16) catch
                     return p.fail("invalid unicode escape");
                 p.pos += len;
                 var buf: [4]u8 = undefined;
@@ -476,4 +489,17 @@ test "multiline continuation requires LF or CRLF after optional spaces" {
         const root = try parse(a, src, null);
         try testing.expectEqualStrings("ab", root.get("value").?.string);
     }
+}
+
+test "CRLF multiline strings preserve error line numbers and reject signed unicode escapes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.SyntaxError, parse(a, "a = \"\"\"\r\nline2\\\r\nline3\"\"\"\r\nbad =", &diag));
+    try testing.expectEqual(@as(usize, 4), diag.line);
+    try testing.expectError(error.SyntaxError, parse(a, "a = '''\r\nline2'''\r\nbad =", &diag));
+    try testing.expectEqual(@as(usize, 3), diag.line);
+    try testing.expectError(error.SyntaxError, parse(a, "a = \"\\u+041\"", &diag));
+    try testing.expectError(error.SyntaxError, parse(a, "a = \"\\U+0000041\"", &diag));
 }

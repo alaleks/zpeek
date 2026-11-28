@@ -118,6 +118,8 @@ pub const Params = struct {
     database: []const u8 = "",
     ssl: SslMode = .prefer,
     access: Access = .full,
+    /// True when config explicitly chose `password_env`; prevents fallback to $PGPASSWORD/$MYSQL_PWD.
+    password_explicit: bool = false,
 
     pub fn effectivePort(p: Params) u16 {
         return if (p.port != 0) p.port else p.kind.defaultPort();
@@ -137,7 +139,7 @@ pub const Params = struct {
 /// Fills an empty password from $PGPASSWORD (PostgreSQL) or $MYSQL_PWD (MySQL),
 /// like the official clients do.
 pub fn passwordFromEnv(p: *Params, env: *const std.process.Environ.Map) void {
-    if (p.password.len > 0) return;
+    if (p.password.len > 0 or p.password_explicit) return;
     const name: []const u8 = switch (p.kind) {
         .postgres => "PGPASSWORD",
         .mysql => "MYSQL_PWD",
@@ -183,7 +185,7 @@ pub fn looksLikeSqlitePath(s: []const u8) bool {
 /// connection name from the config file).
 pub fn isConnectionString(s: []const u8) bool {
     if (std.mem.indexOf(u8, s, "://") != null) return true;
-    if (std.mem.startsWith(u8, s, "sqlite:")) return true;
+    if (std.mem.startsWith(u8, s, "sqlite:") or std.mem.startsWith(u8, s, "sqlite3:")) return true;
     if (std.mem.indexOf(u8, s, "@tcp(") != null) return true;
     if (std.mem.indexOfScalar(u8, s, '=') != null) return true;
     if (std.mem.indexOfScalar(u8, s, '/') != null) return true;
@@ -195,8 +197,14 @@ pub fn parse(arena: Allocator, s: []const u8) ParseError!Params {
     const input = stripPasted(s);
     if (input.len == 0) return error.InvalidConnectionString;
 
-    if (std.mem.startsWith(u8, input, "sqlite:")) {
-        var path = input["sqlite:".len..];
+    const sqlite_prefix: ?[]const u8 = if (std.mem.startsWith(u8, input, "sqlite:"))
+        "sqlite:"
+    else if (std.mem.startsWith(u8, input, "sqlite3:"))
+        "sqlite3:"
+    else
+        null;
+    if (sqlite_prefix) |prefix| {
+        var path = input[prefix.len..];
         if (std.mem.startsWith(u8, path, "//")) path = path[2..];
         if (path.len == 0) return error.InvalidConnectionString;
         return .{ .kind = .sqlite, .database = try percentDecode(arena, path) };
@@ -218,9 +226,10 @@ pub fn parse(arena: Allocator, s: []const u8) ParseError!Params {
 fn parseUrl(arena: Allocator, kind: Kind, rest_in: []const u8) ParseError!Params {
     var p: Params = .{ .kind = kind };
     var rest = rest_in;
+    var query: ?[]const u8 = null;
 
     if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
-        try applyQuery(arena, &p, rest[q + 1 ..]);
+        query = rest[q + 1 ..];
         rest = rest[0..q];
     }
 
@@ -242,6 +251,7 @@ fn parseUrl(arena: Allocator, kind: Kind, rest_in: []const u8) ParseError!Params
     }
 
     try parseHostPort(arena, &p, hostport);
+    if (query) |q| try applyQuery(arena, &p, q);
     return p;
 }
 
@@ -350,11 +360,13 @@ fn parseGoDsn(arena: Allocator, s: []const u8) ParseError!Params {
     const close = std.mem.indexOfScalar(u8, rest, ')') orelse return error.InvalidConnectionString;
     try parseHostPort(arena, &p, rest[0..close]);
     var tail = rest[close + 1 ..];
+    var query: ?[]const u8 = null;
     if (std.mem.indexOfScalar(u8, tail, '?')) |q| {
-        try applyQuery(arena, &p, tail[q + 1 ..]);
+        query = tail[q + 1 ..];
         tail = tail[0..q];
     }
     if (std.mem.startsWith(u8, tail, "/")) p.database = try arena.dupe(u8, tail[1..]);
+    if (query) |q| try applyQuery(arena, &p, q);
     return p;
 }
 
@@ -364,7 +376,7 @@ fn percentDecode(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
     var o: usize = 0;
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
-        if (s[i] == '%' and i + 2 < s.len) {
+        if (s[i] == '%' and i + 2 < s.len and std.ascii.isHex(s[i + 1]) and std.ascii.isHex(s[i + 2])) {
             if (std.fmt.parseInt(u8, s[i + 1 .. i + 3], 16)) |b| {
                 out[o] = b;
                 o += 1;
@@ -458,4 +470,36 @@ test "ipv6 host" {
 test "connection string detection accepts one libpq parameter" {
     try testing.expect(isConnectionString("dbname=app"));
     try testing.expect(isConnectionString("host=localhost"));
+    try testing.expect(isConnectionString("sqlite3::memory:"));
+}
+
+test "sqlite3 scheme, URL query precedence and strict percent decoding" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const s1 = try parse(a, "sqlite3:///tmp/app.db");
+    try testing.expectEqual(Kind.sqlite, s1.kind);
+    try testing.expectEqualStrings("/tmp/app.db", s1.database);
+    const s2 = try parse(a, "sqlite3::memory:");
+    try testing.expectEqual(Kind.sqlite, s2.kind);
+    try testing.expectEqualStrings(":memory:", s2.database);
+
+    const pg_q = try parse(a, "postgres:///?dbname=app&host=/var/run/postgresql");
+    try testing.expectEqualStrings("app", pg_q.database);
+    try testing.expectEqualStrings("/var/run/postgresql", pg_q.host);
+    const pg_port = try parse(a, "postgres://:5433/app?host=/var/run/postgresql");
+    try testing.expectEqual(@as(u16, 5433), pg_port.port);
+    try testing.expectEqualStrings("/var/run/postgresql", pg_port.host);
+    const dsn = try parse(a, "u:pw@tcp(h:3306)/?dbname=shop");
+    try testing.expectEqualStrings("shop", dsn.database);
+
+    const pct = try parse(a, "postgres://u:a%+5b%40c@h/db");
+    try testing.expectEqualStrings("a%+5b@c", pct.password);
+
+    var env: std.process.Environ.Map = .init(a);
+    try env.put("PGPASSWORD", "fallback");
+    var explicit: Params = .{ .kind = .postgres, .password_explicit = true };
+    passwordFromEnv(&explicit, &env);
+    try testing.expectEqualStrings("", explicit.password);
 }

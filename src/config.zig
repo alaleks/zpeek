@@ -64,19 +64,31 @@ pub const Diagnostic = struct {
 pub const LoadError = error{ InvalidConfig, ReadFailed } || Allocator.Error;
 
 pub fn defaultPath(arena: Allocator, env: *const std.process.Environ.Map) Allocator.Error!?[]const u8 {
-    if (env.get("ZPEEK_CONFIG")) |p| return try arena.dupe(u8, p);
+    if (env.get("ZPEEK_CONFIG")) |p| {
+        if (p.len > 0) return try arena.dupe(u8, p);
+    }
     if (env.get("XDG_CONFIG_HOME")) |x| {
         if (x.len > 0) return try std.fs.path.join(arena, &.{ x, "zpeek", "config.toml" });
     }
-    if (env.get("HOME")) |home| return try std.fs.path.join(arena, &.{ home, ".config", "zpeek", "config.toml" });
+    if (env.get("HOME")) |home| {
+        if (home.len > 0) return try std.fs.path.join(arena, &.{ home, ".config", "zpeek", "config.toml" });
+    }
     // Windows outside of Git Bash/MSYS has no HOME.
-    if (env.get("APPDATA")) |appdata| return try std.fs.path.join(arena, &.{ appdata, "zpeek", "config.toml" });
+    if (env.get("APPDATA")) |appdata| {
+        if (appdata.len > 0) return try std.fs.path.join(arena, &.{ appdata, "zpeek", "config.toml" });
+    }
     return null;
 }
 
 /// The user's home directory: $HOME, or %USERPROFILE% on Windows.
 pub fn homeDir(env: *const std.process.Environ.Map) ?[]const u8 {
-    return env.get("HOME") orelse env.get("USERPROFILE");
+    if (env.get("HOME")) |home| {
+        if (home.len > 0) return home;
+    }
+    if (env.get("USERPROFILE")) |profile| {
+        if (profile.len > 0) return profile;
+    }
+    return null;
 }
 
 /// Loads the config. A missing file yields an empty config with `found = false`.
@@ -198,6 +210,7 @@ fn entryParams(arena: Allocator, env: *const std.process.Environ.Map, t: *const 
         // A missing variable must not break the whole config: the password
         // stays empty and only this connection fails to authenticate.
         params.password = env.get(name) orelse "";
+        params.password_explicit = true;
     }
     if (try getString(t, "database")) |v| params.database = v;
     if (t.get("read_only")) |v| switch (v) {
@@ -232,6 +245,7 @@ fn entryColor(t: *const toml.Table) EntryError!?Color {
 
 pub fn parseColor(value: []const u8) error{InvalidColor}!Color {
     if (value.len != 7 or value[0] != '#') return error.InvalidColor;
+    for (value[1..7]) |ch| if (!std.ascii.isHex(ch)) return error.InvalidColor;
     return .{
         .r = std.fmt.parseInt(u8, value[1..3], 16) catch return error.InvalidColor,
         .g = std.fmt.parseInt(u8, value[3..5], 16) catch return error.InvalidColor,
@@ -551,5 +565,24 @@ test "password_env overrides URL and explicit password even when absent" {
     try testing.expectEqualStrings("replacement", present.find("pg").?.params.password);
     try env.put("ZPEEK_TEST_PASSWORD", "");
     const empty = try parse(a, &env, "test.toml", src, &diag);
-    try testing.expectEqualStrings("", empty.find("pg").?.params.password);
+    var p = empty.find("pg").?.params;
+    try testing.expectEqualStrings("", p.password);
+    try env.put("PGPASSWORD", "wrong-fallback");
+    conninfo.passwordFromEnv(&p, &env);
+    try testing.expectEqualStrings("", p.password);
+}
+
+test "empty env vars fall back and non-hex color signs are rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    try env.put("ZPEEK_CONFIG", "");
+    try env.put("HOME", "");
+    try env.put("APPDATA", "");
+    try testing.expect((try defaultPath(a, &env)) == null);
+    try env.put("XDG_CONFIG_HOME", "/cfg");
+    const expected = try std.fs.path.join(a, &.{ "/cfg", "zpeek", "config.toml" });
+    try testing.expectEqualStrings(expected, (try defaultPath(a, &env)).?);
+    try testing.expectError(error.InvalidColor, parseColor("#+1+2+3"));
 }

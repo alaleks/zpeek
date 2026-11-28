@@ -45,6 +45,17 @@ pub const Browse = struct {
     read_only: bool = false,
 };
 
+const BrowseRollback = struct {
+    old_filter: ?[]const u8 = null,
+    order_change: union(enum) {
+        unchanged,
+        flip_desc: bool,
+        replace: ?schema.Order,
+    } = .unchanged,
+    offset: usize,
+    total: ?u64,
+};
+
 pub const Action = union(enum) {
     none,
     close,
@@ -67,6 +78,7 @@ result: *db.Result,
 owns_result: bool,
 title: []const u8,
 browse: ?Browse,
+pending_browse_rollback: ?BrowseRollback = null,
 /// Connection badge for a result opened outside browse mode.
 result_database: []const u8 = "",
 result_database_color: ?BadgeColor = null,
@@ -172,6 +184,7 @@ pub fn init(gpa: Allocator, result: *db.Result, owns_result: bool, title: []cons
 }
 
 pub fn deinit(tv: *TableView) void {
+    tv.clearBrowseRollback();
     if (tv.owns_result) {
         tv.result.deinit();
         tv.gpa.destroy(tv.result);
@@ -200,8 +213,49 @@ pub fn deinit(tv: *TableView) void {
     tv.gpa.destroy(tv);
 }
 
+fn clearBrowseRollback(tv: *TableView) void {
+    const rb = tv.pending_browse_rollback orelse return;
+    if (rb.old_filter) |f| tv.gpa.free(f);
+    switch (rb.order_change) {
+        .replace => |ord| if (ord) |o| tv.gpa.free(o.column),
+        else => {},
+    }
+    tv.pending_browse_rollback = null;
+}
+
+/// Restores browse filter/order/offset/total when a requested reload fails or is rejected.
+pub fn revertPendingBrowse(tv: *TableView) void {
+    const rb = tv.pending_browse_rollback orelse return;
+    tv.pending_browse_rollback = null;
+    if (tv.browse) |*b| {
+        if (rb.old_filter) |f| {
+            tv.gpa.free(b.filter);
+            b.filter = f;
+        }
+        switch (rb.order_change) {
+            .unchanged => {},
+            .flip_desc => |was_desc| if (b.order) |*o| {
+                o.descending = was_desc;
+            },
+            .replace => |old_order| {
+                if (b.order) |o| tv.gpa.free(o.column);
+                b.order = old_order;
+            },
+        }
+        b.offset = rb.offset;
+        b.total = rb.total;
+    } else {
+        if (rb.old_filter) |f| tv.gpa.free(f);
+        switch (rb.order_change) {
+            .replace => |ord| if (ord) |o| tv.gpa.free(o.column),
+            else => {},
+        }
+    }
+}
+
 /// Replaces the result after a browse reload.
 pub fn setResult(tv: *TableView, result: *db.Result) Allocator.Error!void {
+    tv.clearBrowseRollback();
     tv.clearForeignResult();
     if (tv.owns_result) {
         tv.result.deinit();
@@ -555,6 +609,7 @@ pub fn handleKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
         return tv.prevPage();
     } else if (key.matches('r', .{}) or key.matches(vaxis.Key.f5, .{})) {
         if (tv.browse) |*b| {
+            if (tv.pending_browse_rollback == null) tv.pending_browse_rollback = .{ .offset = b.offset, .total = b.total };
             b.total = null;
             return .reload;
         }
@@ -609,7 +664,15 @@ fn handleFilterKey(tv: *TableView, key: vaxis.Key) Allocator.Error!Action {
         const text = std.mem.trim(u8, e.text(), " \t");
         if (tv.browse) |*b| {
             const filter = try tv.gpa.dupe(u8, text);
-            tv.gpa.free(b.filter);
+            if (tv.pending_browse_rollback == null) {
+                tv.pending_browse_rollback = .{
+                    .old_filter = b.filter,
+                    .offset = b.offset,
+                    .total = b.total,
+                };
+            } else {
+                tv.gpa.free(b.filter);
+            }
             b.filter = filter;
             b.offset = 0;
             b.total = null;
@@ -692,6 +755,15 @@ fn filterLabel(tv: *const TableView) []const u8 {
     return if (tv.browse != null) " WHERE " else " filter ";
 }
 
+fn dialect(tv: *const TableView) lexer.Dialect {
+    const b = tv.browse orelse return .postgres;
+    return switch (b.kind) {
+        .postgres => .postgres,
+        .mysql, .clickhouse => .mysql,
+        .sqlite => .sqlite,
+    };
+}
+
 /// The identifier being typed before the cursor (with an opening quote, if any),
 /// or null when the cursor is inside a string literal or comment.
 fn completionWord(tv: *const TableView) ?[]const u8 {
@@ -704,7 +776,7 @@ fn completionWord(tv: *const TableView) ?[]const u8 {
     if (word.len == 0) return null;
     // Only complete outside of strings/comments: the token ending at the
     // cursor must be an identifier, keyword or quoted identifier.
-    var it: lexer.Iterator = .init(before);
+    var it: lexer.Iterator = .initDialect(before, tv.dialect());
     var last: ?lexer.Token = null;
     while (it.next()) |t| last = t;
     const t = last orelse return null;
@@ -722,7 +794,7 @@ fn updateCompletion(tv: *TableView) Allocator.Error!void {
     tv.completion_navigated = false;
     if (!tv.editing_filter) return;
     if (tv.browse) |b| {
-        if (complete.operatorPrefix(tv.filter_editor.text(), tv.filter_editor.cursor, true)) |prefix| {
+        if (complete.operatorPrefixDialect(tv.filter_editor.text(), tv.filter_editor.cursor, true, tv.dialect())) |prefix| {
             tv.completion_len = prefix.len;
             for (complete.operators(b.kind)) |candidate| {
                 if (tv.completion.items.len >= max_completions) return;
@@ -813,7 +885,12 @@ fn drawCompletion(tv: *TableView, win: vaxis.Window, input_row: u16) void {
 
 pub fn setPrimaryKey(tv: *TableView, columns: []const []const u8) Allocator.Error!void {
     tv.clearPrimaryKey();
-    for (columns) |c| try tv.primary_key.append(tv.gpa, try tv.gpa.dupe(u8, c));
+    errdefer tv.clearPrimaryKey();
+    for (columns) |c| {
+        const copy = try tv.gpa.dupe(u8, c);
+        errdefer tv.gpa.free(copy);
+        try tv.primary_key.append(tv.gpa, copy);
+    }
 }
 
 fn clearPrimaryKey(tv: *TableView) void {
@@ -1140,17 +1217,48 @@ fn toggleSort(tv: *TableView) Allocator.Error!Action {
         if (b.order) |o| {
             const same = std.mem.eql(u8, o.column, name);
             if (same and !o.descending) {
+                if (tv.pending_browse_rollback == null) {
+                    tv.pending_browse_rollback = .{
+                        .order_change = .{ .flip_desc = false },
+                        .offset = b.offset,
+                        .total = b.total,
+                    };
+                }
                 b.order.?.descending = true;
             } else if (same) {
+                if (tv.pending_browse_rollback == null) {
+                    tv.pending_browse_rollback = .{
+                        .order_change = .{ .replace = o },
+                        .offset = b.offset,
+                        .total = b.total,
+                    };
+                } else {
+                    tv.gpa.free(o.column);
+                }
                 b.order = null;
-                tv.gpa.free(o.column);
             } else {
                 const column = try tv.gpa.dupe(u8, name);
+                if (tv.pending_browse_rollback == null) {
+                    tv.pending_browse_rollback = .{
+                        .order_change = .{ .replace = o },
+                        .offset = b.offset,
+                        .total = b.total,
+                    };
+                } else {
+                    tv.gpa.free(o.column);
+                }
                 b.order = .{ .column = column };
-                tv.gpa.free(o.column);
             }
         } else {
-            b.order = .{ .column = try tv.gpa.dupe(u8, name) };
+            const column = try tv.gpa.dupe(u8, name);
+            if (tv.pending_browse_rollback == null) {
+                tv.pending_browse_rollback = .{
+                    .order_change = .{ .replace = null },
+                    .offset = b.offset,
+                    .total = b.total,
+                };
+            }
+            b.order = .{ .column = column };
         }
         b.offset = 0;
         return .reload;
@@ -1171,6 +1279,7 @@ fn nextPage(tv: *TableView) Action {
     if (b.total) |total| {
         if (@as(u128, b.offset) + b.page_size >= total) return .{ .notice = "last page" };
     }
+    if (tv.pending_browse_rollback == null) tv.pending_browse_rollback = .{ .offset = b.offset, .total = b.total };
     b.offset += b.page_size;
     return .reload;
 }
@@ -1178,6 +1287,7 @@ fn nextPage(tv: *TableView) Action {
 fn prevPage(tv: *TableView) Action {
     const b = &(tv.browse orelse return .none);
     if (b.offset == 0) return .{ .notice = "first page" };
+    if (tv.pending_browse_rollback == null) tv.pending_browse_rollback = .{ .offset = b.offset, .total = b.total };
     b.offset -|= b.page_size;
     return .reload;
 }
@@ -1733,8 +1843,10 @@ fn drawChooser(tv: *TableView, a: Allocator, win: vaxis.Window) Allocator.Error!
     });
     _ = box.print(&.{.{ .text = " space hide/show · enter jump", .style = theme.plain }}, .{ .row_offset = 1, .wrap = .none });
 
+    if (visible == 0) return;
     if (ch.sel < ch.top) ch.top = ch.sel;
     if (ch.sel >= ch.top + visible) ch.top = ch.sel + 1 - visible;
+    ch.top = @min(ch.top, cols.len -| visible);
     for (cols[ch.top..][0..visible], ch.top..) |name, ci| {
         const sel = ci == ch.sel;
         const row: u16 = @intCast(ci - ch.top + 2);
@@ -1804,4 +1916,94 @@ test "browse allocation failures preserve owned filter and sort" {
     try std.testing.expect(tv.browse.?.order.?.descending);
     _ = try tv.toggleSort();
     try std.testing.expect(tv.browse.?.order == null);
+}
+
+test "column chooser clamps top when terminal grows or shrinks to zero visible rows" {
+    const a = std.testing.allocator;
+    const cols = [_][]const u8{ "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11" };
+    var result: db.Result = .{ .arena = .init(a), .columns = &cols, .rows = &.{} };
+    defer result.deinit();
+    const tv = try TableView.init(a, &result, false, "t", null, "", null);
+    defer tv.deinit();
+    tv.chooser = .{ .sel = 11, .top = 8 };
+
+    // Grow taller (height 24 -> visible 12): ch.top must clamp to 0 without slice OOB.
+    var tall = try vaxis.Screen.init(a, .{ .cols = 80, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer tall.deinit(a);
+    const tall_win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 80, .height = 24, .screen = &tall };
+    try tv.draw(tall_win);
+    try std.testing.expectEqual(@as(usize, 0), tv.chooser.?.top);
+
+    // Very short terminal (height 8 -> visible 0): must not panic.
+    var tiny = try vaxis.Screen.init(a, .{ .cols = 80, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer tiny.deinit(a);
+    const tiny_win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 80, .height = 8, .screen = &tiny };
+    try tv.draw(tiny_win);
+}
+
+test "setPrimaryKey cleans up partial allocations on OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: Allocator) !void {
+            var result: db.Result = .{ .arena = .init(a), .columns = &.{ "a", "b", "c" }, .rows = &.{} };
+            defer result.deinit();
+            const tv = try TableView.init(a, &result, false, "t", .{ .table = "t" }, "", null);
+            defer tv.deinit();
+            try tv.setPrimaryKey(&.{ "a", "b", "c" });
+        }
+    }.run, .{});
+}
+
+test "filter completion respects dialect comments and browse rollback restores failed reloads" {
+    const a = std.testing.allocator;
+    var result: db.Result = .{ .arena = .init(a), .columns = &.{ "id", "name" }, .rows = &.{&.{ "1", "Ada" }} };
+    defer result.deinit();
+    const tv = try TableView.init(a, &result, false, "t", .{
+        .table = "t",
+        .kind = .mysql,
+        .filter = "id = 1",
+        .order = .{ .column = "id", .descending = false },
+        .offset = 50,
+        .total = 100,
+        .page_size = 1,
+    }, "", null);
+    defer tv.deinit();
+
+    // MySQL '#' comment suppresses column and operator completion.
+    tv.editing_filter = true;
+    try tv.filter_editor.setText("id = 1 # nam");
+    try tv.updateCompletion();
+    try std.testing.expectEqual(@as(usize, 0), tv.completion.items.len);
+    tv.editing_filter = false;
+
+    // Filter change rollback restores old filter, offset and total.
+    _ = try tv.handleKey(.{ .codepoint = '/' });
+    try tv.filter_editor.setText("broken =");
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = vaxis.Key.enter })) == .reload);
+    try std.testing.expectEqualStrings("broken =", tv.browse.?.filter);
+    try std.testing.expectEqual(@as(usize, 0), tv.browse.?.offset);
+    tv.revertPendingBrowse();
+    try std.testing.expectEqualStrings("id = 1", tv.browse.?.filter);
+    try std.testing.expectEqual(@as(usize, 50), tv.browse.?.offset);
+    try std.testing.expectEqual(@as(?u64, 100), tv.browse.?.total);
+
+    // Sort flip rollback restores descending=false and offset=50.
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 's' })) == .reload);
+    try std.testing.expect(tv.browse.?.order.?.descending);
+    tv.revertPendingBrowse();
+    try std.testing.expect(!tv.browse.?.order.?.descending);
+    try std.testing.expectEqual(@as(usize, 50), tv.browse.?.offset);
+
+    // Sort column replacement rollback restores previous column and frees new column.
+    tv.col = 1;
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 's' })) == .reload);
+    try std.testing.expectEqualStrings("name", tv.browse.?.order.?.column);
+    tv.revertPendingBrowse();
+    try std.testing.expectEqualStrings("id", tv.browse.?.order.?.column);
+    try std.testing.expectEqual(@as(usize, 50), tv.browse.?.offset);
+
+    // Page navigation rollback restores offset=50.
+    try std.testing.expect((try tv.handleKey(.{ .codepoint = 'n' })) == .reload);
+    try std.testing.expectEqual(@as(usize, 51), tv.browse.?.offset);
+    tv.revertPendingBrowse();
+    try std.testing.expectEqual(@as(usize, 50), tv.browse.?.offset);
 }

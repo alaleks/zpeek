@@ -33,9 +33,10 @@ const Sqlite = struct {
 
             var stmt: ?*c.sqlite3_stmt = null;
             var tail: [*c]const u8 = null;
-            if (c.sqlite3_prepare_v2(self.handle, rest.ptr, @intCast(rest.len), &stmt, &tail) != c.SQLITE_OK) {
+            const rc = c.sqlite3_prepare_v2(self.handle, rest.ptr, @intCast(rest.len), &stmt, &tail);
+            if (rc != c.SQLITE_OK) {
                 self.setError();
-                return error.QueryFailed;
+                return if ((rc & 0xff) == c.SQLITE_INTERRUPT) error.Canceled else error.QueryFailed;
             }
             const consumed = @intFromPtr(tail) - @intFromPtr(rest.ptr);
             rest = rest[consumed..];
@@ -49,6 +50,7 @@ const Sqlite = struct {
     }
 
     fn runStatement(self: *Sqlite, s: *c.sqlite3_stmt, b: *db.ResultBuilder, opts: db.QueryOptions) db.QueryError!void {
+        b.resetResult();
         const a = b.allocator();
         const ncols: usize = @intCast(c.sqlite3_column_count(s));
         const word = firstWord(std.mem.span(c.sqlite3_sql(s)));
@@ -59,8 +61,6 @@ const Sqlite = struct {
                 n.* = try a.dupe(u8, std.mem.span(c.sqlite3_column_name(s, @intCast(i))));
             }
             try b.setColumns(names);
-            b.result.affected_rows = null;
-            b.result.truncated = false;
         }
 
         while (true) {
@@ -96,8 +96,6 @@ const Sqlite = struct {
                 b.rows.items.len, if (b.result.truncated) "+" else "", plural(b.rows.items.len),
             });
         } else {
-            b.result.columns = &.{};
-            b.rows.clearRetainingCapacity();
             const verb = try std.ascii.allocUpperString(a, word);
             if (dml) {
                 const changes: u64 = @intCast(c.sqlite3_changes64(self.handle));
@@ -431,6 +429,51 @@ test "foreign key metadata and composite row lookup on SQLite" {
     try std.testing.expectEqualStrings("id", implicit.rows[0][4].?);
 }
 
+test "SQLite browse metadata comes from the attached schema" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var err: db.ErrorText = .{};
+    defer err.deinit(gpa);
+    const conn = try connect(gpa, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    defer conn.close();
+
+    var setup = try conn.query(gpa,
+        \\create table example(id integer primary key, main_name text unique);
+        \\create view summary as select 1;
+        \\attach ':memory:' as extra;
+        \\create table extra.example(id integer, item integer primary key, extra_name text unique);
+        \\create table extra.child(ref integer references example);
+        \\create view extra.summary as select 2;
+        \\insert into extra.example values (1, 1, 'first'), (1, 2, 'second');
+    );
+    setup.deinit();
+    var keys = try conn.query(gpa, try schema.primaryKeySql(a, .sqlite, "extra.example"));
+    defer keys.deinit();
+    try std.testing.expectEqual(@as(usize, 1), keys.rows.len);
+    try std.testing.expectEqualStrings("item", keys.rows[0][0].?);
+
+    var deleted = try conn.query(gpa, try schema.deleteRowSql(a, .sqlite, "extra.example", &.{keys.rows[0][0].?}, &.{"1"}));
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), deleted.affected_rows);
+
+    const describe = try schema.describeSql(a, .sqlite, "extra.example");
+    var indexes = try conn.query(gpa, describe[1]);
+    defer indexes.deinit();
+    try std.testing.expectEqualStrings("extra_name", indexes.rows[0][2].?);
+    var unique = try conn.query(gpa, try schema.uniqueKeySql(a, .sqlite, "extra.example"));
+    defer unique.deinit();
+    try std.testing.expectEqualStrings("extra_name", unique.rows[0][0].?);
+    var foreign = try conn.query(gpa, (try schema.foreignKeySql(a, .sqlite, "extra.child")).?);
+    defer foreign.deinit();
+    try std.testing.expectEqualStrings("extra", foreign.rows[0][2].?);
+    try std.testing.expectEqualStrings("item", foreign.rows[0][4].?);
+    var def = try conn.query(gpa, try schema.definitionSql(a, .sqlite, "extra.summary"));
+    defer def.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, def.rows[0][2].?, "select 2"));
+}
+
 test "failed SQLite batch stops and explicit rollback restores transaction" {
     const a = std.testing.allocator;
     var err: db.ErrorText = .{};
@@ -472,4 +515,28 @@ test "SQLite cancellation interrupts execution and connection remains usable" {
     var result = try conn.query(a, "select 42");
     defer result.deinit();
     try std.testing.expectEqualStrings("42", result.rows[0][0].?);
+}
+
+test "SQLite releases discarded results before allocating the next result" {
+    const a = std.testing.allocator;
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try connect(a, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    defer conn.close();
+    const limit = 512 * 1024;
+    var bounded: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .{ .requested_memory_limit = limit };
+    defer {
+        const status = bounded.deinit();
+        std.debug.assert(status == .ok);
+    }
+    var result = try conn.queryOpts(bounded.allocator(),
+        \\select cast(zeroblob(327680) as text);
+        \\select cast(zeroblob(327680) as text);
+        \\select 'ok';
+    , .{ .max_bytes = limit });
+    defer result.deinit();
+    try std.testing.expect(!result.truncated);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("ok", result.rows[0][0].?);
+    try std.testing.expect(result.capacity() < 16 * 1024);
 }

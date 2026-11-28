@@ -151,7 +151,7 @@ fn applyFields(arena: Allocator, cli: Cli, base: ?config.Entry, stderr: *Io.Writ
     if (cli.database) |v| p.database = v;
     var buf: [256]u8 = undefined;
     const name = if (base) |b| b.name else if (p.kind == .sqlite) std.fs.path.basename(p.database) else p.describe(&buf);
-    return .{ .name = try arena.dupe(u8, name), .params = p };
+    return .{ .name = try arena.dupe(u8, name), .params = p, .color = if (base) |b| b.color else null };
 }
 
 fn eqlAny(a: []const u8, options: []const []const u8) bool {
@@ -194,10 +194,12 @@ pub fn main(init: std.process.Init) !u8 {
     const cli = parseArgs(args, stderr) catch return 2;
     if (cli.help) {
         try stdout.writeAll(usage);
+        try stdout.flush();
         return 0;
     }
     if (cli.version) {
         try stdout.print("zpeek {s}\n", .{@import("build_options").version});
+        try stdout.flush();
         return 0;
     }
 
@@ -210,10 +212,15 @@ pub fn main(init: std.process.Init) !u8 {
         else => |e| return e,
     };
 
-    if (cli.init_config) return initConfig(io, cfg, stdout, stderr);
+    if (cli.init_config) {
+        const code = try initConfig(io, cfg, stdout, stderr);
+        try stdout.flush();
+        return code;
+    }
 
     if (cli.list) {
         try listConnections(cfg, stdout);
+        try stdout.flush();
         return 0;
     }
 
@@ -244,7 +251,9 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr.writeAll("zpeek: --format must be table, csv or json\n");
             return 2;
         };
-        return executeOnce(gpa, io, e, sql, stdout, stderr, format, cli.allow_dangerous);
+        const code = try executeOnce(gpa, io, e, sql, stdout, stderr, format, cli.allow_dangerous);
+        try stdout.flush();
+        return code;
     }
     if (cli.output_format != null or cli.allow_dangerous) {
         try stderr.writeAll("zpeek: --format and --allow-dangerous require --execute\n");
@@ -409,9 +418,15 @@ test {
     _ = conninfo;
     _ = db;
     _ = render;
+    _ = exporter;
+    _ = @import("plan.zig");
     _ = @import("sql/lexer.zig");
     _ = @import("db/schema.zig");
+    _ = @import("db/net.zig");
+    _ = @import("db/tls/Client.zig");
     _ = @import("ui/Editor.zig");
+    _ = @import("ui/Picker.zig");
+    _ = @import("ui/Transcript.zig");
     _ = App;
     _ = @import("ui/TableView.zig");
     _ = @import("ui/complete.zig");
@@ -421,9 +436,17 @@ test {
 test "unknown driver rejects saved and new connections" {
     var buffer: [256]u8 = undefined;
     var stderr: Io.Writer = .fixed(&buffer);
-    const saved: config.Entry = .{ .name = "local", .params = .{ .kind = .sqlite, .database = ":memory:" } };
+    const saved: config.Entry = .{
+        .name = "local",
+        .params = .{ .kind = .sqlite, .database = ":memory:" },
+        .color = .{ .r = 0x11, .g = 0x22, .b = 0x33 },
+    };
     for ([_]?config.Entry{ null, saved }) |base| {
         try std.testing.expectError(error.InvalidArgs, applyFields(std.testing.allocator, .{ .driver = "definitely_invalid" }, base, &stderr));
     }
     try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "unknown driver") != null);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const updated = (try applyFields(arena.allocator(), .{ .database = "other.db" }, saved, &stderr)).?;
+    try std.testing.expectEqual(saved.color, updated.color);
 }

@@ -244,6 +244,7 @@ pub fn run(opts: Options) !void {
     defer app.loop.uninstallResizeHandler();
     try app.loop.start();
     defer app.stopJob();
+    defer app.drainPendingEvents();
     defer app.loop.stop();
 
     try app.vx.enterAltScreen(writer);
@@ -267,7 +268,10 @@ pub fn run(opts: Options) !void {
     while (app.running) {
         const event = try app.loop.nextEvent();
         try app.handleEvent(event);
-        while (try app.loop.tryEvent()) |ev| try app.handleEvent(ev);
+        while (app.running) {
+            const ev = (try app.loop.tryEvent()) orelse break;
+            try app.handleEvent(ev);
+        }
         if (!app.running) break;
         if (app.table_view == null or app.table_view.?.owns_result) {
             app.transcript.compact() catch {}; // only frees memory; keeping rows is safe
@@ -277,6 +281,13 @@ pub fn run(opts: Options) !void {
         try app.vx.render(writer);
         try writer.flush();
     }
+}
+
+fn drainPendingEvents(app: *App) void {
+    while (app.loop.tryEvent() catch null) |ev| switch (ev) {
+        .paste => |text| app.gpa.free(text),
+        else => {},
+    };
 }
 
 fn deinit(app: *App) void {
@@ -574,7 +585,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     const paste_key = key.matches('v', .{ .ctrl = true }) or key.matches('v', .{ .ctrl = true, .shift = true }) or
         key.matches('v', .{ .super = true });
     const filtering = app.filterEditor() != null;
-    if ((paste_key and (filtering or app.mode == .console)) or
+    if ((paste_key and (filtering or app.mode == .console or app.mode == .config)) or
         (filtering and key.matches('s', .{ .ctrl = true })))
     {
         app.exit_armed = false;
@@ -743,7 +754,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     } else if (key.matches(vaxis.Key.escape, .{})) {
         app.closePopup();
     } else if (key.text) |t| {
-        if (!key.mods.ctrl and !(key.mods.alt and t.len == 1)) {
+        if (!key.mods.ctrl and !key.mods.super and !(key.mods.alt and t.len == 1)) {
             try e.insert(t);
             if (editing_config) return app.openCompletion(false);
             if (std.mem.startsWith(u8, e.text(), "/")) {
@@ -1030,10 +1041,20 @@ fn handlePickerKey(app: *App, key: vaxis.Key) !void {
     }
 }
 
+fn setPicker(app: *App, picker: *Picker) void {
+    if (app.picker) |old| old.deinit();
+    app.picker = picker;
+    app.mode = .picker;
+}
+
+fn clearPicker(app: *App) void {
+    if (app.picker) |old| old.deinit();
+    app.picker = null;
+}
+
 fn closePicker(app: *App) void {
     const returning_to_table = if (app.picker) |p| app.export_table and (p.purpose == .export_format or p.purpose == .export_csv or p.purpose == .export_json) else false;
-    if (app.picker) |p| p.deinit();
-    app.picker = null;
+    app.clearPicker();
     app.mode = if (returning_to_table and app.table_view != null) .table else .console;
 }
 
@@ -1058,14 +1079,13 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
     }
     if (app.job != null) {
         if (key.matches('c', .{ .ctrl = true })) {
-            if (app.conn) |c| c.cancel();
+            app.cancelJob(false);
         }
         return;
     }
     if (key.matches('e', .{}) and !tv.editing_filter and tv.chooser == null and !tv.detail and tv.confirm_delete == null) {
         app.export_table = true;
-        app.picker = try Picker.init(app.gpa, .export_format, "Export current view · retained rows and visible columns", &.{ .{ .label = "CSV" }, .{ .label = "JSON" } }, false);
-        app.mode = .picker;
+        app.setPicker(try Picker.init(app.gpa, .export_format, "Export current view · retained rows and visible columns", &.{ .{ .label = "CSV" }, .{ .label = "JSON" } }, false));
         return;
     }
     const action = try tv.handleKey(key);
@@ -1073,6 +1093,7 @@ fn handleTableKey(app: *App, key: vaxis.Key) !void {
     if (app.conn == null) switch (action) {
         .reload, .count, .describe, .follow_fk, .delete_row => {
             switch (action) {
+                .reload => tv.revertPendingBrowse(),
                 .follow_fk, .delete_row => |sql| app.gpa.free(sql),
                 else => {},
             }
@@ -1161,11 +1182,10 @@ fn executeSql(app: *App, text: []const u8, approved: bool) !void {
     }
     const access = if (app.conn_params) |p| p.access else conn.access;
     if (!approved and access == .full) if (lexer.dangerousStatement(text, dialect)) |word| {
-        app.picker = try Picker.init(app.gpa, .confirm_sql, "Confirm full-access SQL · review before running", &.{
+        app.setPicker(try Picker.init(app.gpa, .confirm_sql, "Confirm full-access SQL · review before running", &.{
             .{ .label = "Cancel", .detail = "keep the database unchanged" },
             .{ .label = "Run SQL", .detail = word, .value = text },
-        }, false);
-        app.mode = .picker;
+        }, false));
         return;
     };
     try lexer.splitStatements(text, dialect, &stmts, app.gpa);
@@ -1199,13 +1219,11 @@ fn openHistory(app: *App, search: []const u8) !void {
     const p = try Picker.init(app.gpa, .history, "SQL history · newest first · type to search · enter loads", items.items, false);
     errdefer p.deinit();
     if (search.len > 0) _ = try p.handleKey(.{ .codepoint = 0, .text = search });
-    app.picker = p;
-    app.mode = .picker;
+    app.setPicker(p);
 }
 
 fn openExportPath(app: *App, format: exporter.Format) !void {
-    app.picker = try Picker.init(app.gpa, if (format == .csv) .export_csv else .export_json, if (format == .csv) "Export CSV · .csv added automatically · existing files are never overwritten" else "Export JSON · .json added automatically · existing files are never overwritten", &.{}, true);
-    app.mode = .picker;
+    app.setPicker(try Picker.init(app.gpa, if (format == .csv) .export_csv else .export_json, if (format == .csv) "Export CSV · .csv added automatically · existing files are never overwritten" else "Export JSON · .json added automatically · existing files are never overwritten", &.{}, true));
 }
 
 fn exportResult(app: *App, format: exporter.Format, path: []const u8) !void {
@@ -1549,8 +1567,7 @@ fn saveQuery(app: *App, name: []const u8) !void {
     const entries = queries.list(a, app.io, dir, true) catch |err| return app.transcript.addMessage(.err, "cannot read saved queries: {t}", .{err});
     var items: std.ArrayList(Picker.Item) = .empty;
     for (entries) |entry| try items.append(a, .{ .label = entry.name, .detail = entry.preview });
-    app.picker = try Picker.init(app.gpa, .save_query, "Save query · type a name · enter saves · tab selects · esc cancels", items.items, true);
-    app.mode = .picker;
+    app.setPicker(try Picker.init(app.gpa, .save_query, "Save query · type a name · enter saves · tab selects · esc cancels", items.items, true));
 }
 
 fn writeSavedQuery(app: *App, name: []const u8, overwrite: bool) !void {
@@ -1558,11 +1575,10 @@ fn writeSavedQuery(app: *App, name: []const u8, overwrite: bool) !void {
     const dir = (try app.queriesDir()) orelse return app.transcript.addMessage(.err, "cannot determine the config directory", .{});
     queries.save(app.io, dir, name, app.pending_save.items, overwrite) catch |err| {
         if (err == error.PathAlreadyExists and !overwrite) {
-            app.picker = try Picker.init(app.gpa, .overwrite_query, "Query already exists · overwrite?", &.{
+            app.setPicker(try Picker.init(app.gpa, .overwrite_query, "Query already exists · overwrite?", &.{
                 .{ .label = "Cancel" },
                 .{ .label = "Overwrite", .detail = name, .value = name },
-            }, false);
-            app.mode = .picker;
+            }, false));
             return;
         }
         return app.transcript.addMessage(.err, "cannot save query: {t}", .{err});
@@ -1589,8 +1605,7 @@ fn openQueriesPicker(app: *App) !void {
     if (entries.len == 0) return app.transcript.addMessage(.dim, "no saved queries yet — type SQL and press ctrl+s to save it", .{});
     var items: std.ArrayList(Picker.Item) = .empty;
     for (entries) |e| try items.append(a, .{ .label = e.name, .detail = e.preview, .value = e.sql });
-    app.picker = try Picker.init(app.gpa, .query, "Saved queries", items.items, false);
-    app.mode = .picker;
+    app.setPicker(try Picker.init(app.gpa, .query, "Saved queries", items.items, false));
 }
 
 pub const read_only_message = "read-only connection: only reading statements run ('{s}' was refused, nothing was run)";
@@ -2247,8 +2262,7 @@ fn openConnectPicker(app: *App) !void {
         const desc = c.params.describe(&buf);
         try items.append(a, .{ .label = c.name, .detail = try std.fmt.allocPrint(a, "{s}  {s}", .{ c.params.kind.label(), desc }) });
     }
-    app.picker = try Picker.init(app.gpa, .connect, "Connect to", items.items, true);
-    app.mode = .picker;
+    app.setPicker(try Picker.init(app.gpa, .connect, "Connect to", items.items, true));
     // preselect the default connection
     if (app.cfg.default) |d| {
         for (app.picker.?.matches.items, 0..) |m, i| {
@@ -2266,13 +2280,15 @@ fn openTablePicker(app: *App, purpose: Picker.Purpose) !void {
         try items.append(a, .{ .label = t, .detail = try std.fmt.allocPrint(a, "{d} columns", .{cols.len}) });
     }
     const title: []const u8 = if (purpose == .browse) "Browse table" else "Describe table";
-    app.picker = try Picker.init(app.gpa, purpose, title, items.items, false);
-    app.mode = .picker;
+    app.setPicker(try Picker.init(app.gpa, purpose, title, items.items, false));
 }
 
 fn openLastResult(app: *App) !void {
     const r = app.transcript.lastResult() orelse return app.transcript.addMessage(.dim, "no result to open yet", .{});
-    app.table_view = try TableView.init(app.gpa, r, false, "Result", null, app.conn_name, app.conn_color);
+    const tv = try TableView.init(app.gpa, r, false, "Result", null, app.conn_name, app.conn_color);
+    app.clearPicker();
+    if (app.table_view) |old| old.deinit();
+    app.table_view = tv;
     app.mode = .table;
 }
 
@@ -3031,6 +3047,7 @@ fn processJob(app: *App, job: *Job) !void {
                     result.* = r.result;
                     const tv = try TableView.init(app.gpa, result, true, "Query plan · enter expands a step · e exports", null, app.conn_name, app.conn_color);
                     outcome.* = .canceled;
+                    app.clearPicker();
                     if (app.table_view) |old| old.deinit();
                     app.table_view = tv;
                     app.mode = .table;
@@ -3129,6 +3146,7 @@ fn processJob(app: *App, job: *Job) !void {
                         else => {},
                     };
                     tv.fitKeyMarkers();
+                    app.clearPicker();
                     app.mode = .table;
                     try app.transcript.addMessage(.dim, "{s}: {d} rows loaded in {d} ms", .{ b.table, r.result.rows.len, r.ms });
                 },
@@ -3180,7 +3198,10 @@ fn processJob(app: *App, job: *Job) !void {
         },
         .browse_reload => {
             const tv = app.table_view orelse return;
-            if (job.outcomes.items.len == 0) return;
+            if (job.outcomes.items.len == 0) {
+                tv.revertPendingBrowse();
+                return;
+            }
             switch (job.outcomes.items[0]) {
                 .result => |r| {
                     const owned = try app.gpa.create(db.Result);
@@ -3189,11 +3210,15 @@ fn processJob(app: *App, job: *Job) !void {
                     try tv.setResult(owned);
                 },
                 .failed => |msg| {
+                    tv.revertPendingBrowse();
                     app.notice.clearRetainingCapacity();
                     try app.notice.appendSlice(app.gpa, msg);
                     tv.notice = app.notice.items;
                 },
-                .canceled => tv.notice = "canceled",
+                .canceled => {
+                    tv.revertPendingBrowse();
+                    tv.notice = "canceled";
+                },
             }
         },
         .browse_count => {
@@ -3450,11 +3475,10 @@ fn openObjectPicker(app: *App, obj: schema.Object, result: db.Result) !void {
         else if (kind == .postgres)
             try schema.definitionSqlForOid(a, obj, objectColumn(result, row, "oid"))
         else
-            try schema.definitionSqlForObject(a, kind, obj, name, objectColumn(result, row, "kind"));
+            try schema.definitionSqlForObject(a, kind, obj, try schema.quoteIdent(a, kind, name), objectColumn(result, row, "kind"));
         try items.append(a, .{ .label = label, .detail = detail, .value = value });
     }
-    app.picker = try Picker.init(app.gpa, if (obj == .tables) .browse else if (obj == .types) .type_value else .definition, obj.title(), items.items, false);
-    app.mode = .picker;
+    app.setPicker(try Picker.init(app.gpa, if (obj == .tables) .browse else if (obj == .types) .type_value else .definition, obj.title(), items.items, false));
 }
 
 test "schema pickers select the requested object" {
@@ -3491,12 +3515,13 @@ test "schema pickers select the requested object" {
     try std.testing.expectEqualStrings("orders", p.items[table_choice.choose].label);
     app.closePicker();
 
-    const view_rows = [_][]const ?[]const u8{&.{"recent_orders"}};
+    const view_rows = [_][]const ?[]const u8{&.{"sales.recent_orders"}};
     const views: db.Result = .{ .arena = .init(a), .columns = &.{"name"}, .rows = &view_rows };
     try app.openObjectPicker(.views, views);
     p = app.picker.?;
     try std.testing.expectEqual(Picker.Purpose.definition, p.purpose);
     try std.testing.expect(std.mem.indexOf(u8, p.items[0].value, "type = 'view'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.items[0].value, "name = 'sales.recent_orders'") != null);
     app.closePicker();
 
     const trigger_rows = [_][]const ?[]const u8{&.{ "orders", "audit_orders" }};
@@ -3705,7 +3730,9 @@ test "database label follows driver defaults" {
 fn startBrowseReload(app: *App) !void {
     const tv = app.table_view orelse return;
     const b = tv.browse orelse return;
+    errdefer tv.revertPendingBrowse();
     if (try app.filterViolation(b.filter) != null) {
+        tv.revertPendingBrowse();
         tv.notice = "browse filters may only read";
         return;
     }
@@ -4049,6 +4076,7 @@ fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16
     const visible = @min(cands.len, max_visible);
     if (p.selected < p.top) p.top = p.selected;
     if (p.selected >= p.top + visible) p.top = p.selected + 1 - visible;
+    p.top = @min(p.top, cands.len -| visible);
 
     var label_w: usize = 0;
     var detail_w: usize = 0;
@@ -4101,4 +4129,134 @@ fn drawPopup(app: *App, a: Allocator, win: vaxis.Window, p: *Popup, box_top: u16
             .{ .text = shown_detail, .style = if (sel) style else theme.dim },
         }, .{ .row_offset = @intCast(i), .wrap = .none });
     }
+}
+
+test "config mode pastes via Cmd+V/Ctrl+V, ignores Super text, and cleans up overwritten pickers and views" {
+    const a = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try db.connect(a, std.testing.io, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+        .conn = conn,
+        .conn_params = .{ .kind = .sqlite, .database = ":memory:" },
+    };
+    defer app.deinit();
+    app.loop = .init(app.io, &app.tty, &app.vx);
+
+    // Super+a in console must not insert 'a'.
+    try app.handleKey(.{ .codepoint = 'a', .text = "a", .mods = .{ .super = true } });
+    try std.testing.expectEqualStrings("", app.editor.text());
+
+    // Cmd+V and Ctrl+V in config mode request clipboard rather than inserting 'v'.
+    app.tty = try vaxis.Tty.init(app.io, &app.tty_buf);
+    defer app.tty.deinit();
+    var output: [1024]u8 = undefined;
+    const writer = app.tty.writer();
+    const original_writer = writer.*;
+    writer.* = .fixed(&output);
+    defer writer.* = original_writer;
+    app.vx = try vaxis.init(app.io, a, &env, .{ .system_clipboard_allocator = a });
+    defer app.vx.deinit(a, writer);
+
+    app.config_edit = .{ .previous = .init(a), .original = null };
+    app.mode = .config;
+    try app.handleKey(.{ .codepoint = 'v', .text = "v", .mods = .{ .super = true } });
+    try app.handleKey(.{ .codepoint = 'v', .text = "v", .mods = .{ .ctrl = true } });
+    try app.handleKey(.{ .codepoint = 'a', .text = "a", .mods = .{ .super = true } });
+    try std.testing.expectEqualStrings("", app.editor.text());
+    try std.testing.expectEqualStrings("\x1b]52;c;?\x1b\\\x1b]52;c;?\x1b\\", writer.buffered());
+    app.closeConfigEditor();
+
+    // Overwriting an existing picker and table_view does not leak.
+    const rows = [_][]const ?[]const u8{&.{ "users", "table" }};
+    const res: db.Result = .{ .arena = .init(a), .columns = &.{ "name", "kind" }, .rows = &rows };
+    try app.openObjectPicker(.tables, res);
+    try app.openObjectPicker(.tables, res);
+    try app.transcript.add(.{ .result = .{ .result = try conn.query(a, "select 1"), .elapsed_ms = 0 } });
+    try app.openLastResult();
+    try std.testing.expect(app.picker == null);
+    try app.openLastResult();
+    try std.testing.expectEqual(Mode.table, app.mode);
+
+    // drainPendingEvents frees unread paste allocations on exit.
+    try app.loop.postEvent(.{ .paste = try a.dupe(u8, "queued paste") });
+    app.drainPendingEvents();
+
+    // drawPopup clamps top when growing taller after scrolling to the bottom.
+    var cands: [15]complete.Candidate = undefined;
+    for (&cands) |*c| c.* = .{ .text = "col", .kind = .column };
+    var popup: Popup = .{ .completion = .{ .replace_len = 0, .candidates = &cands }, .selected = 14, .top = 12 };
+    var screen = try vaxis.Screen.init(a, .{ .cols = 80, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 80, .height = 24, .screen = &screen };
+    try app.drawPopup(app.frame_arena.allocator(), win, &popup, 15, 4);
+    try std.testing.expectEqual(@as(usize, 5), popup.top);
+}
+
+test "table mode Ctrl+C marks job canceled and failed browse reload reverts filter" {
+    const a = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var err: db.ErrorText = .{};
+    defer err.deinit(a);
+    const conn = try db.connect(a, std.testing.io, .{ .kind = .sqlite, .database = ":memory:" }, &err);
+    var app: App = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .env = &env,
+        .cfg = .{ .path = "", .found = false },
+        .editor = .init(a),
+        .transcript = .init(a),
+        .conn_arena = .init(a),
+        .popup_arena = .init(a),
+        .frame_arena = .init(a),
+        .conn = conn,
+        .conn_params = .{ .kind = .sqlite, .database = ":memory:" },
+    };
+    defer app.deinit();
+    app.loop = .init(app.io, &app.tty, &app.vx);
+    var setup = try conn.query(a, "create table people(id integer primary key, name text); insert into people values (1,'Ada'),(2,'Bob');");
+    setup.deinit();
+
+    try app.startBrowse("people", "id > 0");
+    try app.handleEvent(try app.loop.nextEvent());
+    try std.testing.expectEqual(Mode.table, app.mode);
+    const tv = app.table_view.?;
+    try std.testing.expectEqualStrings("id > 0", tv.browse.?.filter);
+
+    // Invalid SQL filter fails reload and reverts browse filter back to "id > 0".
+    try app.handleTableKey(.{ .codepoint = '/' });
+    try tv.filter_editor.setText("nonexistent_column = 1");
+    try app.handleTableKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(app.job != null);
+    try app.handleEvent(try app.loop.nextEvent());
+    try std.testing.expectEqualStrings("id > 0", tv.browse.?.filter);
+
+    // Write attempt in filter is rejected before running and reverts filter.
+    try app.handleTableKey(.{ .codepoint = '/' });
+    try tv.filter_editor.setText("1; drop table people");
+    try app.handleTableKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(app.job == null);
+    try std.testing.expectEqualStrings("id > 0", tv.browse.?.filter);
+
+    // Ctrl+C in table mode while a job is active sets cancel_requested via cancelJob.
+    const fake_job = try app.newJob(.browse_reload);
+    defer {
+        app.job = null;
+        app.destroyJob(fake_job);
+    }
+    app.job = fake_job;
+    try app.handleTableKey(.{ .codepoint = 'c', .mods = .{ .ctrl = true } });
+    try std.testing.expect(fake_job.cancel_requested.load(.acquire));
 }

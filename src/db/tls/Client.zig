@@ -712,7 +712,24 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                     },
                     .certificate_request => {
                         // zpeek: remember the request; an empty Certificate is sent later.
-                        if (cipher_state == .application) return error.TlsUnexpectedMessage;
+                        if (cert_requested) return error.TlsUnexpectedMessage;
+                        switch (handshake_state) {
+                            .hello, .encrypted_extensions => return error.TlsUnexpectedMessage,
+                            else => {},
+                        }
+                        switch (tls_version) {
+                            .tls_1_3 => {
+                                if (cipher_state != .handshake or handshake_state != .certificate) return error.TlsUnexpectedMessage;
+                            },
+                            .tls_1_2 => {
+                                if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
+                                switch (handshake_state) {
+                                    .certificate, .trust_chain_established, .server_hello_done => {},
+                                    else => return error.TlsUnexpectedMessage,
+                                }
+                            },
+                            else => return error.TlsUnexpectedMessage,
+                        }
                         switch (handshake_cipher) {
                             inline else => |*p| p.transcript_hash.update(wrapped_handshake),
                         }
@@ -1071,9 +1088,14 @@ fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize 
 fn flush(w: *Writer) Writer.Error!void {
     const c: *Client = @alignCast(@fieldParentPtr("writer", w));
     const output = c.output;
-    const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
-    const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
-    output.advance(prepared.ciphertext_end);
+    var remaining = w.buffered();
+    while (remaining.len > 0) {
+        const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
+        const prepared = prepareCiphertextRecord(c, ciphertext_buf, remaining, .application_data);
+        output.advance(prepared.ciphertext_end);
+        remaining = remaining[prepared.cleartext_len..];
+        if (remaining.len > 0) try output.flush();
+    }
     w.end = 0;
 }
 
@@ -1249,8 +1271,9 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 const pv = &p.tls_1_3;
                 const P = @TypeOf(p.*);
                 if (record_len < P.AEAD.tag_length) return failRead(c, error.TlsRecordOverflow);
-                const ad = input.take(tls.record_header_len) catch unreachable; // already peeked
                 const ciphertext_len = record_len - P.AEAD.tag_length;
+                if (!rebase(r, ciphertext_len)) return failRead(c, error.TlsRecordOverflow);
+                const ad = input.take(tls.record_header_len) catch unreachable; // already peeked
                 const ciphertext = input.take(ciphertext_len) catch unreachable; // already peeked
                 const auth_tag = (input.takeArray(P.AEAD.tag_length) catch unreachable).*; // already peeked
                 const nonce = nonce: {
@@ -1259,7 +1282,6 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                     const operand: V = pad ++ mem.toBytes(big(c.read_seq));
                     break :nonce @as(V, pv.server_iv) ^ operand;
                 };
-                rebase(r, ciphertext.len);
                 const cleartext = r.buffer[r.end..][0..ciphertext.len];
                 P.AEAD.decrypt(cleartext, ciphertext, auth_tag, ad, nonce, pv.server_key) catch
                     return failRead(c, error.TlsBadRecordMac);
@@ -1273,6 +1295,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 const P = @TypeOf(p.*);
                 if (record_len < P.record_iv_length + P.mac_length) return failRead(c, error.TlsRecordOverflow);
                 const message_len: u16 = record_len - P.record_iv_length - P.mac_length;
+                if (!rebase(r, message_len)) return failRead(c, error.TlsRecordOverflow);
                 const ad_header = input.take(tls.record_header_len) catch unreachable; // already peeked
                 const ad = mem.toBytes(big(c.read_seq)) ++
                     ad_header[0 .. 1 + 2] ++
@@ -1288,7 +1311,6 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 };
                 const ciphertext = input.take(message_len) catch unreachable; // already peeked
                 const auth_tag = (input.takeArray(P.mac_length) catch unreachable).*; // already peeked
-                rebase(r, ciphertext.len);
                 const cleartext = r.buffer[r.end..][0..ciphertext.len];
                 P.AEAD.decrypt(cleartext, ciphertext, auth_tag, ad, nonce, pv.server_write_key) catch
                     return failRead(c, error.TlsBadRecordMac);
@@ -1324,6 +1346,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
         .handshake => {
             var ct_i: usize = 0;
             while (true) {
+                if (ct_i + 4 > cleartext.len) return failRead(c, error.TlsDecodeError);
                 const handshake_type: tls.HandshakeType = @fromBackingInt(@intCast(cleartext[ct_i]));
                 ct_i += 1;
                 const handshake_len = mem.readInt(u24, cleartext[ct_i..][0..3], .big);
@@ -1336,7 +1359,13 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                         // This client implementation ignores new session tickets.
                     },
                     .key_update => {
+                        if (c.tls_version != .tls_1_3) return failRead(c, error.TlsUnexpectedMessage);
                         if (handshake.len != 1) return failRead(c, error.TlsDecodeError);
+                        const req: tls.KeyUpdateRequest = @fromBackingInt(@intCast(handshake[0]));
+                        switch (req) {
+                            .update_requested, .update_not_requested => {},
+                            _ => return failRead(c, error.TlsIllegalParameter),
+                        }
                         switch (c.application_cipher) {
                             inline else => |*p| {
                                 const pv = &p.tls_1_3;
@@ -1355,8 +1384,23 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                         }
                         c.read_seq = 0;
 
-                        switch (@as(tls.KeyUpdateRequest, @fromBackingInt(@intCast(handshake[0])))) {
+                        switch (req) {
                             .update_requested => {
+                                // RFC 8446 §4.6.3: send KeyUpdate(update_not_requested) under
+                                // the current client write key before rotating it.
+                                flush(&c.writer) catch return error.ReadFailed;
+                                const key_update_reply = [_]u8{
+                                    @backingInt(tls.HandshakeType.key_update),
+                                    0,
+                                    0,
+                                    1,
+                                    @backingInt(tls.KeyUpdateRequest.update_not_requested),
+                                };
+                                const ciphertext_buf = c.output.writableSliceGreedy(min_buffer_len) catch return error.ReadFailed;
+                                const prepared = prepareCiphertextRecord(c, ciphertext_buf, &key_update_reply, .handshake);
+                                c.output.advance(prepared.ciphertext_end);
+                                c.output.flush() catch return error.ReadFailed;
+
                                 switch (c.application_cipher) {
                                     inline else => |*p| {
                                         const pv = &p.tls_1_3;
@@ -1376,7 +1420,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                                 c.write_seq = 0;
                             },
                             .update_not_requested => {},
-                            _ => return failRead(c, error.TlsIllegalParameter),
+                            _ => unreachable,
                         }
                     },
                     else => return failRead(c, error.TlsUnexpectedMessage),
@@ -1394,13 +1438,13 @@ fn readIndirect(c: *Client) Reader.Error!usize {
     }
 }
 
-fn rebase(r: *Reader, capacity: usize) void {
-    if (r.buffer.len - r.end >= capacity) return;
+fn rebase(r: *Reader, capacity: usize) bool {
+    if (r.buffer.len - r.end >= capacity) return true;
     const data = r.buffer[r.seek..r.end];
     @memmove(r.buffer[0..data.len], data);
     r.seek = 0;
     r.end = data.len;
-    assert(r.buffer.len - r.end >= capacity);
+    return r.buffer.len - r.end >= capacity;
 }
 
 fn failRead(c: *Client, err: ReadError) error{ReadFailed} {
@@ -1850,4 +1894,183 @@ test "zero-length key_update body" {
             .client_iv = undefined,
         } } },
     ));
+}
+
+test "CertificateRequest before ServerHello is rejected without UB" {
+    // Plaintext handshake record containing CertificateRequest (type 0x0d, len 1, body 0x00)
+    const wire = [_]u8{ 0x16, 0x03, 0x03, 0x00, 0x05, 0x0d, 0x00, 0x00, 0x01, 0x00 };
+    var in_buf: [min_buffer_len]u8 = undefined;
+    @memcpy(in_buf[0..wire.len], &wire);
+    var input: Reader = .fixed(&in_buf);
+    input.end = wire.len;
+    var out_buf: [min_buffer_len]u8 = undefined;
+    var output: Writer = .fixed(&out_buf);
+    var read_buf: [min_buffer_len]u8 = undefined;
+    var write_buf: [min_buffer_len]u8 = undefined;
+    var entropy: [Options.entropy_len]u8 = @splat(1);
+    try std.testing.expectError(error.TlsUnexpectedMessage, Client.init(&input, &output, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+        .read_buffer = &read_buf,
+        .write_buffer = &write_buf,
+        .entropy = &entropy,
+        .realtime_now = .zero,
+    }));
+}
+
+test "truncated post-handshake record and TLS 1.2 key_update fail cleanly" {
+    const Chacha = crypto.aead.chacha_poly.ChaCha20Poly1305;
+    // 1-byte handshake payload (shorter than 4-byte handshake header)
+    const short_pt = [_]u8{ 0x18, 0x16 };
+    const short_hdr = [_]u8{ 0x17, 0x03, 0x03 } ++ mem.toBytes(big(@as(u16, short_pt.len + Chacha.tag_length)));
+    var ct: [short_pt.len]u8 = undefined;
+    var tag: [Chacha.tag_length]u8 = undefined;
+    Chacha.encrypt(&ct, &tag, &short_pt, &short_hdr, @splat(0), @splat(0));
+    try std.testing.expectEqual(error.TlsDecodeError, testReadError(
+        &(short_hdr ++ ct ++ tag),
+        .tls_1_3,
+        .{ .CHACHA20_POLY1305_SHA256 = .{ .tls_1_3 = .{
+            .server_key = @splat(0),
+            .server_iv = @splat(0),
+            .client_secret = @splat(0),
+            .server_secret = @splat(0),
+            .client_key = @splat(0),
+            .client_iv = @splat(0),
+        } } },
+    ));
+
+    // TLS 1.2 handshake record containing key_update must return TlsUnexpectedMessage
+    const P12 = tls.ApplicationCipherT(crypto.aead.aes_gcm.Aes128Gcm, crypto.hash.sha2.Sha256, 8);
+    const ku_pt = [_]u8{ 0x18, 0x00, 0x00, 0x01, 0x00 };
+    const ku_hdr = [_]u8{ 0x16, 0x03, 0x03 } ++ mem.toBytes(big(@as(u16, P12.record_iv_length + ku_pt.len + P12.mac_length)));
+    const ad12 = mem.toBytes(big(@as(u64, 0))) ++ ku_hdr[0..3] ++ mem.toBytes(big(@as(u16, ku_pt.len)));
+    var ct12: [ku_pt.len]u8 = undefined;
+    var tag12: [P12.mac_length]u8 = undefined;
+    const iv12: [P12.record_iv_length]u8 = @splat(0);
+    P12.AEAD.encrypt(&ct12, &tag12, &ku_pt, ad12, @splat(0), @splat(0));
+    try std.testing.expectEqual(error.TlsUnexpectedMessage, testReadError(
+        &(ku_hdr ++ iv12 ++ ct12 ++ tag12),
+        .tls_1_2,
+        .{ .AES_128_GCM_SHA256 = .{ .tls_1_2 = mem.zeroes(P12.Tls_1_2) } },
+    ));
+}
+
+test "TLS 1.3 flush writes full buffer without truncation and key_update replies under old key" {
+    const Chacha = crypto.aead.chacha_poly.ChaCha20Poly1305;
+    const a = std.testing.allocator;
+    var out_alloc: Writer.Allocating = .init(a);
+    defer out_alloc.deinit();
+
+    // Part 1: flush full min_buffer_len plaintext across multiple TLS records
+    var empty_in: Reader = .fixed(&.{});
+    var read_buf: [min_buffer_len]u8 = undefined;
+    var write_buf: [min_buffer_len]u8 = undefined;
+    var client: Client = .{
+        .input = &empty_in,
+        .output = &out_alloc.writer,
+        .tls_version = .tls_1_3,
+        .read_seq = 0,
+        .write_seq = 0,
+        .application_cipher = .{ .CHACHA20_POLY1305_SHA256 = .{ .tls_1_3 = .{
+            .server_key = @splat(0),
+            .server_iv = @splat(0),
+            .client_secret = @splat(1),
+            .server_secret = @splat(2),
+            .client_key = @splat(3),
+            .client_iv = @splat(4),
+        } } },
+        .reader = .{ .vtable = &.{ .stream = stream, .readVec = readVec }, .buffer = &read_buf, .seek = 0, .end = 0 },
+        .writer = .{ .vtable = &.{ .drain = drain, .flush = flush }, .buffer = &write_buf, .end = 0 },
+        .allow_truncation_attacks = false,
+        .received_close_notify = false,
+        .ssl_key_log = null,
+    };
+    const payload_len = min_buffer_len;
+    @memset(write_buf[0..payload_len], 'A');
+    client.writer.end = payload_len;
+    try client.writer.flush();
+    // Decrypt all emitted records and verify total plaintext length equals payload_len.
+    var wire = out_alloc.written();
+    var total_plain: usize = 0;
+    var seq: u64 = 0;
+    while (wire.len > 0) {
+        const rec_len = mem.readInt(u16, wire[3..5], .big);
+        const rec_ad = wire[0..5];
+        const rec_ct = wire[5 .. 5 + rec_len - Chacha.tag_length];
+        const rec_tag = wire[5 + rec_len - Chacha.tag_length ..][0..Chacha.tag_length].*;
+        const V = @Vector(Chacha.nonce_length, u8);
+        const pad: [Chacha.nonce_length - 8]u8 = @splat(0);
+        const nonce: [Chacha.nonce_length]u8 = @as(V, @as([Chacha.nonce_length]u8, @splat(4))) ^ @as(V, pad ++ mem.toBytes(big(seq)));
+        const pt = try a.alloc(u8, rec_ct.len);
+        defer a.free(pt);
+        try Chacha.decrypt(pt, rec_ct, rec_tag, rec_ad, nonce, @splat(3));
+        try std.testing.expectEqual(@as(u8, 0x17), pt[pt.len - 1]);
+        total_plain += pt.len - 1;
+        wire = wire[5 + rec_len ..];
+        seq += 1;
+    }
+    try std.testing.expectEqual(payload_len, total_plain);
+
+    // Part 2: KeyUpdate(update_requested) emits KeyUpdate(update_not_requested) encrypted under old key before rotating
+    out_alloc.clearRetainingCapacity();
+    const ku_pt = [_]u8{ 0x18, 0x00, 0x00, 0x01, 0x01, 0x16 };
+    const ku_hdr = [_]u8{ 0x17, 0x03, 0x03 } ++ mem.toBytes(big(@as(u16, ku_pt.len + Chacha.tag_length)));
+    var ku_ct: [ku_pt.len]u8 = undefined;
+    var ku_tag: [Chacha.tag_length]u8 = undefined;
+    Chacha.encrypt(&ku_ct, &ku_tag, &ku_pt, &ku_hdr, @splat(0), @splat(0));
+    const ku_wire = ku_hdr ++ ku_ct ++ ku_tag;
+    var ku_in: Reader = .fixed(&ku_wire);
+    client.input = &ku_in;
+    const old_seq = client.write_seq;
+    _ = try readIndirect(&client);
+    try std.testing.expectEqual(@as(u64, 0), client.write_seq);
+    const reply_wire = out_alloc.written();
+    try std.testing.expect(reply_wire.len > 5 + Chacha.tag_length);
+    const reply_len = mem.readInt(u16, reply_wire[3..5], .big);
+    const reply_ct = reply_wire[5 .. 5 + reply_len - Chacha.tag_length];
+    const reply_tag = reply_wire[5 + reply_len - Chacha.tag_length ..][0..Chacha.tag_length].*;
+    const V = @Vector(Chacha.nonce_length, u8);
+    const pad: [Chacha.nonce_length - 8]u8 = @splat(0);
+    const reply_nonce: [Chacha.nonce_length]u8 = @as(V, @as([Chacha.nonce_length]u8, @splat(4))) ^ @as(V, pad ++ mem.toBytes(big(old_seq)));
+    var reply_pt: [6]u8 = undefined;
+    try Chacha.decrypt(&reply_pt, reply_ct, reply_tag, reply_wire[0..5], reply_nonce, @splat(3));
+    try std.testing.expectEqualSlices(u8, &.{ 0x18, 0x00, 0x00, 0x01, 0x00, 0x16 }, &reply_pt);
+}
+
+test "readIndirect returns TlsRecordOverflow when unread buffer leaves no room" {
+    const Chacha = crypto.aead.chacha_poly.ChaCha20Poly1305;
+    const pt = [_]u8{ 'x', 'y', 'z', 0x17 };
+    const hdr = [_]u8{ 0x17, 0x03, 0x03 } ++ mem.toBytes(big(@as(u16, pt.len + Chacha.tag_length)));
+    var ct: [pt.len]u8 = undefined;
+    var tag: [Chacha.tag_length]u8 = undefined;
+    Chacha.encrypt(&ct, &tag, &pt, &hdr, @splat(0), @splat(0));
+    const wire = hdr ++ ct ++ tag;
+    var input: Reader = .fixed(&wire);
+    var out_buf: [min_buffer_len]u8 = undefined;
+    var output: Writer = .fixed(&out_buf);
+    var read_buf: [min_buffer_len]u8 = undefined;
+    var write_buf: [min_buffer_len]u8 = undefined;
+    var client: Client = .{
+        .input = &input,
+        .output = &output,
+        .tls_version = .tls_1_3,
+        .read_seq = 0,
+        .write_seq = 0,
+        .application_cipher = .{ .CHACHA20_POLY1305_SHA256 = .{ .tls_1_3 = .{
+            .server_key = @splat(0),
+            .server_iv = @splat(0),
+            .client_secret = undefined,
+            .server_secret = undefined,
+            .client_key = undefined,
+            .client_iv = undefined,
+        } } },
+        // Almost full unread buffer: only 2 bytes free, record needs 4 bytes.
+        .reader = .{ .vtable = &.{ .stream = stream, .readVec = readVec }, .buffer = &read_buf, .seek = 0, .end = min_buffer_len - 2 },
+        .writer = .{ .vtable = &.{ .drain = drain, .flush = flush }, .buffer = &write_buf, .end = 0 },
+        .allow_truncation_attacks = false,
+        .received_close_notify = false,
+        .ssl_key_log = null,
+    };
+    try std.testing.expectError(error.ReadFailed, readIndirect(&client));
+    try std.testing.expectEqual(error.TlsRecordOverflow, client.read_err.?);
 }

@@ -170,8 +170,9 @@ const Ch = struct {
     server_version: []const u8 = "",
     err: db.ErrorText = .{},
     /// Query id of the running request, for cancellation.
+    query_id_lock: Io.Mutex = .init,
     query_id: [32]u8 = undefined,
-    query_id_len: std.atomic.Value(usize) = .init(0),
+    query_id_len: usize = 0,
     /// HTTP keep-alive connection reused by queries (job thread only; cancel
     /// opens its own). Reused only while the server's Keep-Alive timeout says
     /// it is open, so a request never needs a retry on a stale socket.
@@ -201,9 +202,15 @@ const Ch = struct {
         var id_buf: [16]u8 = undefined;
         self.io.random(&id_buf);
         const id = std.fmt.bytesToHex(id_buf, .lower);
+        self.query_id_lock.lockUncancelable(self.io);
         @memcpy(&self.query_id, &id);
-        self.query_id_len.store(id.len, .release);
-        defer self.query_id_len.store(0, .release);
+        self.query_id_len = id.len;
+        self.query_id_lock.unlock(self.io);
+        defer {
+            self.query_id_lock.lockUncancelable(self.io);
+            self.query_id_len = 0;
+            self.query_id_lock.unlock(self.io);
+        }
 
         var b: db.ResultBuilder = .init(gpa);
         errdefer b.deinit();
@@ -410,10 +417,14 @@ const Ch = struct {
 
     fn cancel(ptr: *anyopaque) void {
         const self: *Ch = @ptrCast(@alignCast(ptr));
-        const len = self.query_id_len.load(.acquire);
+        var id_copy: [32]u8 = undefined;
+        self.query_id_lock.lockUncancelable(self.io);
+        const len = self.query_id_len;
+        if (len > 0) @memcpy(id_copy[0..len], self.query_id[0..len]);
+        self.query_id_lock.unlock(self.io);
         if (len == 0) return;
         var sql_buf: [96]u8 = undefined;
-        const sql = std.fmt.bufPrint(&sql_buf, "KILL QUERY WHERE query_id = '{s}' ASYNC", .{self.query_id[0..len]}) catch return;
+        const sql = std.fmt.bufPrint(&sql_buf, "KILL QUERY WHERE query_id = '{s}' ASYNC", .{id_copy[0..len]}) catch return;
         var id_buf: [16]u8 = undefined;
         self.io.random(&id_buf);
         const id = std.fmt.bytesToHex(id_buf, .lower);
@@ -442,7 +453,8 @@ fn keepAliveTimeoutMs(value: []const u8) ?i64 {
     while (it.next()) |part| {
         if (std.mem.startsWith(u8, part, "timeout=")) {
             const seconds = std.fmt.parseInt(i64, part["timeout=".len..], 10) catch return null;
-            return seconds * 1000;
+            if (seconds < 0) return null;
+            return std.math.mul(i64, seconds, 1000) catch null;
         }
     }
     return null;
@@ -736,6 +748,8 @@ test "keep-alive timeout" {
     try testing.expectEqual(@as(?i64, 10_000), keepAliveTimeoutMs("timeout=10, max=9999"));
     try testing.expectEqual(@as(?i64, 3_000), keepAliveTimeoutMs("timeout=3"));
     try testing.expectEqual(@as(?i64, null), keepAliveTimeoutMs("max=5"));
+    try testing.expectEqual(@as(?i64, null), keepAliveTimeoutMs("timeout=9223372036854775807"));
+    try testing.expectEqual(@as(?i64, null), keepAliveTimeoutMs("timeout=-5"));
 }
 
 test "summary" {

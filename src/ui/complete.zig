@@ -44,6 +44,7 @@ pub const SchemaCache = struct {
         var interned: std.StringHashMapUnmanaged([]const u8) = .empty;
         var all: std.ArrayList([]const u8) = .empty;
         for (r.rows) |row| {
+            if (row.len == 0) continue;
             const t = row[0] orelse continue;
             if (tables.items.len == 0 or !std.mem.eql(u8, tables.items[tables.items.len - 1], t)) {
                 if (tables.items.len > 0) try columns.append(a, current.items);
@@ -71,13 +72,17 @@ pub const SchemaCache = struct {
     /// Own names once; completion borrows them until the next schema refresh.
     pub fn addDefinitions(c: *SchemaCache, r: db.Result) Allocator.Error!void {
         const a = c.arena.allocator();
-        const definitions = try a.alloc(Candidate, r.rows.len);
-        for (r.rows, definitions) |row, *candidate| candidate.* = .{
-            .text = try a.dupe(u8, row[0] orelse ""),
-            .kind = .definition,
-            .detail = try a.dupe(u8, row[1] orelse ""),
-        };
-        c.definitions = definitions;
+        var definitions: std.ArrayList(Candidate) = .empty;
+        try definitions.ensureTotalCapacity(a, r.rows.len);
+        for (r.rows) |row| {
+            if (row.len == 0) continue;
+            definitions.appendAssumeCapacity(.{
+                .text = try a.dupe(u8, row[0] orelse ""),
+                .kind = .definition,
+                .detail = try a.dupe(u8, if (row.len > 1) row[1] orelse "" else ""),
+            });
+        }
+        c.definitions = definitions.items;
     }
 
     pub fn deinit(c: *SchemaCache) void {
@@ -253,8 +258,9 @@ pub fn configComplete(a: Allocator, text: []const u8, cursor: usize, connections
     const start = if (std.mem.lastIndexOfScalar(u8, text[0..cursor], '\n')) |i| i + 1 else 0;
     const end = if (std.mem.indexOfScalar(u8, text[cursor..], '\n')) |i| cursor + i else text.len;
     var field_start = start;
-    while (field_start < cursor and std.ascii.isWhitespace(text[field_start])) field_start += 1;
+    while (field_start < end and std.ascii.isWhitespace(text[field_start])) field_start += 1;
     if (field_start < end and text[field_start] == '#') return empty;
+    if (cursor < field_start) field_start = cursor;
     const equal = if (std.mem.indexOfScalar(u8, text[start..end], '=')) |i| start + i else end;
     if (cursor > equal) {
         const key = std.mem.trim(u8, text[field_start..equal], " \t\"'");
@@ -453,13 +459,16 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
         return .{ .replace_len = word.len, .candidates = list.items.items, .exact_match = list.exact };
     }
 
+    const dialect = dialectFor(ctx.kind);
+    if (cursorInStringOrComment(before, dialect)) return .{ .replace_len = 0, .candidates = &.{} };
+
     const word = sqlWord(before);
-    const stmt = currentStatement(ctx.text, ctx.cursor);
+    const stmt = currentStatement(ctx.text, ctx.cursor, dialect);
     const cache = ctx.cache;
 
     if (ctx.kind) |kind| {
         const relative_cursor = ctx.cursor - stmt.start;
-        if (operatorPrefix(stmt.text, relative_cursor, false)) |prefix| {
+        if (operatorPrefixDialect(stmt.text, relative_cursor, false, dialect)) |prefix| {
             const upper = prefix.len == 0 or std.ascii.isUpper(prefix[0]);
             for (operators(kind)) |op| {
                 try list.addIfMatchCase(op.text, prefix, .operator, op.detail, upper);
@@ -474,7 +483,7 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
         const qualifier = unquote(word[0..dot]);
         const partial = word[dot + 1 ..];
         if (cache) |c| {
-            const table = (try resolveAlias(a, stmt.text, qualifier)) orelse qualifier;
+            const table = (try resolveAlias(a, stmt.text, qualifier, dialect)) orelse qualifier;
             if (c.columnsOf(table)) |cols| {
                 for (cols) |col| try list.addIfMatch(col, partial, .column, table);
             }
@@ -489,8 +498,8 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
     }
 
     const before_word = stmt.text[0 .. ctx.cursor - stmt.start - word.len];
-    const prev_token = lastSignificant(before_word);
-    const prev = previousKeyword(stmt.text[0 .. ctx.cursor - stmt.start]);
+    const prev_token = lastSignificant(before_word, dialect);
+    const prev = previousKeyword(stmt.text[0 .. ctx.cursor - stmt.start], dialect);
     const wants_table = if (prev) |p| isTableKeyword(p) else false;
     const upper = word.len > 0 and std.ascii.isUpper(word[0]);
     const kind = ctx.kind orelse .postgres;
@@ -523,7 +532,7 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
     const prefer_upper = upper or word.len == 0;
 
     if (after_expression) {
-        if (joinBeforeCondition(before_word)) |join| {
+        if (joinBeforeCondition(before_word, dialect)) |join| {
             const join_upper = if (word.len > 0) upper else std.ascii.isUpper(join[0]);
             for ([_][]const u8{ "ON", "USING" }) |k| try list.addIfMatchCase(k, word, .keyword, "", join_upper);
             if (list.items.items.len > 0) return .{
@@ -542,7 +551,7 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
     // columns of the tables in this statement come first.
     if (cache) |c| {
         var referenced: std.ArrayList([]const u8) = .empty;
-        try referencedTables(a, stmt.text, &referenced);
+        try referencedTables(a, stmt.text, dialect, &referenced);
         for (referenced.items) |t| {
             if (c.columnsOf(t)) |cols| for (cols) |col| try list.addIfMatch(col, word, .column, t);
         }
@@ -562,8 +571,71 @@ pub fn complete(a: Allocator, ctx: Context) Allocator.Error!Completion {
     return .{ .replace_len = word.len, .candidates = list.items.items, .exact_match = list.exact };
 }
 
-fn lastSignificant(s: []const u8) ?lexer.Token {
-    var it: lexer.Iterator = .init(s);
+fn dialectFor(kind: ?db.Kind) lexer.Dialect {
+    return switch (kind orelse .postgres) {
+        .postgres => .postgres,
+        .mysql, .clickhouse => .mysql,
+        .sqlite => .sqlite,
+    };
+}
+
+fn cursorInStringOrComment(src: []const u8, dialect: lexer.Dialect) bool {
+    var it: lexer.Iterator = .initDialect(src, dialect);
+    var last: ?lexer.Token = null;
+    while (it.next()) |t| last = t;
+    const t = last orelse return false;
+    if (t.end != src.len) return false;
+    switch (t.tag) {
+        .string => {
+            if (src[t.start] == '$') {
+                var tag_end = t.start + 1;
+                while (tag_end < t.end and src[tag_end] != '$') tag_end += 1;
+                if (tag_end >= t.end) return true;
+                tag_end += 1;
+                const delim = src[t.start..tag_end];
+                return t.end < tag_end + delim.len or !std.mem.endsWith(u8, src[tag_end..t.end], delim);
+            }
+            const quote_start = if (src[t.start] == '\'') t.start else t.start + 1;
+            const backslash = dialect == .mysql or src[t.start] == 'e' or src[t.start] == 'E';
+            var i = quote_start + 1;
+            while (i < t.end) : (i += 1) {
+                if (backslash and src[i] == '\\' and i + 1 < t.end) {
+                    i += 1;
+                    continue;
+                }
+                if (src[i] == '\'') {
+                    if (i + 1 < t.end and src[i + 1] == '\'') {
+                        i += 1;
+                        continue;
+                    }
+                    return false;
+                }
+            }
+            return true;
+        },
+        .comment => {
+            if (t.end - t.start >= 2 and src[t.start] == '/' and src[t.start + 1] == '*') {
+                var i = t.start + 2;
+                var depth: usize = 1;
+                while (i < t.end and depth > 0) {
+                    if (i + 1 < t.end and src[i] == '*' and src[i + 1] == '/') {
+                        depth -= 1;
+                        i += 2;
+                    } else if (dialect == .postgres and i + 1 < t.end and src[i] == '/' and src[i + 1] == '*') {
+                        depth += 1;
+                        i += 2;
+                    } else i += 1;
+                }
+                return depth > 0;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn lastSignificant(s: []const u8, dialect: lexer.Dialect) ?lexer.Token {
+    var it: lexer.Iterator = .initDialect(s, dialect);
     var last: ?lexer.Token = null;
     while (it.next()) |t| switch (t.tag) {
         .whitespace, .comment => {},
@@ -748,10 +820,15 @@ fn sqlWord(before: []const u8) []const u8 {
 /// condition. Browse filters set `condition_only`; console SQL must contain a
 /// WHERE, HAVING or JOIN ON clause.
 pub fn operatorPrefix(text: []const u8, cursor: usize, condition_only: bool) ?[]const u8 {
+    return operatorPrefixDialect(text, cursor, condition_only, .postgres);
+}
+
+pub fn operatorPrefixDialect(text: []const u8, cursor: usize, condition_only: bool, dialect: lexer.Dialect) ?[]const u8 {
     const before = text[0..cursor];
+    if (cursorInStringOrComment(before, dialect)) return null;
     const word = sqlWord(before);
     const base = before[0 .. before.len - word.len];
-    var it: lexer.Iterator = .init(base);
+    var it: lexer.Iterator = .initDialect(base, dialect);
     var last: ?lexer.Token = null;
     var in_condition = condition_only;
     while (it.next()) |t| {
@@ -785,8 +862,8 @@ fn unquote(s: []const u8) []const u8 {
 
 const Statement = struct { text: []const u8, start: usize };
 
-fn currentStatement(text: []const u8, cursor: usize) Statement {
-    var it: lexer.Iterator = .init(text);
+fn currentStatement(text: []const u8, cursor: usize, dialect: lexer.Dialect) Statement {
+    var it: lexer.Iterator = .initDialect(text, dialect);
     var start: usize = 0;
     var end: usize = text.len;
     while (it.next()) |t| {
@@ -800,8 +877,8 @@ fn currentStatement(text: []const u8, cursor: usize) Statement {
     return .{ .text = text[start..end], .start = start };
 }
 
-fn previousKeyword(s: []const u8) ?[]const u8 {
-    var it: lexer.Iterator = .init(s);
+fn previousKeyword(s: []const u8, dialect: lexer.Dialect) ?[]const u8 {
+    var it: lexer.Iterator = .initDialect(s, dialect);
     var last: ?[]const u8 = null;
     var last_end: usize = 0;
     var prev_sig: ?lexer.Token = null;
@@ -872,8 +949,8 @@ fn readRelation(it: *lexer.Iterator, stmt: []const u8) ?Relation {
     return relation;
 }
 
-fn joinBeforeCondition(stmt: []const u8) ?[]const u8 {
-    var it: lexer.Iterator = .init(stmt);
+fn joinBeforeCondition(stmt: []const u8, dialect: lexer.Dialect) ?[]const u8 {
+    var it: lexer.Iterator = .initDialect(stmt, dialect);
     var allows_condition = true;
     while (nextSignificant(&it)) |t| {
         const word = t.text(stmt);
@@ -909,8 +986,8 @@ fn nextRelation(it: *lexer.Iterator, stmt: []const u8, from_list: *bool) ?Relati
     return null;
 }
 
-fn referencedTables(a: Allocator, stmt: []const u8, out: *std.ArrayList([]const u8)) Allocator.Error!void {
-    var it: lexer.Iterator = .init(stmt);
+fn referencedTables(a: Allocator, stmt: []const u8, dialect: lexer.Dialect, out: *std.ArrayList([]const u8)) Allocator.Error!void {
+    var it: lexer.Iterator = .initDialect(stmt, dialect);
     var from_list = false;
     while (nextRelation(&it, stmt, &from_list)) |relation| {
         try out.append(a, try relation.table(a));
@@ -918,8 +995,8 @@ fn referencedTables(a: Allocator, stmt: []const u8, out: *std.ArrayList([]const 
 }
 
 /// Resolves `alias` (FROM users u / JOIN orders AS o) to its table name.
-fn resolveAlias(a: Allocator, stmt: []const u8, alias: []const u8) Allocator.Error!?[]const u8 {
-    var it: lexer.Iterator = .init(stmt);
+fn resolveAlias(a: Allocator, stmt: []const u8, alias: []const u8, dialect: lexer.Dialect) Allocator.Error!?[]const u8 {
+    var it: lexer.Iterator = .initDialect(stmt, dialect);
     var from_list = false;
     while (nextRelation(&it, stmt, &from_list)) |relation| {
         const qualifier = relation.alias orelse relation.object orelse relation.name;
@@ -1052,7 +1129,7 @@ test "left join completion follows clauses and resolves qualified aliases" {
         try testing.expectEqualStrings(case[1], result.candidates[0].text);
     }
     const natural = "select * from users natural left join public.orders ";
-    try testing.expect(joinBeforeCondition(natural) == null);
+    try testing.expect(joinBeforeCondition(natural, .postgres) == null);
 }
 
 test "keywords keep case and commands" {
@@ -1197,4 +1274,49 @@ test "context-aware SQL keywords" {
     try testing.expect(!hasCandidate(pg.candidates, "PRAGMA"));
     const lite = try complete(a, .{ .text = "TRUN", .cursor = 4, .cache = null, .connections = &.{}, .commands = &.{}, .kind = .sqlite });
     try testing.expect(!hasCandidate(lite.candidates, "TRUNCATE"));
+}
+
+test "completion is suppressed inside strings, comments and indented TOML comments" {
+    var cache = try testCache(testing.allocator);
+    defer cache.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Unterminated strings and comments produce no candidates.
+    for ([_]struct { text: []const u8, kind: db.Kind }{
+        .{ .text = "select 'sel", .kind = .postgres },
+        .{ .text = "select * from users where name = 'it''s sel", .kind = .postgres },
+        .{ .text = "select * from users -- fro", .kind = .postgres },
+        .{ .text = "select * from users /* fro", .kind = .postgres },
+        .{ .text = "select * from users /* outer /* inner */ fro", .kind = .postgres },
+        .{ .text = "select * from users # fro", .kind = .mysql },
+        .{ .text = "select 'a\\' sel", .kind = .mysql },
+        .{ .text = "select $tag$ sel", .kind = .postgres },
+    }) |case| {
+        const r = try complete(a, .{ .text = case.text, .cursor = case.text.len, .cache = &cache, .connections = &.{}, .commands = &.{}, .kind = case.kind });
+        try testing.expectEqual(@as(usize, 0), r.candidates.len);
+    }
+
+    // Closed string or block comment resumes normal completion.
+    const after_str = "select 'a' F";
+    const r_str = try complete(a, .{ .text = after_str, .cursor = after_str.len, .cache = &cache, .connections = &.{}, .commands = &.{}, .kind = .postgres });
+    try testing.expect(r_str.candidates.len > 0);
+    try testing.expectEqualStrings("FROM", r_str.candidates[0].text);
+
+    // Indented TOML comment must not complete even when cursor is before '#'.
+    const toml_comment = "[connections.local]\n  # access = full";
+    const line_start = std.mem.indexOfScalar(u8, toml_comment, '\n').? + 1;
+    const cfg_res = try configComplete(a, toml_comment, line_start, &.{});
+    try testing.expectEqual(@as(usize, 0), cfg_res.candidates.len);
+
+    // SchemaCache safely ignores empty or short rows.
+    const short_rows = [_][]const ?[]const u8{ &.{}, &.{"users"} };
+    const r_short: db.Result = .{ .arena = .init(testing.allocator), .columns = &.{}, .rows = &short_rows };
+    var short_cache = try SchemaCache.fromResult(testing.allocator, r_short);
+    defer short_cache.deinit();
+    try testing.expectEqual(@as(usize, 1), short_cache.tables.len);
+    try short_cache.addDefinitions(r_short);
+    try testing.expectEqual(@as(usize, 1), short_cache.definitions.len);
+    try testing.expectEqualStrings("", short_cache.definitions[0].detail);
 }

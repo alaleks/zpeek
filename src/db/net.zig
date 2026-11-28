@@ -233,7 +233,7 @@ pub const Transport = struct {
     pub fn startTls(t: *Transport, host: []const u8, mode: conninfo.SslMode, diag: *[]const u8) error{ TlsFailed, OutOfMemory }!void {
         const state = try t.gpa.create(TlsState);
         errdefer t.gpa.destroy(state);
-        state.read_buf = try t.gpa.alloc(u8, TlsClient.min_buffer_len);
+        state.read_buf = try t.gpa.alloc(u8, TlsClient.min_buffer_len * 2);
         errdefer t.gpa.free(state.read_buf);
         state.write_buf = try t.gpa.alloc(u8, TlsClient.min_buffer_len);
         errdefer t.gpa.free(state.write_buf);

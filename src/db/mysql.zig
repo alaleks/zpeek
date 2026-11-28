@@ -123,7 +123,7 @@ const My = struct {
         r.toss(1);
         self.server_version = try self.gpa.dupe(u8, cleanVersion(version));
         self.connection_id = try r.takeInt(u32, .little);
-        var nonce: [20]u8 = undefined;
+        var nonce: [20]u8 = @splat(0);
         @memcpy(nonce[0..8], try r.take(8));
         r.toss(1);
         var server_caps: u32 = try r.takeInt(u16, .little);
@@ -340,6 +340,7 @@ const My = struct {
                 else => {
                     var r: Io.Reader = .fixed(first);
                     const ncols: usize = @intCast(try readLenenc(&r));
+                    b.resetResult();
                     const names = try a.alloc([]const u8, ncols);
                     for (names) |*name| {
                         const def = try self.readPacket();
@@ -347,8 +348,6 @@ const My = struct {
                     }
                     try self.readEofIfPresent();
                     try b.setColumns(names);
-                    b.result.truncated = false;
-                    b.result.affected_rows = null;
                     // rows
                     while (true) {
                         const p = try self.readPacket();
@@ -578,7 +577,7 @@ fn rsaEncryptPassword(gpa: Allocator, io: Io, pem: []const u8, password: []const
     const outer = try der.Element.parse(spki, 0);
     const algo = try der.Element.parse(spki, outer.slice.start);
     const bits = try der.Element.parse(spki, algo.slice.end);
-    if (bits.identifier.tag != .bitstring) return error.InvalidKey;
+    if (bits.identifier.tag != .bitstring or bits.slice.start >= bits.slice.end) return error.InvalidKey;
     const rsa_der = spki[bits.slice.start + 1 .. bits.slice.end]; // skip unused-bits byte
     const parts = try rsa.PublicKey.parseDer(rsa_der);
     const key = try rsa.PublicKey.fromBytes(parts.exponent, parts.modulus);
@@ -592,6 +591,7 @@ fn rsaEncryptPassword(gpa: Allocator, io: Io, pem: []const u8, password: []const
     for (msg, 0..) |*m, i| m.* ^= nonce[i % nonce.len];
 
     const h_len = Sha1.digest_length;
+    if (k < 2 * h_len + 2) return error.InvalidKey;
     if (msg.len > k - 2 * h_len - 2) return error.PasswordTooLong;
 
     // EME-OAEP encoding (RFC 8017 7.1.1) with empty label
@@ -791,4 +791,16 @@ fn dataRowBytes(reader: Io.Reader, ncols: usize) !usize {
 test "row preflight counts nulls and rejects incomplete values" {
     try std.testing.expectEqual(@as(usize, 3), try dataRowBytes(.fixed("\x03abc\xfb"), 2));
     try std.testing.expectError(error.EndOfStream, dataRowBytes(.fixed("\x03"), 2));
+}
+
+test "rsaEncryptPassword rejects empty bitstring without panicking" {
+    const a = std.testing.allocator;
+    // SEQUENCE { SEQUENCE {}, BIT STRING (len 0) }
+    const spki = [_]u8{ 0x30, 0x04, 0x30, 0x00, 0x03, 0x00 };
+    var b64_buf: [16]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &spki);
+    const pem = try std.fmt.allocPrint(a, "-----BEGIN PUBLIC KEY-----\n{s}\n-----END PUBLIC KEY-----\n", .{b64});
+    defer a.free(pem);
+    const nonce: [20]u8 = @splat(0);
+    try std.testing.expectError(error.InvalidKey, rsaEncryptPassword(a, std.testing.io, pem, "pw", &nonce));
 }
